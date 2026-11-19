@@ -16,9 +16,10 @@ uv run cstudio test
 # 3. 檢查 Google Colab 登入與剩餘運算單元
 uv run cstudio check
 
-# 4. 預覽範例批次任務
-uv run cstudio plan jobs/demo_qwen21/manifest.json
+# 4. 啟動本地輕量 Web UI 工作台（支援文字生圖、1~10張多圖改圖、RGBA透明貼紙、9B AI擴寫與歷史畫廊）
+uv run cstudio ui --open
 
-# 5. 在 Colab L4 GPU 上執行並同步回 jobs/demo_qwen21/out/
+# 5. 或使用 CLI 預覽與執行批次任務
+uv run cstudio plan jobs/demo_qwen21/manifest.json
 uv run cstudio run jobs/demo_qwen21/manifest.json --gpu L4
 ```

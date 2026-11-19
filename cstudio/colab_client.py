@@ -102,7 +102,7 @@ def parse_sessions(out: str) -> list[str]:
         if not m:
             continue
         name, rest = m.group(1), m.group(2)
-        if name == "?" or (name == "colab" and "No active sessions" in rest):
+        if name in ("?", "colab"):
             continue
         names.append(name)
     return names
@@ -134,8 +134,15 @@ def sessions_checked(tries: int = 2) -> tuple[list[str] | None, str]:
     return None, out
 
 
+def sanitize_session_name(session: str) -> str:
+    s = str(session or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", s) or s in (".", ".."):
+        raise ValueError(f"不合法的 Session 名稱：{session!r}")
+    return s
+
+
 def keep_file(session: str) -> Path:
-    return KEEP / f"{session}.json"
+    return KEEP / f"{sanitize_session_name(session)}.json"
 
 
 def keep_info(session: str) -> dict | None:
@@ -147,6 +154,10 @@ def keep_info(session: str) -> dict | None:
 
 
 def is_owned_session(name: str) -> bool:
+    try:
+        name = sanitize_session_name(name)
+    except ValueError:
+        return False
     if name.startswith(PREFIX):
         return True
     if not keep_file(name).exists():
@@ -158,7 +169,14 @@ def owned_sessions() -> list[str]:
     return [n for n in sessions()[0] if is_owned_session(n)]
 
 
-def set_keep(session: str, expires: float | None, pid: int | None = None, owner: str | None = None):
+def set_keep(
+    session: str,
+    expires: float | None,
+    pid: int | None = None,
+    owner: str | None = None,
+    extra: dict | None = None,
+):
+    session = sanitize_session_name(session)
     KEEP.mkdir(parents=True, exist_ok=True)
     old = keep_info(session) or {}
     owner = owner or old.get("created_by")
@@ -167,7 +185,12 @@ def set_keep(session: str, expires: float | None, pid: int | None = None, owner:
     data = dict(old, session=session, expires=expires, watchdog_pid=pid or old.get("watchdog_pid"))
     if owner:
         data["created_by"] = owner
-    keep_file(session).write_text(json.dumps(data), encoding="utf-8")
+    if extra:
+        data.update(extra)
+    kf = keep_file(session)
+    tmp = kf.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(kf)
 
 
 def drop_keep(session: str):

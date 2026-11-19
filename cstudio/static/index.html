@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Colab Studio · Qwen-Image-2.1 Turbo 雲端生圖與改圖工作台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- 頂部狀態列 (Top Bar — Colab 狀態與省錢控制面板) -->
+  <header class="topbar">
+    <div class="topbar-brand">
+      <div class="brand-logo">⚡</div>
+      <div class="brand-text">
+        <span class="brand-title">Colab Studio</span>
+        <span class="brand-subtitle">Qwen-Image-2.1 Turbo · 8 步極速雲端工作台</span>
+      </div>
+    </div>
+
+    <div class="topbar-status">
+      <!-- Google Colab 登入狀態 -->
+      <div class="status-pill" id="authStatusPill" title="Google Colab OAuth 登入狀態">
+        <span class="dot" id="authDot"></span>
+        <span id="authLabel">檢查登入中...</span>
+        <button type="button" class="btn-inline" id="btnToggleLogin">🔑 登入／切換帳號</button>
+      </div>
+
+      <!-- 剩餘運算單元 (CU) -->
+      <div class="status-pill" id="cuStatusPill" title="Google Colab 剩餘運算單元 (Compute Units)">
+        <span class="pill-icon">💳</span>
+        <span>剩餘運算單元：<strong id="cuValue">--</strong></span>
+      </div>
+
+      <!-- 運行中 Session 與自動關機倒數 -->
+      <div class="status-pill" id="sessionStatusPill" title="目前 Colab GPU Session 與自動關機倒數計時">
+        <span class="pill-icon">🖥️</span>
+        <span>運行中 Session：<strong id="activeSessionLabel">尚無</strong></span>
+        <span class="countdown-badge" id="countdownBadge" hidden>⏱️ --:--</span>
+      </div>
+    </div>
+
+    <div class="topbar-controls">
+      <div class="ctrl-group" title="選擇 Google Colab GPU 規格">
+        <label for="gpuSelect">GPU</label>
+        <select id="gpuSelect" class="select-compact">
+          <option value="L4">L4 (推薦)</option>
+          <option value="G4">G4</option>
+          <option value="A100">A100</option>
+          <option value="H100">H100</option>
+          <option value="T4">T4</option>
+        </select>
+      </div>
+
+      <div class="ctrl-group" title="選擇權重規格（預設原生 INT8，支援 BF16 與 12 種 Unsloth GGUF 量化）">
+        <label for="quantSelect">權重規格</label>
+        <select id="quantSelect" class="select-compact quant-select">
+          <option value="INT8">INT8 (預設原生)</option>
+        </select>
+      </div>
+
+      <button type="button" class="btn-top" id="btnRefreshColab" title="立即向 Google Colab 查詢最新 CU 與 Session 狀態">
+        🔄 重新整理
+      </button>
+      <button type="button" class="btn-top btn-keep" id="btnKeep30" title="將目前開啟的 GPU 自動關機時間設為 30 分鐘後">
+        ⏳ +30分保留
+      </button>
+      <button type="button" class="btn-top btn-keep" id="btnKeep60" title="將目前開啟的 GPU 自動關機時間設為 60 分鐘後">
+        ⏳ +60分保留
+      </button>
+      <button type="button" class="btn-top btn-warn" id="btnCancelTop" title="中斷當前雲端生成任務，但保留 Colab GPU 與已載入模型">
+        ⏹️ 中斷當前任務
+      </button>
+      <button type="button" class="btn-top btn-danger" id="btnStopTop" title="立即關閉 Colab GPU 釋放資源並停止計費">
+        🛑 立即關機
+      </button>
+    </div>
+  </header>
+
+  <!-- 兩步驟 Google Colab OAuth 登入抽屜 (未登入或點擊登入時展開) -->
+  <section class="login-drawer" id="loginDrawer" hidden>
+    <div class="login-drawer-inner">
+      <div class="login-step">
+        <strong>步驟 1：</strong>
+        <span>點擊取得 Google Colab OAuth 授權網址（請使用具備 Google AI Pro / Colab GPU 額度的帳號登入）：</span>
+        <button type="button" class="btn-primary-sm" id="btnGetLoginUrl">🔗 產生 Google 登入網址</button>
+        <a id="loginUrlLink" href="#" target="_blank" rel="noopener noreferrer" class="login-url-link" hidden>👉 點此在新分頁開啟 Google 授權頁面</a>
+      </div>
+      <div class="login-step">
+        <strong>步驟 2：</strong>
+        <span>在 Google 頁面按「允許」後，複製頁面顯示的授權碼貼在下方：</span>
+        <input type="text" id="loginCodeInput" class="input-text login-code-input" placeholder="貼上 4/0A... 開頭的 Google 授權碼" />
+        <button type="button" class="btn-primary-sm" id="btnSubmitLoginCode">✅ 驗證並完成登入</button>
+        <button type="button" class="btn-ghost-sm" id="btnCloseLoginDrawer">收起</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 雙欄式主工作區 (Left Settings Rail + Right Stage Canvas) -->
+  <main class="studio-workspace">
+    <!-- 左側參數設定欄 (Settings Rail，約 420px 寬，獨立捲動) -->
+    <aside class="settings-rail">
+      <div class="rail-scroll">
+        <!-- 頂部模式切換 Pill Tabs -->
+        <div class="mode-tabs" role="tablist">
+          <button type="button" class="mode-tab active" id="tabT2I" data-mode="t2i">
+            ✨ 文字生圖 (T2I)
+          </button>
+          <button type="button" class="mode-tab" id="tabEdit" data-mode="edit">
+            🎨 圖片編輯／多圖參考 (Edit)
+          </button>
+        </div>
+
+        <!-- 參考圖片區 (僅 edit 模式顯示) -->
+        <section class="panel-section" id="editReferenceSection" hidden>
+          <div class="section-header">
+            <span class="section-title">🖼️ 參考圖片 (<code class="code-tag">&lt;image1&gt;</code> ～ <code class="code-tag">&lt;image10&gt;</code>)</span>
+            <span class="section-badge" id="refCountBadge">0 / 10 張</span>
+          </div>
+          <p class="section-hint">
+            <code class="code-tag">&lt;image1&gt;</code> 為<strong>主畫布</strong>，可上傳最多 10 張圖片進行局部改圖、換裝、風格轉移或多圖角色合成。點擊下方標籤可插入提示詞游標處：
+          </p>
+
+          <!-- 一鍵插入 <image1> .. <imageN> 膠囊列 -->
+          <div class="token-pill-bar" id="imageTokenBar"></div>
+
+          <!-- 參考圖卡片列表 (支援拖曳上傳與排序) -->
+          <div class="ref-dropzone" id="refDropzone">
+            <input type="file" id="refFileInput" accept="image/*" multiple hidden />
+            <div class="ref-cards-grid" id="refCardsGrid"></div>
+            <div class="ref-drop-actions">
+              <button type="button" class="btn-secondary-sm" id="btnAddRefImage">➕ 新增參考圖片 (可多選或拖曳至此)</button>
+              <button type="button" class="btn-ghost-sm" id="btnClearRefImages" hidden>🗑️ 清空全部</button>
+            </div>
+          </div>
+
+          <!-- 輸出尺寸策略 (Output Sizing — 借鏡 Unsloth Match Image 1 vs Custom) -->
+          <div class="sub-field">
+            <label class="field-label" for="editSizingSelect">📐 輸出尺寸策略 (Output Sizing)</label>
+            <select id="editSizingSelect" class="select-full">
+              <option value="match_1k">維持圖片 1 比例（標準 1K / 1024px，極速推薦）</option>
+              <option value="match_2k">維持圖片 1 比例（高畫質 2K / 2048px，極致細節）</option>
+              <option value="match_orig">維持圖片 1 原始像素尺寸（自動對齊 32 倍數）</option>
+              <option value="custom">自訂輸出長寬比與解析度（展開下方選擇器）</option>
+            </select>
+          </div>
+        </section>
+
+        <!-- 提示詞 (Prompt) 與透明背景／AI 擴寫開關 -->
+        <section class="panel-section">
+          <div class="section-header">
+            <label class="section-title" for="promptInput" id="promptSectionTitle">✍️ 提示詞 (Prompt)</label>
+            <button type="button" class="btn-ghost-xs" id="btnClearPrompt" title="清空提示詞">清空</button>
+          </div>
+          <textarea
+            id="promptInput"
+            class="prompt-textarea"
+            rows="5"
+            placeholder="例如：台北街頭的霓虹拉麵攤，雨夜地面倒影，招牌寫著「極上豚骨」，電影級光影與蒸氣細節..."
+          ></textarea>
+
+          <!-- 透明背景貼紙 & AI 自動擴寫開關 -->
+          <div class="toggles-box">
+            <label class="toggle-row" title="自動套用官方 RGBA 透明背景提示詞包裹，直接生成具 Alpha 透明通道的去背貼紙 PNG">
+              <input type="checkbox" id="chkTransparent" />
+              <span class="toggle-title">🔲 透明背景貼紙 (<code>RGBA</code>)</span>
+              <span class="toggle-badge">Alpha 去背直出</span>
+            </label>
+
+            <label class="toggle-row" title="由雲端 Qwen 3.5 9B Prompt Enhancer 自動根據短提示詞或參考圖片擴寫豐富的構圖、光影與材質細節">
+              <input type="checkbox" id="chkRefinePrompt" />
+              <span class="toggle-title">✨ AI 自動擴寫提示詞 (<code>Qwen 3.5 9B Prompt Enhancer</code>)</span>
+            </label>
+
+            <div class="pe-variant-row" id="peVariantRow" hidden>
+              <label for="peVariantSelect">擴寫模型規格：</label>
+              <select id="peVariantSelect" class="select-compact">
+                <option value="int8">Qwen 3.5 9B INT8（官方預設高精度）</option>
+                <option value="w4a8">Qwen 3.5 9B W4A8（輕量快速版）</option>
+              </select>
+            </div>
+          </div>
+        </section>
+
+        <!-- 長寬比 (Aspect Ratio) 與解析度 (Resolution) -->
+        <section class="panel-section" id="sizeControlSection">
+          <div class="section-header">
+            <span class="section-title">📐 長寬比 (Aspect Ratio) 與解析度</span>
+            <button type="button" class="btn-ghost-xs" id="btnSwapAspect" title="翻轉長寬比例 (例如 16:9 ⇄ 9:16)">⇄ 翻轉長寬</button>
+          </div>
+
+          <div class="aspect-grid" id="aspectGrid">
+            <button type="button" class="aspect-btn active" data-ar="1:1">1:1</button>
+            <button type="button" class="aspect-btn" data-ar="16:9">16:9</button>
+            <button type="button" class="aspect-btn" data-ar="9:16">9:16</button>
+            <button type="button" class="aspect-btn" data-ar="4:3">4:3</button>
+            <button type="button" class="aspect-btn" data-ar="3:4">3:4</button>
+            <button type="button" class="aspect-btn" data-ar="3:2">3:2</button>
+            <button type="button" class="aspect-btn" data-ar="2:3">2:3</button>
+          </div>
+
+          <div class="resolution-row">
+            <div class="res-pills">
+              <button type="button" class="res-pill active" id="res1K" data-res="1K">
+                1K <span class="res-sub">標準 ~1MP · 極速</span>
+              </button>
+              <button type="button" class="res-pill" id="res2K" data-res="2K">
+                2K <span class="res-sub">原生 ~4MP · 極致細節</span>
+              </button>
+            </div>
+            <div class="pixel-readout" id="pixelReadout">1024 × 1024 px</div>
+          </div>
+        </section>
+
+        <!-- 種子碼 (Seed)、Session 選擇與省錢設定 -->
+        <section class="panel-section">
+          <div class="section-header">
+            <span class="section-title">🎲 種子碼 (Seed) 與執行選項</span>
+          </div>
+
+          <div class="seed-row">
+            <input type="text" id="seedInput" class="input-text" placeholder="留空代表每次隨機種子" inputmode="numeric" />
+            <button type="button" class="btn-secondary-sm" id="btnRandomSeed" title="產生新的隨機種子碼">🎲 隨機</button>
+            <button type="button" class="btn-secondary-sm" id="btnReuseLastSeed" title="沿用上一張生成圖片的 Seed">↺ 沿用上次 Seed</button>
+          </div>
+
+          <div class="sub-grid-2">
+            <div class="sub-field">
+              <label class="field-label" for="sessionSelect">目標 Colab Session</label>
+              <select id="sessionSelect" class="select-full">
+                <option value="">自動沿用或新開 Session</option>
+                <option value="__new__">強制新開一台 Colab GPU</option>
+              </select>
+            </div>
+            <div class="sub-field">
+              <label class="field-label" for="idleMinutesInput">完成後待命保留 (分鐘)</label>
+              <input type="number" id="idleMinutesInput" class="input-text" value="15" min="1" max="240" />
+            </div>
+          </div>
+
+          <div class="sub-field">
+            <label class="field-label" for="batchNameInput">自訂任務／資料夾標籤（選填）</label>
+            <input type="text" id="batchNameInput" class="input-text" placeholder="預設自動產生 webui_YYYYMMDD_HHMMSS" maxlength="32" />
+          </div>
+
+          <label class="toggle-row compact-toggle" title="勾選後，本張圖片生成並下載回本地後會立即關閉 Colab GPU，不保留待命">
+            <input type="checkbox" id="chkStopAfter" />
+            <span class="toggle-title">🛑 生成完成後立即關閉 Colab GPU（不保留待命）</span>
+          </label>
+        </section>
+      </div>
+
+      <!-- 左側底部固定操作列 -->
+      <div class="rail-footer">
+        <button type="button" class="btn-generate" id="btnGenerate">
+          🚀 開始生成 (Generate)
+        </button>
+        <button type="button" class="btn-cancel-run" id="btnCancelRun" hidden>
+          ⏹️ 中斷當前任務 (保留 GPU 與模型)
+        </button>
+      </div>
+    </aside>
+
+    <!-- 右側主畫布與歷史畫廊 (Stage Canvas & Bottom Gallery Strip) -->
+    <section class="stage-column">
+      <!-- 錯誤或提示通知橫幅 -->
+      <div class="toast-banner" id="toastBanner" hidden>
+        <span id="toastMessage"></span>
+        <button type="button" class="btn-ghost-xs" id="btnCloseToast">✕</button>
+      </div>
+
+      <!-- 中央大圖預覽舞台 (預設套用 CSS 棋盤格透明背景) -->
+      <div class="stage-canvas checkerboard" id="stageCanvas">
+        <!-- 空狀態提示 -->
+        <div class="stage-empty" id="stageEmpty">
+          <div class="empty-icon">🎨</div>
+          <h2>Qwen-Image-2.1 Turbo 雲端工作台已就緒</h2>
+          <p>支援原生 2K (~4MP) 8 步極速文字生圖、RGBA 透明貼紙直出、1～10 張多圖參考改圖與 Qwen 3.5 9B AI 自動擴寫提示詞。</p>
+          <p class="empty-sub">在左側輸入提示詞並點擊「🚀 開始生成」，或從下方歷史畫廊點擊任一作品檢視與接力改圖。</p>
+        </div>
+
+        <!-- 主圖展示容器 -->
+        <div class="stage-image-wrap" id="stageImageWrap" hidden>
+          <img id="stageImage" src="" alt="Generated Artwork" />
+        </div>
+
+        <!-- 生成進行中的浮動即時進度卡片 -->
+        <div class="progress-overlay" id="progressOverlay" hidden>
+          <div class="progress-card">
+            <div class="progress-header">
+              <span class="spinner"></span>
+              <div class="progress-title-group">
+                <div class="progress-stage" id="progressStageText">🚀 正在啟動雲端任務...</div>
+                <div class="progress-meta" id="progressMetaText">Session: -- | GPU: L4 | 已耗時 0.0 秒</div>
+              </div>
+            </div>
+            <!-- 階段進度指示器 -->
+            <div class="stage-stepper" id="stageStepper">
+              <span class="step-chip" data-step="boot">1. 開啟/連線 GPU</span>
+              <span class="step-chip" data-step="install">2. 雲端環境</span>
+              <span class="step-chip" data-step="models">3. 權重就緒</span>
+              <span class="step-chip" data-step="generate">4. 8步取樣與擴寫</span>
+              <span class="step-chip" data-step="done">5. SHA256 同步回本地</span>
+            </div>
+            <!-- 即時 Colab Log 摘要 -->
+            <pre class="progress-logs" id="progressLogs">正在等待 Colab 回應...</pre>
+          </div>
+        </div>
+
+        <!-- 浮動玻璃工具列 (Floating Glass Toolbar) -->
+        <div class="floating-toolbar" id="floatingToolbar" hidden>
+          <div class="toolbar-meta" id="toolbarMeta">
+            <span class="meta-badge" id="metaBadgeMode">T2I</span>
+            <span class="meta-badge" id="metaBadgeQuant">INT8</span>
+            <span class="meta-badge" id="metaBadgeSize">1024×1024</span>
+            <span class="meta-badge" id="metaBadgeSeed">Seed: --</span>
+          </div>
+          <div class="toolbar-actions">
+            <button type="button" class="btn-glass btn-glass-primary" id="btnContinueEdit" title="一鍵將此圖送入「圖片編輯 (Edit)」模式的參考圖片 1 (<image1> 主畫布) 接力改圖">
+              🎨 以此圖繼續改圖 (&lt;image1&gt;)
+            </button>
+            <button type="button" class="btn-glass" id="btnAddAsExtraRef" title="將此圖加入圖片編輯模式的額外參考圖 (<image2>~<image10>)">
+              ➕ 加入多圖參考
+            </button>
+            <button type="button" class="btn-glass" id="btnRestoreRecipe" title="將此圖的提示詞、權重規格、長寬比、解析度與 Seed 還原至左側設定欄">
+              ↺ 套用此圖設定
+            </button>
+            <button type="button" class="btn-glass" id="btnTogglePromptDrawer" title="檢視原始提示詞與 Qwen 3.5 9B 擴寫後的完整提示詞">
+              ✨ 提示詞與配方明細
+            </button>
+            <a id="btnDownloadPng" href="#" download class="btn-glass" title="下載本地原圖 PNG">
+              ⬇️ 下載 PNG 原圖
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- ✨ AI 擴寫提示詞與生成配方展示面板 (Enhanced Prompt & Recipe Drawer) -->
+      <div class="prompt-drawer" id="promptDrawer" hidden>
+        <div class="prompt-drawer-header">
+          <div class="drawer-title">
+            <span>✨ 提示詞與生成配方明細</span>
+            <span class="drawer-badge" id="drawerEnhancerBadge">Qwen 3.5 9B Prompt Enhancer</span>
+          </div>
+          <div class="drawer-actions">
+            <button type="button" class="btn-secondary-xs" id="btnCopyRefinedPrompt">📋 複製擴寫提示詞</button>
+            <button type="button" class="btn-secondary-xs" id="btnUseRefinedPrompt" title="將擴寫後的完整提示詞填入左側輸入框，並自動關閉 AI 擴寫以固定重現">
+              ⤴️ 填入左側提示詞框（並關閉自動擴寫）
+            </button>
+            <button type="button" class="btn-ghost-xs" id="btnClosePromptDrawer">收起 ✕</button>
+          </div>
+        </div>
+        <div class="prompt-compare-grid">
+          <div class="prompt-box">
+            <div class="prompt-box-label">原始輸入提示詞 (Original Prompt)</div>
+            <div class="prompt-box-content" id="drawerOriginalPrompt">--</div>
+          </div>
+          <div class="prompt-box refined-box" id="drawerRefinedBox">
+            <div class="prompt-box-label">✨ Qwen 3.5 9B 擴寫後完整提示詞 (Refined Prompt)</div>
+            <div class="prompt-box-content" id="drawerRefinedPrompt">（此作品未啟用 AI 自動擴寫提示詞）</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 底部水平歷史畫廊 (Bottom Gallery Strip) -->
+      <footer class="gallery-strip-panel">
+        <div class="gallery-header">
+          <span class="gallery-title">🖼️ 本地歷史畫廊 (<span id="galleryCount">0</span> 張已校驗同步作品)</span>
+          <button type="button" class="btn-ghost-xs" id="btnRefreshGallery">🔄 重新掃描 jobs/</button>
+        </div>
+        <div class="gallery-strip" id="galleryStrip">
+          <div class="gallery-empty-hint">尚無本地歷史圖片</div>
+        </div>
+      </footer>
+    </section>
+  </main>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

@@ -195,6 +195,11 @@ def main():
     p_sheet.add_argument("--width", type=int, default=512)
     p_sheet.add_argument("--out", default=None, help="輸出檔案路徑")
 
+    p_ui = sub.add_parser("ui", help="啟動本地輕量 Web UI 介面 (借鏡 Unsloth Studio 雙欄設計)")
+    p_ui.add_argument("--host", default="127.0.0.1", help="監聽位址 (預設 127.0.0.1)")
+    p_ui.add_argument("--port", type=int, default=7860, help="監聽埠號 (預設 7860)")
+    p_ui.add_argument("--open", action="store_true", help="啟動後自動開啟瀏覽器")
+
     p_wd = sub.add_parser("_watchdog", add_help=False)
     p_wd.add_argument("--session", required=True)
 
@@ -236,6 +241,10 @@ def main():
     elif args.cmd == "sheet":
         dst = T.make_image_sheet(args.images, cols=args.cols, thumb_width=args.width, out_path=args.out)
         print(f"🖼️ 已產生預覽拼圖：{dst}", flush=True)
+    elif args.cmd == "ui":
+        from . import webui as W
+
+        W.launch_ui(host=args.host, port=args.port, open_browser=args.open)
     elif args.cmd == "_watchdog":
         C.watchdog_loop(args.session)
 

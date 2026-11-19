@@ -32,6 +32,10 @@ uv run cstudio keep --session NAME --minutes 60  # 延長保留 GPU
 uv run cstudio cancel --session NAME             # 中斷雲端執行中的任務，但保留 GPU 與已載入模型
 uv run cstudio stop --session NAME               # 立即關閉指定 GPU（或加 --all 關閉所有本工具開啟的機器）
 
+# 啟動本地輕量 Web UI 工作台（預設 http://127.0.0.1:7860）
+uv run cstudio ui --open
+# 或：uv run cstudio-ui --port 7860
+
 # 產生多張圖片的預覽拼圖 (Contact Sheet)
 uv run cstudio sheet jobs/demo_qwen21/out/*.png
 ```
@@ -105,13 +109,19 @@ uv run cstudio sheet jobs/demo_qwen21/out/*.png
 
 ---
 
-## 4. 為本地 Web UI 預留的 Python API
+## 4. 本地輕量 Web UI (`cstudio/webui.py` & `cstudio/static/`)
 
-未來在本 repo 建立本地 Web UI（如 Gradio / FastAPI）時，可直接匯入 `cstudio` 套件：
-```python
-from cstudio.runner import run_manifest, plan_batch
-from cstudio.colab_client import usage, sessions
-```
-`run_manifest(..., progress_cb=my_callback)` 支援傳入進度回呼函式，每輪輪詢皆會收到 Colab 端即時狀態，且每張圖片完成時會經過 SHA256 校驗後原子寫入本地 `out/<id>.png` 與 `out/results.json`。
+本專案內建由 **FastAPI + Uvicorn + 零建置原生 ES Module 前端** 驅動的雙欄式本地 Web UI（借鏡 Unsloth Studio 桌面版圖片生成介面）：
+- **啟動方式**：`uv run cstudio ui [--host 127.0.0.1] [--port 7860] [--open]`（或 `uv run cstudio-ui`）。
+- **核心功能**：
+  - 頂部即時顯示 Google Colab OAuth 登入狀態（支援網頁兩步驟授權登入）、剩餘運算單元 (`CU`)、運行中 `Session` 與自動關機倒數計時，並提供 GPU (`L4`/`G4`/`A100` 等)、14 種權重規格（預設原生 `INT8`）、`+30/+60 分鐘延長保留`、`⏹️ 中斷當前任務` 與 `🛑 立即關機` 控制。
+  - 左側參數設定欄支援 **文字生圖 (`T2I`)** 與 **圖片編輯／多圖參考 (`Edit`，1～10 張 `<image1>`..`<image10>` 參考圖與一鍵插入游標膠囊)**、**🔲 透明背景貼紙 (`RGBA`)**、**✨ AI 自動擴寫提示詞 (`Qwen 3.5 9B Prompt Enhancer`)**、7 種官方長寬比 (`1K`/`2K`) 與 `Edit` 四種輸出尺寸策略。
+  - 右側棋盤格透明背景舞台提供即時雲端階段進度、**✨ 原始 vs 9B 擴寫後提示詞對照抽屜**、浮動玻璃工具列（一鍵 **「🎨 以此圖繼續改圖 (`<image1>`)」**、**「➕ 加入多圖參考」**、**「↺ 套用此圖設定」**）與底部本地 `jobs/` 歷史畫廊。
+- **Python API 呼叫**：
+  ```python
+  from cstudio.runner import run_manifest, plan_batch
+  from cstudio.colab_client import usage, sessions
+  ```
+  `run_manifest(..., progress_cb=my_callback, exit_on_error=False, should_abort=...)` 支援非 CLI 環境安全呼叫與中斷控制。
 
 > **授權提醒**：`Qwen-Image-2.1-Turbo` 權重採用 Qwen Research License（非商業研究與評估使用）。

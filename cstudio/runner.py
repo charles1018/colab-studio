@@ -108,18 +108,28 @@ def validate_manifest(manifest: dict[str, Any], base_dir: Path, cli_quant: str |
     return problems
 
 
-def load_manifest(path: str | Path, cli_quant: str | None = None) -> tuple[dict[str, Any], Path]:
+def _fail(msg: str, exit_on_error: bool = True):
+    if exit_on_error:
+        sys.exit(msg)
+    raise RuntimeError(msg)
+
+
+def load_manifest(
+    path: str | Path,
+    cli_quant: str | None = None,
+    exit_on_error: bool = True,
+) -> tuple[dict[str, Any], Path]:
     p = Path(path).resolve()
     if not p.is_file():
-        sys.exit(f"找不到 manifest 檔案：{p}")
+        _fail(f"找不到 manifest 檔案：{p}", exit_on_error)
     try:
         m = json.loads(p.read_text(encoding="utf-8"))
     except Exception as e:
-        sys.exit(f"manifest JSON 格式錯誤（{p}）：{e}")
+        _fail(f"manifest JSON 格式錯誤（{p}）：{e}", exit_on_error)
     base = p.parent
     problems = validate_manifest(m, base, cli_quant=cli_quant)
     if problems:
-        sys.exit("manifest 驗證未通過，沒有開機：\n- " + "\n- ".join(problems))
+        _fail("manifest 驗證未通過，沒有開機：\n- " + "\n- ".join(problems), exit_on_error)
     return m, base
 
 
@@ -367,13 +377,15 @@ def run_manifest(
     assign_retries: int = 5,
     assign_wait: int = 120,
     progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    exit_on_error: bool = True,
+    should_abort: Callable[[], str | bool | None] | None = None,
 ) -> dict[str, Any]:
     if gpu not in C.GPUS:
-        sys.exit(f"不支援的 GPU {gpu!r}（可用：{', '.join(C.GPUS)}）")
+        _fail(f"不支援的 GPU {gpu!r}（可用：{', '.join(C.GPUS)}）", exit_on_error)
     if not C.token_ok():
-        sys.exit("尚未登入 Google Colab：請先執行 `uv run cstudio login url`")
+        _fail("尚未登入 Google Colab：請先執行 `uv run cstudio login url`", exit_on_error)
 
-    m, base = load_manifest(manifest_path, cli_quant=cli_quant)
+    m, base = load_manifest(manifest_path, cli_quant=cli_quant, exit_on_error=exit_on_error)
     out_dir = base / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
     res_file = out_dir / "results.json"
@@ -392,7 +404,7 @@ def run_manifest(
     elif stale and not remake_stale:
         msg = "發現已存在的輸出與目前設定不符（過期）：\n" + "\n".join(f"  - {jid}: {reason}" for jid, reason in stale)
         msg += "\n👉 若要重做過期項目（舊檔會移至 out/_stale/），請加上 `--remake-stale`；若要全部重做請加 `--force`。"
-        sys.exit(msg)
+        _fail(msg, exit_on_error)
 
     if stale and remake_stale:
         stale_dir = out_dir / "_stale"
@@ -405,18 +417,77 @@ def run_manifest(
 
     if not todo:
         print(f"✅ 全部 {len(m['jobs'])} 個任務皆已完成且指紋相符，無需啟動 Colab GPU！（輸出位於 {out_dir}）", flush=True)
+        if progress_cb:
+            try:
+                progress_cb(
+                    {
+                        "stage": "done",
+                        "done": True,
+                        "session": session,
+                        "gpu": gpu,
+                        "_local_synced_jobs": list(done_ids),
+                        "_local_results": prev_results,
+                        "log": ["全部任務皆已完成且指紋相符，免啟動 GPU"],
+                    }
+                )
+            except Exception:
+                pass
         return prev_results
 
     if done_ids:
         print(f"⏭️ 略過已完成且指紋相符的任務：{', '.join(done_ids)}", flush=True)
 
+    t0 = time.time()
+    run_id = uuid.uuid4().hex[:12]
+
+    def _emit(payload: dict[str, Any]):
+        if not progress_cb:
+            return
+        try:
+            snap = dict(payload)
+            snap.setdefault("run_id", run_id)
+            snap.setdefault("session", session)
+            snap.setdefault("gpu", gpu)
+            snap.setdefault("_local_synced_jobs", sorted(local_synced))
+            snap.setdefault("_local_results", json.loads(json.dumps(results, ensure_ascii=False)))
+            progress_cb(snap)
+        except Exception:
+            pass
+
+    abort_reason: str | None = None
+
+    def _check_abort():
+        nonlocal abort_reason
+        if not should_abort:
+            return
+        sig = should_abort()
+        if not sig:
+            return
+        if sig == "stop":
+            abort_reason = "stop"
+            raise RuntimeError("任務已中斷並立即關閉 Colab GPU (stopped by user)")
+        abort_reason = "cancel"
+        raise RuntimeError("任務已由使用者中斷 (cancelled by user)")
+
+    local_synced: set[str] = set(done_ids)
+    results: dict[str, Any] = {
+        "session": session,
+        "gpu": gpu,
+        "run_id": run_id,
+        "model": m.get("model", DEFAULT_MODEL),
+        "jobs": dict((prev_results.get("jobs") or {}) if not force else {}),
+    }
+
+    _check_abort()
     cu_before, _ = C.usage()
     alive, _ = C.sessions()
     created = False
 
     if not session or session not in alive:
         session = session or f"{C.PREFIX}{time.strftime('%m%d-%H%M%S')}"
+        results["session"] = session
         print(f"🚀 在 Google Colab 開啟 {gpu}：{session}", flush=True)
+        _emit({"stage": "booting_vm", "done": False, "log": [f"正在 Google Colab 分配並啟動 {gpu} ({session})..."]})
         try:
             C.new_runtime(session, gpu, retries=assign_retries, wait=assign_wait)
             created = True
@@ -430,29 +501,27 @@ def run_manifest(
                 pass
             raise
         owned = True
+        _check_abort()
     else:
+        results["session"] = session
         owned = C.is_owned_session(session)
         st_check = C.poll_remote_status(session)
         if st_check and st_check.get("alive"):
-            sys.exit(f"⚠️ Session {session} 上已有正在執行的批次任務，請先等待完成或執行 `uv run cstudio cancel --session {session}`")
+            _fail(
+                f"⚠️ Session {session} 上已有正在執行的批次任務，請先等待完成或執行 `uv run cstudio cancel --session {session}`",
+                exit_on_error,
+            )
         print(f"♻️ 沿用開啟中的 Colab Session：{session}（省去安裝與重複下載模型）", flush=True)
+        _emit({"stage": "reusing_vm", "done": False, "log": [f"沿用開啟中的 Colab Session：{session}"]})
         C.set_keep(session, None, owner="owned" if owned else "external")
-
-    t0 = time.time()
-    run_id = uuid.uuid4().hex[:12]
-    results: dict[str, Any] = {
-        "session": session,
-        "gpu": gpu,
-        "run_id": run_id,
-        "model": m.get("model", DEFAULT_MODEL),
-        "jobs": dict((prev_results.get("jobs") or {}) if not force else {}),
-    }
 
     short = dict(timeout=45, tries=6)
     got: set[str] = set()
+    expected_todo_ids = {j["id"] for j in todo}
     finished = False
 
     try:
+        _check_abort()
         # Prepare remote manifest containing only `todo` jobs + metadata flags
         remote_m = dict(
             m,
@@ -478,15 +547,14 @@ def run_manifest(
         dirs = sorted({str(Path(f).parent).replace("\\", "/") for f in files} - {"."})
         input_shas = {f: hashlib.sha256((base / f).read_bytes()).hexdigest() for f in files}
 
+        _emit({"stage": "syncing_code", "done": False, "log": [f"正在同步遠端程式與任務設定至 {session}..."]})
         prep_out = C.remote_exec(
             session,
             bundle_and_launch_code(code_files, bundle_hash, manifest_json, dirs, input_shas),
             **short,
         )
         if need_code:
-            old_k = C.keep_info(session) or {}
-            old_k["bundle_hash"] = bundle_hash
-            C.keep_file(session).write_text(json.dumps(old_k), encoding="utf-8")
+            C.set_keep(session, None, owner="owned" if (owned or created) else "external", extra={"bundle_hash": bundle_hash})
 
         prep_info = {}
         for line in reversed(prep_out.splitlines()):
@@ -499,20 +567,27 @@ def run_manifest(
 
         missing_inputs = prep_info.get("missing_inputs", files)
         for f in missing_inputs:
+            _check_abort()
             print(f"⬆️ 上傳參考圖：{f}", flush=True)
+            _emit({"stage": "uploading_inputs", "done": False, "log": [f"正在上傳參考圖片：{f}"]})
             C.colab("upload", "-s", session, base / f, f"/content/cstudio/inputs/{f}", timeout=600)
 
+        _check_abort()
         if prep_info.get("launched"):
             print(f"▶️ 已單次指令同步並啟動遠端引擎 (pid={prep_info.get('pid')})", flush=True)
+            _emit({"stage": "starting", "done": False, "log": [f"已啟動遠端生成引擎 (pid={prep_info.get('pid')})"]})
         else:
             launch_out = C.remote_exec(session, (REMOTE / "start.py").read_text(encoding="utf-8"), **short)
             print(f"▶️ 已啟動遠端生成引擎：{launch_out.strip()[-200:]}", flush=True)
+            _emit({"stage": "starting", "done": False, "log": ["已啟動遠端生成引擎"]})
 
         shown_log: set[str] = set()
         last_ok = time.time()
+        boot_grace_until = time.time() + 25.0
 
         while True:
             time.sleep(4)
+            _check_abort()
             if time.time() - t0 > max_minutes * 60:
                 raise RuntimeError(f"超過 {max_minutes} 分鐘上限，中止以保護運算單元")
 
@@ -523,7 +598,11 @@ def run_manifest(
                 print("…等待 Colab 回應中", flush=True)
                 continue
 
-            if st.get("run_id") and st.get("run_id") != run_id:
+            st_run_id = st.get("run_id")
+            if st_run_id and st_run_id != run_id:
+                continue
+            # If remote_runner just started and hasn't written status.json yet, give it a brief grace window
+            if not st_run_id and st.get("stage") in ("crashed", "not started") and time.time() < boot_grace_until:
                 continue
 
             last_ok = time.time()
@@ -532,21 +611,23 @@ def run_manifest(
                     shown_log.add(line)
                     print(f"  [Colab] {line}", flush=True)
 
-            if progress_cb:
-                try:
-                    progress_cb(st)
-                except Exception:
-                    pass
+            # If remote reports done=True, hold stage as "syncing_outputs" until local download + SHA256 verification completes
+            st_for_ui = dict(st)
+            if st_for_ui.get("done") and not st_for_ui.get("error"):
+                st_for_ui["stage"] = "syncing_outputs"
+            _emit(st_for_ui)
 
             # Pull newly completed images immediately via atomic temporary file + sha256 verification
             r_jobs = st.get("jobs") or {}
+            synced_any = False
             for jid, jinfo in r_jobs.items():
-                if jid in got or not isinstance(jinfo, dict):
+                if jid not in expected_todo_ids or jid in got or not isinstance(jinfo, dict):
                     continue
                 if jinfo.get("status") == "done" and jinfo.get("file"):
                     tmp_pull = out_dir / f".{jid}_{run_id}.png.tmp"
                     final_dst = out_dir / f"{jid}.png"
                     max_pull_tries = 3 if st.get("done") else 1
+                    pull_err = None
                     for pull_try in range(max_pull_tries):
                         try:
                             C.colab("download", "-s", session, f"/content/cstudio/{jinfo['file']}", tmp_pull, timeout=600)
@@ -557,45 +638,72 @@ def run_manifest(
                             if exp_sha and got_sha != exp_sha:
                                 raise RuntimeError(f"SHA256 校驗不符 (expected {exp_sha[:10]}, got {got_sha[:10]})")
                             tmp_pull.replace(final_dst)
-                            rec = dict(jinfo, fingerprint=fps.get(jid))
+                            rec = dict(jinfo, fingerprint=fps.get(jid), local_synced=True)
                             results["jobs"][jid] = rec
                             save_results(res_file, results)
                             got.add(jid)
+                            local_synced.add(jid)
+                            synced_any = True
                             print(f"⬇️ 已同步回本地：{final_dst} ({final_dst.stat().st_size / 1024:.1f} KB)", flush=True)
                             if rec.get("refined_prompt"):
                                 print(f"   ✨ Prompt Enhancer 擴寫結果：{rec['refined_prompt'][:160]}...", flush=True)
+                            pull_err = None
                             break
                         except Exception as e:
+                            pull_err = str(e)
                             tmp_pull.unlink(missing_ok=True)
                             if pull_try + 1 < max_pull_tries:
                                 print(f"⚠️ 拉回 {jid}.png 失敗，重試中 ({pull_try + 1}/{max_pull_tries})：{e}", flush=True)
                                 time.sleep(2)
                             else:
                                 print(f"⚠️ 拉回 {jid}.png 失敗：{e}", flush=True)
+                    if pull_err and st.get("done"):
+                        results["jobs"][jid] = dict(jinfo, status="sync_error", error=f"遠端已生成但下載回本地失敗：{pull_err}")
+                        save_results(res_file, results)
+                        got.add(jid)
+                        synced_any = True
                 elif jinfo.get("status") == "error":
                     results["jobs"][jid] = dict(jinfo)
                     save_results(res_file, results)
                     got.add(jid)
+                    synced_any = True
                     print(f"❌ 任務 {jid} 失敗：{jinfo.get('error')}", flush=True)
+
+            if synced_any and not st.get("done"):
+                _emit(st_for_ui)
 
             if st.get("done"):
                 if st.get("error") and st.get("stage") in ("error", "crashed", "cancelled"):
                     results["error"] = st["error"]
                 finished = True
+                _emit(st)
                 break
 
+    except BaseException as exc:
+        if "error" not in results:
+            results["error"] = str(exc)
+        raise
     finally:
         results["minutes"] = round((time.time() - t0) / 60, 2)
         try:
-            if stop_after or (not finished and created):
+            if abort_reason == "stop" or (stop_after and abort_reason != "cancel") or (not finished and created and abort_reason != "cancel"):
                 print(f"🛑 關閉 Colab GPU：{session}", flush=True)
                 C.colab("stop", "-s", session, timeout=300, check=False)
                 names, lout = C.sessions_checked()
                 if C.session_gone(session, names, lout):
                     C.drop_keep(session)
                 else:
-                    C.set_keep(session, time.time() - 1, owner="owned")
+                    C.set_keep(session, time.time() - 1, owner="owned" if (owned or created) else "external")
                     C.start_watchdog(session)
+            elif abort_reason == "cancel":
+                keep_mins = max(30.0, float(idle_minutes))
+                C.set_keep(
+                    session,
+                    time.time() + keep_mins * 60,
+                    owner="owned" if (owned or created) else "external",
+                )
+                C.start_watchdog(session)
+                print(f"⏹️ 已中斷任務，{session} 保留 {keep_mins:g} 分鐘待命（模型免重新下載）", flush=True)
             elif not finished:
                 if owned or created:
                     C.set_keep(session, time.time() + idle_minutes * 60, owner="owned")
@@ -635,5 +743,13 @@ def run_manifest(
     ]
     print(f"✅ 批次結束：成功 {len(expected_ids) - len(bad)}/{len(expected_ids)}，耗時 {results['minutes']} 分鐘 → {out_dir}", flush=True)
     if bad or results.get("error"):
-        sys.exit(1)
+        if not results.get("error"):
+            err_details = []
+            for jid in bad:
+                j_err = (results["jobs"].get(jid) or {}).get("error")
+                err_details.append(f"{jid} ({j_err})" if j_err else jid)
+            results["error"] = f"部分任務未成功完成：{', '.join(err_details)}"
+            save_results(res_file, results)
+        if exit_on_error:
+            sys.exit(1)
     return results

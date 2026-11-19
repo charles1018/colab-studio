@@ -168,6 +168,45 @@ def run_selftest() -> int:
         fp2 = R.compute_job_fingerprint(manifest["jobs"][1], manifest, tmp_p, cli_quant="Q4_K_M", versions=versions)
         check(fp1 != fp2, "Job 指紋能正確偵測量化等級 (INT8 vs Q4_K_M)、輸入圖片內容與版本變動")
 
+    # 7. Verify Local Web UI (FastAPI routes, static assets, exit_on_error=False, and gallery scan)
+    from . import colab_client as C
+    from . import webui as W
+
+    check((W.STATIC_DIR / "index.html").is_file(), "Web UI 靜態檔案 index.html 存在")
+    check((W.STATIC_DIR / "style.css").is_file(), "Web UI 靜態檔案 style.css 存在")
+    check((W.STATIC_DIR / "app.js").is_file(), "Web UI 靜態檔案 app.js 存在")
+
+    meta = W.api_meta()
+    check(len(meta["quants"]) == 14 and meta["default_quant"] == "INT8", "Web UI /api/meta 提供完整 14 種權重規格清單（預設 INT8）")
+    check(len(meta["aspect_ratios"]) == 7, "Web UI /api/meta 提供 7 種官方 1K/2K 長寬比設定")
+
+    # Verify sanitize_session_name rejects path traversal
+    rejected_traversal = False
+    try:
+        C.sanitize_session_name("../../etc/passwd")
+    except ValueError:
+        rejected_traversal = True
+    check(rejected_traversal, "sanitize_session_name 成功攔截路徑穿越攻擊字串")
+
+    # Verify exit_on_error=False raises RuntimeError instead of SystemExit
+    raised_runtime_err = False
+    try:
+        R.load_manifest("/nonexistent/path/manifest.json", exit_on_error=False)
+    except RuntimeError:
+        raised_runtime_err = True
+    check(raised_runtime_err, "load_manifest(exit_on_error=False) 拋出 RuntimeError 而非殺死 Web Server 執行緒")
+
+    # Verify parse_sessions ignores '[colab] Pruned 1 stale local session(s).'
+    pruned_parsed = C.parse_sessions("[colab] Pruned 1 stale local session(s).\n[colab] No active sessions found on server.")
+    check(pruned_parsed == [], "parse_sessions 正確忽略 [colab] Pruned / No active sessions 系統訊息")
+
+    # Verify scan_gallery executes cleanly and ignores contact_sheet / comparison_sheet
+    gal = W.scan_gallery(limit=50)
+    check(
+        all(not x["filename"].endswith("_sheet.png") for x in gal),
+        f"scan_gallery 成功掃描本地歷史作品且排除拼圖表 (共 {len(gal)} 筆)",
+    )
+
     if failures:
         print(f"\n❌ 自我測試失敗（共 {len(failures)} 項錯誤）", flush=True)
         return 1
