@@ -1,0 +1,23 @@
+{
+  "model": "qwen-image-2.1-turbo",
+  "quant": "Q4_K_M",
+  "jobs": [
+    {
+      "id": "tokyo_ramen",
+      "mode": "t2i",
+      "prompt": "A neon-lit ramen shop in a rainy Tokyo alley at night, reflections on wet pavement, cinematic, warm steam rising from bowls, wooden signboard reading \"深夜拉麵\"",
+      "aspect_ratio": "16:9",
+      "resolution": "1K",
+      "seed": 42
+    },
+    {
+      "id": "sloth_sticker_rgba",
+      "mode": "t2i",
+      "transparent": true,
+      "prompt": "A cute cyberpunk sloth wearing neon goggles and holding a cup of bubble tea, die-cut vinyl sticker illustration",
+      "aspect_ratio": "1:1",
+      "resolution": "1K",
+      "seed": 100
+    }
+  ]
+}

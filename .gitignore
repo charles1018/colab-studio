@@ -1,0 +1,34 @@
+# Python & uv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS & Editors
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+
+# Credentials, OAuth & Colab runtime tokens (safety net)
+*token*.json
+*pending_login*.json
+sessions.json
+sessions.json.*
+.env
+.env.*
+
+# Job workspaces & generated outputs (allowlist only the public demo manifest)
+/jobs/*
+!/jobs/demo_qwen21/
+/jobs/demo_qwen21/*
+!/jobs/demo_qwen21/manifest.json
+*.tmp

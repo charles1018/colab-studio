@@ -1,0 +1,242 @@
+{
+ "schema": 1,
+ "updated": "2026-11-19",
+ "note": "Version and model revision pinning for colab-studio. Pinning is ON by default (--no-pin-versions or CSTUDIO_PIN_VERSIONS=0 turns it off).",
+ "comfyui": {
+  "repo": "https://github.com/Comfy-Org/ComfyUI.git",
+  "commit": "d5d59c4011312df6b3a4241fb48c045289ad9441"
+ },
+ "custom_nodes": [
+  {
+   "name": "ComfyUI-GGUF",
+   "repo": "https://github.com/city96/ComfyUI-GGUF.git",
+   "commit": "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+  }
+ ],
+ "pip": [
+  {
+   "name": "huggingface_hub",
+   "spec": "huggingface_hub>=0.26.0",
+   "version": null
+  },
+  {
+   "name": "hf_xet",
+   "spec": "hf_xet",
+   "version": null
+  },
+  {
+   "name": "gguf",
+   "spec": "gguf>=0.13.0",
+   "version": null
+  }
+ ],
+ "models": [
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q2_K.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q2_K",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "19c0c8aba44d7dbd760e0d916e3eae8dcc285244cbeca98c34aa0e59c32fb709",
+   "bytes": 2466137920
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q3_K_S.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q3_K_S",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "af7bc3c158a846459a6a7db714354ac3dcea6a9afc3a043786831ef8801d3e53",
+   "bytes": 2724742976
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q3_K_M.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q3_K_M",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "2fd16e6590c8153980f0de4d8965007d8cf3cc497240e74c03db7bb05e799467",
+   "bytes": 3168290624
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q3_K_XL.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q3_K_XL",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "b0a97d37640a2dc0d8205cd357464c550be96c81830d3ca296b5490b40593b42",
+   "bytes": 3612493632
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q4_K_S.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q4_K_S",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "2a8e536a9e615d1407a82a600d1e695f34acbe36c7c169fb4be7eb0ecfa56cbe",
+   "bytes": 3906357056
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q4_K_M.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q4_K_M",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "8940e8b522af886e0c0f5afddf720e82dd223cb9a43580b5f61c4d740452ac20",
+   "bytes": 4199565120
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q5_K_S.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q5_K_S",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "72d93eb6f5d7be1a619c34f525393d001bc2fb9485d087f63c8462932b40177d",
+   "bytes": 4501948224
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q5_K_M.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q5_K_M",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "37c51ff446f4db2e131a9d12c003f0c0e824c8b8ba4dcd8c6cd5753f13457f5f",
+   "bytes": 5390223168
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q6_K.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q6_K",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "f4560fb47ad863ffed7e32737d3c42988c44bd0c459606777d7ffe2e895d0a70",
+   "bytes": 6271551296
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q6_K_XL.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q6_K_XL",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "809a2a16e48aff8cbc7ecb668570b15f5645c8244f68963c2e7926562b668ce2",
+   "bytes": 6718506816
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-Q8_0.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "Q8_0",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "399d2ddc3636f36456e2f5bfa57187da4e38721bc046430317f42a9eab5b1712",
+   "bytes": 7640860480
+  },
+  {
+   "repo": "unsloth/Qwen-Image-2.1-Turbo-GGUF",
+   "file": "qwen-image-2.1-turbo-F16.gguf",
+   "dest": "unet",
+   "group": "qwen21_gguf",
+   "quant": "F16",
+   "revision": "bd53e520a64472adaff780da0b2f2d7eb1605e30",
+   "sha256": "4f2241cb2cccb6ce874ebcdd99138a10f96da9c40e4ff1ea0560111511e3e80f",
+   "bytes": 14230275904
+  },
+  {
+   "repo": "Comfy-Org/Qwen-Image-2.1",
+   "file": "diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors",
+   "dest": "diffusion_models",
+   "group": "qwen21_native",
+   "quant": "INT8",
+   "revision": "aacf31a6d48e707f352ecba714cee0680da3479b",
+   "sha256": "8144a0182964aa8403ad6dbc011db837304167d235161b9aabaa8532e967314c",
+   "bytes": 7256787829
+  },
+  {
+   "repo": "Comfy-Org/Qwen-Image-2.1",
+   "file": "diffusion_models/qwen_image_2.1_turbo_bf16.safetensors",
+   "dest": "diffusion_models",
+   "group": "qwen21_native",
+   "quant": "BF16",
+   "revision": "aacf31a6d48e707f352ecba714cee0680da3479b",
+   "sha256": "8b74237a7f505773e2c66726fa696444b4c704585c93a347cff9044937f7914a",
+   "bytes": 14230280616
+  },
+  {
+   "repo": "Comfy-Org/Qwen-Image-2.1",
+   "file": "text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+   "dest": "text_encoders",
+   "group": "qwen21_core",
+   "revision": "aacf31a6d48e707f352ecba714cee0680da3479b",
+   "sha256": "8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f",
+   "bytes": 9350798360
+  },
+  {
+   "repo": "Comfy-Org/Qwen-Image-2.1",
+   "file": "text_encoders/qwen3vl_8b_w4a8.safetensors",
+   "dest": "text_encoders",
+   "group": "qwen21_core_alt",
+   "revision": "aacf31a6d48e707f352ecba714cee0680da3479b",
+   "sha256": "7754425e55e7bea2bfde4dde59a4cc236cb44e5ee9c215ea66ef8d47012824eb",
+   "bytes": 6312105364
+  },
+  {
+   "repo": "Comfy-Org/Qwen-Image-2.1",
+   "file": "vae/qwen_image_2.1_vae_bf16.safetensors",
+   "dest": "vae",
+   "group": "qwen21_core",
+   "revision": "aacf31a6d48e707f352ecba714cee0680da3479b",
+   "sha256": "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9",
+   "bytes": 675509688
+  },
+  {
+   "repo": "Comfy-Org/Qwen-Image-2.1",
+   "file": "text_encoders/qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors",
+   "dest": "text_encoders",
+   "group": "qwen21_pe_t2i",
+   "pe_variant": "int8",
+   "revision": "aacf31a6d48e707f352ecba714cee0680da3479b",
+   "sha256": "9182abae56fe05459840a86d22abd21f972061c92fce032630af680c8c5178d3",
+   "bytes": 9471072252
+  },
+  {
+   "repo": "Comfy-Org/Qwen-Image-2.1",
+   "file": "text_encoders/qwen3.5_9b_qwen_image_2.1_pe_t2i_w4a8.safetensors",
+   "dest": "text_encoders",
+   "group": "qwen21_pe_t2i",
+   "pe_variant": "w4a8",
+   "revision": "aacf31a6d48e707f352ecba714cee0680da3479b",
+   "sha256": "bdc244869e71e91f9e66638dd85872d8906ac26ce24ef9f32fecbc488e6bc708",
+   "bytes": 6724090764
+  },
+  {
+   "repo": "Comfy-Org/Qwen-Image-2.1",
+   "file": "text_encoders/qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors",
+   "dest": "text_encoders",
+   "group": "qwen21_pe_i2i",
+   "pe_variant": "int8",
+   "revision": "aacf31a6d48e707f352ecba714cee0680da3479b",
+   "sha256": "32707d01b427e488af252b95c551989aad59f9fec611a694f5db6bde7f0f1f6c",
+   "bytes": 9471072252
+  },
+  {
+   "repo": "Comfy-Org/Qwen-Image-2.1",
+   "file": "text_encoders/qwen3.5_9b_qwen_image_2.1_pe_i2i_w4a8.safetensors",
+   "dest": "text_encoders",
+   "group": "qwen21_pe_i2i",
+   "pe_variant": "w4a8",
+   "revision": "aacf31a6d48e707f352ecba714cee0680da3479b",
+   "sha256": "3c7c88f786f1bac5baf2c4b314fe28172cc03d93b29dfc8b445e85a655cbabb1",
+   "bytes": 6724090764
+  }
+ ]
+}
