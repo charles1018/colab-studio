@@ -10,19 +10,21 @@
 ## 開發與離線驗證
 
 - 使用 Python 3.12 與 uv。建立開發環境時用 `uv sync --locked` 依 `uv.lock` 安裝。
-- 在既有環境執行下列離線基準。新增或變更其他 Python 檔案時，將它們一併納入 Ruff 檢查。
+- 在既有環境執行與 Linux CI 一致的離線基準。[GitHub Actions 工作流程](.github/workflows/ci.yml)
 
 ```bash
 uv run --locked --offline --no-sync python -m unittest discover -s tests
 uv run --locked --offline --no-sync cstudio test
-ruff check cstudio/_colab.py cstudio/cli.py cstudio/colab_client.py cstudio/colab_login.py cstudio/runner.py cstudio/webui.py remote/cancel.py remote/remote_runner.py tests
+node --test tests/test_webui_frontend.cjs
+ruff check cstudio remote tests
 node --check cstudio/static/app.js
 uv lock --check --offline
 git diff --check
+git diff --cached --check
 ```
 
 - `uv run --locked --offline --no-sync cstudio plan jobs/demo_qwen21/manifest.json` 可離線規劃批次。回歸測試使用暫存目錄、合成資料、Colab 替身及可控時鐘。
-- `cstudio-patch` 會修改已安裝的 Colab CLI 與共用使用者設定。追查補丁時先用套件測試樣本驗證，實際安裝依部署需求。
+- `cstudio-patch --status` 會唯讀檢查目前虛擬環境中的 Colab CLI。執行 `cstudio-patch` 會修改此虛擬環境的釘選套件，Studio 子程序已在程序內停用更新檢查。追查補丁時先用套件測試樣本驗證，實際安裝依部署需求。
 
 ## 需保護的行為
 

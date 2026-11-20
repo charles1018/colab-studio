@@ -158,8 +158,10 @@ test("progress shows the bound run and actual GPU, and completion refreshes only
   assert.match(getElementById("countdownBadge").textContent, /工作台執行中/);
   assert.equal(chips[3].classList.contains("active"), true);
   assert.equal(chips[0].classList.contains("done"), true);
-  apply(status(3, [], { stage: "done" }), 3);
-  apply(status(4, [], { stage: "done" }), 4);
+  const done = { stage: "done", stage_label: "✅ 批次已完成" };
+  apply(status(3, [], done), 3);
+  apply(status(4, [], done), 4);
+  assert.equal(getElementById("toastMessage").textContent, done.stage_label);
   assert.equal(galleryLoads(), 1);
   assert.equal(run("slowPoll"), null);
 });

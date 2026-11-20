@@ -687,7 +687,7 @@ function renderFinishedRun(st) {
   } else if (st.stage === "error" || st.error) {
     showToast(`❌ 生成失敗：${st.error || "未知錯誤"}`);
   } else if (st.stage === "done") {
-    showToast("✅ 雲端生成與 SHA256 校驗下載完成！", true);
+    showToast(st.stage_label, true);
   }
   loadGallery(true);
 }
@@ -1036,7 +1036,7 @@ async function initStudio() {
 
   el.btnStopTop.addEventListener("click", async () => {
     try {
-      showToast("🛑 正在關閉 Colab GPU 並釋放資源...", true);
+      showToast("🛑 正在處理 Studio Session 關機請求…", true);
       const res = await apiFetch("/api/colab/stop", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1129,7 +1129,7 @@ async function initStudio() {
     el.promptInput.value = text;
     el.chkRefinePrompt.checked = false;
     el.peVariantRow.hidden = true;
-    showToast("⤴️ 已還原此圖設定並填入擴寫提示詞（已關閉自動擴寫以固定重現）！", true);
+    showToast("⤴️ 已套用配方與擴寫提示詞，自動擴寫已關閉", true);
   });
 
   el.btnCloseToast.addEventListener("click", hideToast);

@@ -62,12 +62,12 @@ STAGE_LABELS_ZH: dict[str, str] = {
     "starting": "▶️ 正在啟動遠端生成引擎...",
     "not started": "▶️ 正在等待遠端生成引擎回報...",
     "install": "🔧 正在安裝雲端 ComfyUI 與自訂節點環境...",
-    "models": "⬇️ 正在高速下載／驗證 HuggingFace 權重模型...",
+    "models": "⬇️ 正在準備模型權重...",
     "comfy": "⚙️ 正在啟動雲端 ComfyUI 伺服器...",
     "running": "🎨 正在執行雲端生成任務...",
-    "syncing_outputs": "⬇️ 遠端生成完成，正在下載回本地並執行 SHA256 校驗...",
-    "done": "✅ 生成與 SHA256 校驗下載完成！",
-    "done_with_errors": "⚠️ 部分雲端任務失敗，正在收尾",
+    "syncing_outputs": "⬇️ 正在下載遠端成果並驗證大小與 SHA-256...",
+    "done": "✅ 批次已完成",
+    "done_with_errors": "⚠️ 有雲端任務未完成，正在收尾",
     "cancelling": "⏳ 已要求取消，等待遠端確認",
     "cancelled": "⏹️ 已確認任務取消",
     "cancel_failed": "⚠️ 無法確認遠端任務已停止",
@@ -88,28 +88,28 @@ PROGRESS_STEPS = {
 
 
 def get_quant_catalog() -> list[dict[str, Any]]:
-    """Build catalog of all 14 supported quantization specs (2 Native + 12 Unsloth GGUF) with GB sizes."""
+    """List the 14 selectable weight formats and their pinned sizes."""
     versions = R.load_versions()
     pin_idx = {(e["repo"], e["file"]): e for e in (versions.get("models") or []) if "repo" in e and "file" in e}
     items: list[dict[str, Any]] = []
 
-    # Put default INT8 and BF16 first, followed by popular GGUFs
+    # List native weights first, followed by the GGUF formats.
     ordered_quants = ["INT8", "BF16"] + list(Q.GGUF_QUANTS)
     descriptions = {
-        "INT8": "原生 INT8 ConvRot（官方預設推薦，速度與畫質最佳平衡）",
-        "BF16": "原生 BF16 全精度（適合 A100 / H100 / L4）",
-        "Q8_0": "Unsloth GGUF 8-bit（極高畫質，適合 L4 / G4）",
-        "Q6_K_XL": "Unsloth GGUF 6-bit XL（高細節保留）",
-        "Q6_K": "Unsloth GGUF 6-bit（高畫質推薦）",
-        "Q5_K_M": "Unsloth GGUF 5-bit Medium（均衡推薦）",
+        "INT8": "原生 INT8 ConvRot（預設）",
+        "BF16": "原生 BF16",
+        "Q8_0": "Unsloth GGUF 8-bit",
+        "Q6_K_XL": "Unsloth GGUF 6-bit XL",
+        "Q6_K": "Unsloth GGUF 6-bit",
+        "Q5_K_M": "Unsloth GGUF 5-bit Medium",
         "Q5_K_S": "Unsloth GGUF 5-bit Small",
-        "Q4_K_M": "Unsloth GGUF 4-bit Medium（輕量快速，L4 熱門選擇）",
+        "Q4_K_M": "Unsloth GGUF 4-bit Medium",
         "Q4_K_S": "Unsloth GGUF 4-bit Small",
         "Q3_K_XL": "Unsloth GGUF 3-bit XL",
         "Q3_K_M": "Unsloth GGUF 3-bit Medium",
         "Q3_K_S": "Unsloth GGUF 3-bit Small",
-        "Q2_K": "Unsloth GGUF 2-bit（極限輕量測試用）",
-        "F16": "Unsloth GGUF FP16 全精度",
+        "Q2_K": "Unsloth GGUF 2-bit",
+        "F16": "Unsloth GGUF FP16",
     }
     for q in ordered_quants:
         if q in Q.NATIVE_QUANTS:
@@ -692,8 +692,8 @@ def api_meta():
         "quants": get_quant_catalog(),
         "aspect_ratios": ar_list,
         "pe_variants": [
-            {"id": "int8", "label": "Qwen 3.5 9B INT8（官方預設高精度擴寫）"},
-            {"id": "w4a8", "label": "Qwen 3.5 9B W4A8（輕量快速擴寫）"},
+            {"id": "int8", "label": "Qwen 3.5 9B INT8（預設）"},
+            {"id": "w4a8", "label": "Qwen 3.5 9B W4A8"},
         ],
     }
 
