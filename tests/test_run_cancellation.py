@@ -46,7 +46,7 @@ class RemoteCancellationTests(unittest.TestCase):
         ))
         self.status.write_text(json.dumps(self.state), encoding="utf-8")
         (self.job / "manifest.json").write_text(
-            json.dumps({"_run_id": RUN, "_pin_models": False, "jobs": [{"id": "a", "prompt": "test"}]}),
+            json.dumps({"_run_id": RUN, "_pin_versions": False, "jobs": [{"id": "a", "prompt": "test"}]}),
             encoding="utf-8",
         )
 

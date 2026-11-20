@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import stat
@@ -28,6 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from contextlib import nullcontext
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -42,7 +44,14 @@ STATUS = JOB / "status.json"
 COMFY = Path(os.environ.get("CSTUDIO_COMFY", "/content/ComfyUI"))
 HF_MODELS = Path("/content/hf")
 MARK = Path("/content/.cstudio_setup_v1")
-COMFY_URL = os.environ.get("CSTUDIO_COMFY_URL", "http://127.0.0.1:8188")
+COMFY_PROCESS = JOB / "comfy-process.json"
+COMFY_LOG = Path("/content/comfyui.log")
+DEFAULT_COMFY_URL = "http://127.0.0.1:8188"
+COMFY_URL = os.environ.get("CSTUDIO_COMFY_URL", DEFAULT_COMFY_URL)
+COMFY_INSTANCE = "CSTUDIO_COMFY_INSTANCE"
+COMFY_REPO = "https://github.com/Comfy-Org/ComfyUI.git"
+GGUF_REPO = "https://github.com/city96/ComfyUI-GGUF.git"
+EXTRA_PIP = ("huggingface_hub>=0.26.0", "hf_xet", "gguf>=0.13.0")
 
 STATE: dict = {
     "stage": "starting",
@@ -134,42 +143,155 @@ def _git_head(dest: Path) -> str | None:
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def clone(url: str, dest: Path, commit: str | None = None):
-    dest = Path(dest)
-    if commit is None:
-        if not dest.exists():
-            setup_command(["git", "clone", "--depth", "1", url, str(dest)])
-        else:
-            setup_command(["git", "-C", str(dest), "pull", "--ff-only"], check=False)
-        return
-    if str(commit).startswith("-"):
-        raise RuntimeError(f"bad pinned commit {commit!r}")
+def _installed_checkout(dest: Path, url: str) -> str | None:
+    if dest.is_symlink():
+        raise RuntimeError(f"Git checkout 使用了符號連結：{dest}")
     if not dest.exists():
-        setup_command(["git", "init", "-q", str(dest)])
-        setup_command(["git", "-C", str(dest), "remote", "add", "origin", url])
+        return None
+    git = ["git", "-C", str(dest)]
+    top = setup_command([*git, "rev-parse", "--show-toplevel"], capture_output=True, check=False)
+    if top.returncode != 0 or Path(top.stdout.strip()).resolve() != dest.resolve():
+        raise RuntimeError(f"無法驗證 Git checkout：{dest}")
+    origin = setup_command([*git, "remote", "get-url", "origin"], capture_output=True, check=False)
+    if origin.returncode != 0 or origin.stdout.strip() != url:
+        raise RuntimeError(f"Git origin 與預期不符：{dest}")
+    status = setup_command([*git, "status", "--porcelain", "--untracked-files=all"], capture_output=True)
+    if status.stdout.strip():
+        raise RuntimeError(f"Git checkout 有未提交的變更：{dest}")
+    return _git_head(dest)
+
+
+def clone(url: str, dest: Path, commit: str | None = None) -> str:
+    if not dest.exists() and commit is None:
+        setup_command(["git", "clone", "--depth", "1", "--", url, str(dest)])
     else:
-        top = setup_command(["git", "-C", str(dest), "rev-parse", "--show-toplevel"], capture_output=True, check=False)
-        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != dest.resolve():
-            raise RuntimeError(f"{dest} exists but is not its own git repo")
-    if setup_command(["git", "-C", str(dest), "fetch", "-q", "--depth", "1", "origin", commit], check=False).returncode != 0:
-        setup_command(["git", "-C", str(dest), "fetch", "-q", "origin"])
-    setup_command(["git", "-C", str(dest), "checkout", "-q", "--detach", commit])
-    head = _git_head(dest)
-    if head != commit:
-        raise RuntimeError(f"pinned checkout of {dest} failed: HEAD {head} != {commit}")
+        git = ["git", "-C", str(dest)]
+        if not dest.exists():
+            setup_command(["git", "init", "-q", str(dest)])
+            setup_command([*git, "remote", "add", "origin", url])
+        revision = commit or "HEAD"
+        if commit is None or setup_command(
+            [*git, "cat-file", "-e", f"{commit}^{{commit}}"], capture_output=True, check=False,
+        ).returncode:
+            fetched = setup_command(
+                [*git, "fetch", "-q", "--depth", "1", "origin", revision], capture_output=True, check=False,
+            )
+            if fetched.returncode == 0:
+                revision = "FETCH_HEAD"
+            elif commit is None:
+                fetched.check_returncode()
+            else:
+                setup_command([*git, "fetch", "-q", "origin"])
+        setup_command([*git, "checkout", "-q", "--detach", revision])
+    head = _installed_checkout(dest, url)
+    if head is None or (commit is not None and head != commit):
+        raise RuntimeError(f"Git checkout 未取得預期版本：{dest}")
+    return head
 
 
 def load_pins(manifest: dict) -> dict | None:
     if manifest.get("_pin_versions") is False:
         return None
-    f = JOB / "versions.json"
-    if not f.is_file():
+    try:
+        pins = json.loads((JOB / "versions.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("缺少有效的釘選表 versions.json") from exc
+    if not isinstance(pins, dict):
+        raise RuntimeError("缺少有效的釘選表 versions.json")
+    return pins
+
+
+def _read_record(path: Path) -> dict | None:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
-    return json.loads(f.read_text(encoding="utf-8"))
+    return record if isinstance(record, dict) else None
+
+
+def _write_record(path: Path, record: dict):
+    with tempfile.TemporaryDirectory(dir=path.parent, prefix=".cstudio-state-") as tmp:
+        staged = Path(tmp) / "record.json"
+        staged.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        staged.replace(path)
 
 
 # ---------------------------------------------------------------- 1 install
-def install(pins: dict | None = None):
+def _install_plan(pins: dict | None) -> tuple[list[tuple[Path, str, str | None]], list[str]]:
+    nodes_dir = COMFY / "custom_nodes"
+    if pins is None:
+        return [(COMFY, COMFY_REPO, None), (nodes_dir / "ComfyUI-GGUF", GGUF_REPO, None)], list(EXTRA_PIP)
+
+    try:
+        comfy = pins["comfyui"]
+        nodes = pins["custom_nodes"]
+        repos = [(COMFY, comfy["repo"], comfy["commit"])]
+        for node in nodes:
+            name = node["name"]
+            if not JOB_ID.fullmatch(name):
+                raise ValueError("invalid custom node name")
+            repos.append((nodes_dir / name, node["repo"], node["commit"]))
+        if not nodes or len({path for path, _, _ in repos}) != len(repos):
+            raise ValueError("missing or duplicate custom nodes")
+        for _, url, commit in repos:
+            if not isinstance(url, str) or not url or url.startswith("-") or not re.fullmatch(r"[0-9a-f]{40}", commit):
+                raise ValueError("invalid Git pin")
+        extra = []
+        for package in pins["pip"]:
+            spec = package.get("spec") or package["name"]
+            if not isinstance(spec, str) or not spec.strip() or spec.lstrip().startswith("-"):
+                raise ValueError("invalid package spec")
+            extra.append(spec)
+            if package.get("version") is not None:
+                name = package["name"]
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+                    raise ValueError("invalid package name")
+                extra.append(f"{name}=={package['version']}")
+        if not extra:
+            raise ValueError("missing package specs")
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("versions.json 含有不完整的 ComfyUI、節點或 Python 釘選資料") from exc
+
+    managed = {path for path, _, _ in repos[1:]}
+    for path in nodes_dir.glob("*"):
+        if path in managed or path.name.endswith(".disabled") or path.name == "__pycache__":
+            continue
+        if path.suffix == ".py" or any((path / name).is_file() for name in ("__init__.py", "prestartup_script.py")):
+            raise RuntimeError(f"釘選模式發現未列入 versions.json 的 ComfyUI 節點：{path.name}")
+    return repos, extra
+
+
+def _requirements_versions(requirements: list[Path], extra: list[str]) -> dict[str, str] | None:
+    try:
+        from packaging.requirements import Requirement
+        from packaging.utils import canonicalize_name
+    except ImportError:
+        return None
+
+    specs = list(extra)
+    for path in requirements:
+        specs.extend(path.read_text(encoding="utf-8").splitlines())
+    versions = {}
+    for spec in specs:
+        spec = spec.split(" #", 1)[0].strip()
+        if not spec or spec.startswith("#"):
+            continue
+        req = Requirement(spec)
+        if req.marker and not req.marker.evaluate():
+            continue
+        name = canonicalize_name(req.name)
+        try:
+            installed = version(name)
+        except PackageNotFoundError:
+            return None
+        if req.specifier and not req.specifier.contains(installed, prereleases=True):
+            return None
+        versions[name] = installed
+    return versions
+
+
+def install(pins: dict | None = None) -> str:
+    repos, extra = _install_plan(pins)
     import torch
 
     if not torch.cuda.is_available():
@@ -181,53 +303,39 @@ def install(pins: dict | None = None):
     STATE["gpu_info"] = {"name": gpu_name, "capability": list(cap), "vram_gib": round(vram_gb, 2)}
     save()
 
-    if MARK.exists():
-        log("install: already done on this runtime")
-        return
-
-    pip_cmd = ["uv", "pip", "install", "--system", "-q"] if shutil.which("uv") else [sys.executable, "-m", "pip", "install", "-q"]
-
-    comfy_info = (pins or {}).get("comfyui") or {}
-    comfy_repo = comfy_info.get("repo", "https://github.com/Comfy-Org/ComfyUI.git")
-    comfy_commit = comfy_info.get("commit")
-    log(f"install: cloning ComfyUI ({(comfy_commit or 'HEAD')[:10]})")
-    clone(comfy_repo, COMFY, comfy_commit)
-
-    nodes = (pins or {}).get("custom_nodes") or [
-        {"name": "ComfyUI-GGUF", "repo": "https://github.com/city96/ComfyUI-GGUF.git", "commit": None}
+    heads = {str(path): _installed_checkout(path, url) for path, url, _ in repos}
+    updates = [
+        (path, url, commit) for path, url, commit in repos
+        if heads[str(path)] is None or (commit is not None and heads[str(path)] != commit)
     ]
-    for n in nodes:
-        name = n["name"]
-        url = n["repo"]
-        c = n.get("commit")
-        log(f"install: cloning custom node {name} ({(c or 'HEAD')[:10]})")
-        clone(url, COMFY / "custom_nodes" / name, c)
+    if updates:
+        _stop_comfy_for_install()
+        for path, url, commit in updates:
+            log(f"install: updating {path.name} ({(commit or 'HEAD')[:10]})")
+            heads[str(path)] = clone(url, path, commit)
+    requirements = [path / "requirements.txt" for path, _, _ in repos]
+    requirements = [path for path in requirements if path.is_file()]
+    packages = _requirements_versions(requirements, extra)
+    if packages is None:
+        if not updates:
+            _stop_comfy_for_install()
+        log("install: installing Python packages via uv/pip")
+        pip_cmd = ["uv", "pip", "install", "--system", "-q"] if shutil.which("uv") else [sys.executable, "-m", "pip", "install", "-q"]
+        args = [arg for path in requirements for arg in ("-r", str(path))]
+        setup_command([*pip_cmd, *args, *extra])
+        packages = _requirements_versions(requirements, extra)
+        if packages is None:
+            raise RuntimeError("安裝後的 Python 依賴仍未符合 versions.json 與 requirements.txt")
 
-    log("install: installing Python packages via uv/pip")
-    setup_command([*pip_cmd, "-r", str(COMFY / "requirements.txt")])
-    for n in nodes:
-        req = COMFY / "custom_nodes" / n["name"] / "requirements.txt"
-        if req.is_file():
-            setup_command([*pip_cmd, "-r", str(req)])
-
-    extra_pip = [p.get("spec") or p["name"] for p in ((pins or {}).get("pip") or [])] or [
-        "huggingface_hub>=0.26.0",
-        "hf_xet",
-        "gguf>=0.13.0",
-    ]
-    setup_command([*pip_cmd, *extra_pip])
-
-    MARK.write_text(
-        json.dumps(
-            {
-                "comfyui": _git_head(COMFY),
-                "nodes": {n["name"]: _git_head(COMFY / "custom_nodes" / n["name"]) for n in nodes},
-                "time": time.time(),
-            }
-        ),
-        encoding="utf-8",
-    )
-    log("install: complete")
+    environment = {"python": [sys.executable, sys.version], "heads": heads, "packages": packages}
+    signature = hashlib.sha256(json.dumps(environment, sort_keys=True).encode()).hexdigest()
+    record = {"schema": 2, "environment": environment, "signature": signature}
+    if _read_record(MARK) == record:
+        log("install: verified cached environment")
+    else:
+        _write_record(MARK, record)
+        log("install: verified current environment")
+    return signature
 
 
 # ---------------------------------------------------------------- 2 models
@@ -481,36 +589,179 @@ def cancel_prompts():
         raise CancellationUnconfirmed(f"無法確認 ComfyUI 已停止此批次的 prompt{detail}")
 
 
-def start_comfy(has_pe: bool = False):
+def _comfy_argv() -> list[str] | None:
+    try:
+        stats = call(COMFY_URL + "/system_stats", timeout=5)
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ConnectionRefusedError):
+            return None
+        raise
+    system = stats.get("system") if isinstance(stats, dict) else None
+    argv = system.get("argv") if isinstance(system, dict) else None
+    if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) for arg in argv):
+        raise RuntimeError("無法確認正在執行的 ComfyUI 啟動參數")
+    return argv
+
+
+def _owns_comfy_process(record: dict) -> bool:
+    pid, token = record.get("pid"), record.get("token")
+    if type(pid) is not int or pid <= 0 or not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+        return False
+    try:
+        env = (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    return f"{COMFY_INSTANCE}={token}".encode() in env
+
+
+def _comfy_loopback_port() -> int | None:
+    url = urllib.parse.urlsplit(COMFY_URL)
+    if url.scheme == "http" and url.hostname in ("127.0.0.1", "localhost"):
+        return url.port or 80
+    return None
+
+
+def _comfy_listener_sockets() -> set[str]:
+    port = _comfy_loopback_port()
+    if port is None:
+        return set()
+    address = f"0100007F:{port:04X}"
+    rows = Path("/proc/net/tcp").read_text(encoding="ascii").splitlines()[1:]
+    return {
+        f"socket:[{row[9]}]" for line in rows
+        if len(row := line.split()) > 9 and row[1] == address and row[3] == "0A"
+    }
+
+
+def _process_has_listener(proc: Path, sockets: set[str]) -> bool:
+    try:
+        for fd in (proc / "fd").iterdir():
+            try:
+                if str(fd.readlink()) in sockets:
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def _legacy_comfy_checkout() -> bool:
+    sockets = _comfy_listener_sockets()
+    root = COMFY.resolve()
+    python = Path(sys.executable).resolve()
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            if (
+                (proc / "cwd").resolve(strict=True) == root
+                and (proc / "exe").resolve(strict=True) == python
+                and _process_has_listener(proc, sockets)
+            ):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _stop_owned_comfy(record: dict):
+    proc = Path("/proc") / str(record["pid"])
+    if not _process_has_listener(proc, _comfy_listener_sockets()):
+        raise RuntimeError("無法確認此 ComfyUI 服務由 Studio 啟動")
+    queue = call(COMFY_URL + "/queue", timeout=5)
+    if not isinstance(queue, dict) or any(queue.get(key) != [] for key in ("queue_running", "queue_pending")):
+        raise RuntimeError("ComfyUI 仍有工作或無法確認佇列已清空，請在工作完成後重試")
+
     check_cancel()
     try:
-        call(COMFY_URL + "/system_stats", timeout=5)
-        log("comfy: already running on 127.0.0.1:8188")
+        pidfd = os.pidfd_open(record["pid"])
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError("無法取得 ComfyUI 程序身分以安全重啟") from exc
+    try:
+        if not _owns_comfy_process(record) or not _process_has_listener(proc, _comfy_listener_sockets()):
+            raise RuntimeError("ComfyUI 程序身分已變更，請重試")
+        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        for _ in range(15):
+            if select.select([pidfd], [], [], 1)[0]:
+                break
+            check_cancel()
+        else:
+            raise RuntimeError("未確認 ComfyUI 程序已停止")
+    finally:
+        os.close(pidfd)
+    if _comfy_argv() is not None:
+        raise RuntimeError("ComfyUI 端點已有其他服務，請確認後重試")
+
+
+def _stop_comfy_for_install():
+    record = _read_record(COMFY_PROCESS) or {}
+    owned = _owns_comfy_process(record)
+    if _comfy_argv() is None:
+        if owned:
+            raise RuntimeError("Studio 的 ComfyUI 程序尚未可用，請稍後重試安裝")
         return
-    except Exception:
-        pass
+    if not owned:
+        raise RuntimeError("更新環境前需先停止既有 ComfyUI，Studio 無法確認程序由自己啟動")
+    _stop_owned_comfy(record)
+
+
+def start_comfy(has_pe: bool = False, *, environment: str):
+    check_cancel()
+    port = _comfy_loopback_port()
+    if port is None:
+        raise RuntimeError("ComfyUI 端點必須使用本機 loopback，才能核對執行環境")
     # Keep models resident in GPU VRAM when running the 3-model base set (~14.2 GB fits inside L4 22 GiB VRAM)
     vram_gib = (STATE.get("gpu_info") or {}).get("vram_gib") or 0
     vram_flags = ["--gpu-only"] if (vram_gib >= 20 and not has_pe) else []
+    argv = [str(COMFY.resolve() / "main.py"), "--listen", "127.0.0.1", "--port", str(port), "--disable-auto-launch", *vram_flags]
+    running = _comfy_argv()
+    record = _read_record(COMFY_PROCESS) or {}
+    owned = _owns_comfy_process(record)
+    if running is not None:
+        if owned:
+            proc = Path("/proc") / str(record["pid"])
+            if _process_has_listener(proc, _comfy_listener_sockets()):
+                if running == argv and record.get("environment") == environment:
+                    log("comfy: verified running environment and launch arguments")
+                    return
+            _stop_owned_comfy(record)
+        elif running in (argv, ["main.py", *argv[1:]]) and _legacy_comfy_checkout():
+            log("comfy: verified existing checkout path and launch arguments")
+            return
+        else:
+            raise RuntimeError("既有 ComfyUI 路徑或啟動參數不符，Studio 無法確認程序由自己啟動")
+    elif owned:
+        raise RuntimeError("Studio 的 ComfyUI 程序尚未可用，請稍後重試")
+
     log(f"comfy: starting ComfyUI server ({' '.join(vram_flags) or 'normal-vram'})", "comfy")
-    subprocess.Popen(
-        [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188", "--disable-auto-launch", *vram_flags],
-        cwd=str(COMFY),
-        stdout=open("/content/comfyui.log", "w"),
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    for _ in range(90):
+    token = uuid.uuid4().hex
+    with COMFY_LOG.open("w", encoding="utf-8") as output:
+        process = subprocess.Popen(
+            [sys.executable, *argv], cwd=str(COMFY), stdout=output, stderr=subprocess.STDOUT,
+            start_new_session=True, env={**os.environ, COMFY_INSTANCE: token},
+        )
+    try:
+        _write_record(COMFY_PROCESS, {"pid": process.pid, "token": token, "environment": environment})
+    except OSError:
+        process.terminate()
+        raise
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
         check_cancel()
-        time.sleep(2)
+        if process.poll() is not None:
+            break
         try:
-            call(COMFY_URL + "/system_stats", timeout=5)
+            running = _comfy_argv()
+        except (OSError, ComfyHTTPError):
+            running = None
+        if running is not None:
+            proc = Path("/proc") / str(process.pid)
+            if running != argv or not _process_has_listener(proc, _comfy_listener_sockets()):
+                raise RuntimeError("ComfyUI 啟動後的程序或參數與預期不符")
             log("comfy: ready")
             return
-        except Exception:
-            pass
-    tail = Path("/content/comfyui.log").read_text(errors="ignore")[-2000:]
-    raise RuntimeError("ComfyUI did not start within 180s:\n" + tail)
+        time.sleep(2)
+    tail = COMFY_LOG.read_text(errors="ignore")[-2000:]
+    raise RuntimeError("ComfyUI did not become ready:\n" + tail)
 
 
 def combo_options(spec):
@@ -726,14 +977,12 @@ def run_batch():
             raise ValueError("遠端 manifest 含有不合法的任務 ID")
 
     pins = load_pins(manifest)
-    pin_models = manifest.get("_pin_versions") is not False and bool(manifest.get("_pin_models", True))
-    if pin_models and not isinstance(pins, dict):
-        raise RuntimeError("缺少有效的模型釘選表 versions.json")
+    pin_models = pins is not None and bool(manifest.get("_pin_models", True))
     plugin = get_model_plugin(manifest.get("model"))
     cli_quant = manifest.get("_cli_quant")
 
     # 1. Install ComfyUI & ComfyUI-GGUF
-    install(pins)
+    environment = install(pins)
     check_cancel()
 
     # 2. Download required models for this batch
@@ -743,7 +992,7 @@ def run_batch():
 
     # 3. Start ComfyUI
     has_pe = any(bool(j.get("refine_prompt", manifest.get("refine_prompt", False))) for j in (manifest.get("jobs") or []))
-    start_comfy(has_pe=has_pe)
+    start_comfy(has_pe=has_pe, environment=environment)
 
     confined_path(JOB, OUT.name, directory=True, missing_ok=True).mkdir(exist_ok=True)
     confined_path(JOB, WORK.name, directory=True, missing_ok=True).mkdir(exist_ok=True)
