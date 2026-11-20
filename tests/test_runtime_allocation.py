@@ -2,6 +2,7 @@
 import hashlib
 import io
 import json
+import multiprocessing
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,71 @@ from unittest.mock import Mock, call, patch
 from PIL import Image
 
 from cstudio import colab_client as C
+from cstudio import results as store
 from cstudio import runner as R
+
+
+def _png(color):
+    with io.BytesIO() as image:
+        Image.new("RGB", (4, 4), color).save(image, format="PNG")
+        return image.getvalue()
+
+
+def _workspace_worker(manifest, run_id, pause_at, failed_jobs, ready, resume, reply):
+    fixture = RuntimeAllocationTests()
+    try:
+        fixture.setUp()
+        fixture.manifest = manifest
+        fixture.image_bytes = _png("red")
+        template = fixture.done_status()
+        receipt = template["jobs"]["test"]
+        jobs = json.loads(manifest.read_text())["jobs"]
+        template["jobs"] = {
+            jid: ({"status": "error", "error": f"{jid} fixture failure"} if jid in failed_jobs
+                  else dict(receipt, file=f"out/{jid}.png"))
+            for jid in (job["id"] for job in jobs)
+        }
+        fixture.status.return_value = template
+
+        def pause():
+            ready.set()
+            if not resume.wait(10):
+                raise RuntimeError("fixture did not resume")
+
+        def colab(command, *args, **options):
+            if command == "download" and pause_at == "download" and not ready.is_set():
+                pause()
+            if command == "usage" and pause_at == "finish" and "usage" in fixture.commands:
+                pause()
+            return fixture.fake_colab(command, *args, **options)
+
+        C.colab.side_effect = colab
+        if pause_at == "publish":
+            save_results = store.save_results
+
+            def pause_publication(path, data):
+                if path.name == "results.json" and not ready.is_set():
+                    pause()
+                save_results(path, data)
+
+            fixture.enterContext(patch.object(store, "save_results", side_effect=pause_publication))
+        if pause_at == "allocation":
+            def fail_allocation(*_, **__):
+                pause()
+                raise OSError("fixture allocation failed")
+
+            fixture.enterContext(patch.object(C, "new_runtime", side_effect=fail_allocation))
+        if run_id:
+            fixture.runtimes[fixture.session] = fixture.endpoint
+            result = R.recover_outputs(manifest, run_id)
+        else:
+            result = fixture.run_manifest()
+        reply.send(("ok", result))
+    except BaseException as exc:
+        reply.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        fixture.doCleanups()
+        reply.close()
 
 
 class RuntimeAllocationTests(unittest.TestCase):
@@ -134,6 +199,43 @@ class RuntimeAllocationTests(unittest.TestCase):
             self.manifest, session=self.session, exit_on_error=False,
             should_abort=lambda: self.abort, **options,
         )
+
+    def _workspace_manifest(self, filename, *job_ids):
+        path = self.directory / filename
+        path.write_text(json.dumps({"jobs": [{"id": jid, "prompt": jid} for jid in job_ids]}))
+        return path
+
+    def _paused_workspace_worker(self, manifest, *, pause_at, run_id=None, failed_jobs=()):
+        context = multiprocessing.get_context("spawn")
+        ready, resume = context.Event(), context.Event()
+        receive, reply = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_workspace_worker,
+            args=(manifest, run_id, pause_at, failed_jobs, ready, resume, reply),
+        )
+        process.start()
+        reply.close()
+
+        def cleanup():
+            resume.set()
+            if process.is_alive():
+                process.terminate()
+            process.join(5)
+            receive.close()
+            process.close()
+
+        self.addCleanup(cleanup)
+        self.assertTrue(ready.wait(10), "worker did not reach its pause")
+
+        def finish():
+            resume.set()
+            self.assertTrue(receive.poll(10), "worker did not report")
+            result = receive.recv()
+            process.join(5)
+            self.assertEqual(process.exitcode, 0)
+            return result
+
+        return finish
 
     def test_abort_before_preflight_does_not_allocate(self):
         self.abort = "stop"
@@ -521,9 +623,7 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.assertFalse((self.result_path.parent / "test.png").exists())
 
     def test_disconnect_recovers_only_completed_jobs_from_the_original_run(self):
-        with io.BytesIO() as image:
-            Image.new("RGB", (4, 4), "blue").save(image, format="PNG")
-            self.image_bytes = image.getvalue()
+        self.image_bytes = _png("blue")
         self.manifest.write_text(json.dumps({"jobs": [
             {"id": jid, "prompt": jid} for jid in ("first", "second", "third")
         ]}), encoding="utf-8")
@@ -565,6 +665,116 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.assertEqual(repeat["already_synced"], ["first", "second"])
         self.assertIn("原批次已結束", repeat["errors"]["third"])
         self.assertEqual(self.commands, ["sessions"])
+
+    def test_parallel_runs_merge_different_jobs_and_keep_legacy_results(self):
+        out = self.result_path.parent
+        out.mkdir()
+        legacy = {"status": "done", "file": "out/legacy.png"}
+        (out / "legacy.png").write_bytes(_png("green"))
+        self.result_path.write_text(json.dumps({"jobs": {"legacy": legacy}, "custom": {"note": "keep"}}))
+        other = self._workspace_manifest("other.json", "other", "child_error")
+        finish = self._paused_workspace_worker(other, pause_at="download", failed_jobs=("child_error",))
+
+        self.manifest = self._workspace_manifest("manifest.json", "test", "parent_error")
+        self.image_bytes = _png("blue")
+        status = self.done_status()
+        status["jobs"]["parent_error"] = {"status": "error", "error": "parent fixture failure"}
+        self.status.return_value = status
+        parent = self.run_manifest(force=True)
+        outcome, child = finish()
+        self.assertEqual(outcome, "ok", child)
+
+        stored = json.loads(self.result_path.read_text())
+        self.assertEqual(stored["custom"], {"note": "keep"})
+        self.assertEqual(stored["jobs"]["legacy"], legacy)
+        self.assertEqual(stored["jobs"]["test"], parent["jobs"]["test"])
+        self.assertEqual(stored["jobs"]["other"], child["jobs"]["other"])
+        self.assertEqual(set(stored["jobs"]), {"legacy", "test", "other", "child_error", "parent_error"})
+        self.assertEqual(set(stored["job_errors"]), {"child_error", "parent_error"})
+        self.assertEqual((out / "legacy.png").read_bytes(), _png("green"))
+        self.assertEqual((out / "test.png").read_bytes(), _png("blue"))
+        self.assertEqual((out / "other.png").read_bytes(), _png("red"))
+
+    def test_parallel_older_run_summary_keeps_newer_image_and_record(self):
+        finish = self._paused_workspace_worker(self.manifest, pause_at="finish")
+        self.assertEqual(self.result_path.with_name("test.png").read_bytes(), _png("red"))
+        self.image_bytes = _png("blue")
+        self.status.return_value = self.done_status()
+        newer = self.run_manifest(force=True)["jobs"]["test"]
+        outcome, child = finish()
+        self.assertEqual(outcome, "ok", child)
+        self.assertNotEqual(child["run_id"], newer["run_id"])
+        self.assertEqual(json.loads(self.result_path.read_text())["jobs"]["test"], newer)
+        self.assertEqual(self.result_path.with_name("test.png").read_bytes(), _png("blue"))
+
+    def test_parallel_runs_for_same_job_keep_first_committed_result(self):
+        finish = self._paused_workspace_worker(self.manifest, pause_at="download")
+        self.image_bytes = _png("blue")
+        self.status.return_value = self.done_status()
+        committed = self.run_manifest()["jobs"]["test"]
+        outcome, delayed = finish()
+        self.assertEqual(outcome, "ok", delayed)
+        self.assertIn("本機成果紀錄已由其他批次更新", delayed["error"])
+        stored = json.loads(self.result_path.read_text())
+        self.assertEqual(stored["jobs"]["test"], committed)
+        self.assertNotIn("test", stored.get("job_errors", {}))
+        self.assertEqual(self.result_path.with_name("test.png").read_bytes(), _png("blue"))
+
+    def test_cross_process_recover_rechecks_same_job_after_download_and_merges_the_rest(self):
+        self.manifest = self._workspace_manifest("old.json", "test", "other")
+        self.status.return_value = {"done": True, "alive": False, "jobs": {}}
+        old_run = self.run_manifest()["run_id"]
+        finish = self._paused_workspace_worker(self.manifest, run_id=old_run, pause_at="download")
+
+        self.manifest = self._workspace_manifest("manifest.json", "test")
+        self.image_bytes = _png("blue")
+        self.status.side_effect = [{"alive": False}, self.done_status()]
+        newer = self.run_manifest()["jobs"]["test"]
+        outcome, report = finish()
+        self.assertEqual(outcome, "ok", report)
+        self.assertEqual(report["superseded"], ["test"])
+        self.assertEqual(report["synced"], ["other"])
+        self.assertEqual(report["errors"], {})
+        stored = json.loads(self.result_path.read_text())
+        self.assertEqual(stored["jobs"]["test"], newer)
+        self.assertEqual(stored["jobs"]["other"]["run_id"], old_run)
+        self.assertEqual(self.result_path.with_name("test.png").read_bytes(), _png("blue"))
+        self.assertEqual(self.result_path.with_name("other.png").read_bytes(), _png("red"))
+
+    def test_recover_waits_for_cross_process_publication_to_finish(self):
+        self.manifest = self._workspace_manifest("old.json", "test")
+        self.status.return_value = {"done": True, "alive": False, "jobs": {}}
+        old_run = self.run_manifest()["run_id"]
+        other = self._workspace_manifest("other.json", "other")
+        finish = self._paused_workspace_worker(other, pause_at="publish")
+
+        self.assertEqual(self.result_path.with_name("other.png").read_bytes(), _png("red"))
+        self.assertNotIn("other", json.loads(self.result_path.read_text())["jobs"])
+        self.commands.clear()
+        with patch.object(R, "WORKSPACE_LOCK_TIMEOUT", 0):
+            busy = R.recover_outputs(self.manifest, old_run)
+        self.assertIn("工作目錄正在發布成果", busy["errors"]["test"])
+        self.assertEqual(self.commands, [])
+        outcome, child = finish()
+        self.assertEqual(outcome, "ok", child)
+
+        self.image_bytes = _png("blue")
+        self.status.return_value = self.done_status()
+        self.assertEqual(R.recover_outputs(self.manifest, old_run)["synced"], ["test"])
+        stored = json.loads(self.result_path.read_text())
+        self.assertEqual(stored["jobs"]["other"], child["jobs"]["other"])
+        self.assertEqual(stored["jobs"]["test"]["run_id"], old_run)
+
+    def test_parallel_failed_allocation_keeps_other_run_results(self):
+        other = self._workspace_manifest("other.json", "other")
+        finish = self._paused_workspace_worker(other, pause_at="allocation")
+        self.image_bytes = _png("blue")
+        self.status.return_value = self.done_status()
+        self.run_manifest(stop_after=True)
+        committed = self.result_path.read_bytes()
+        self.assertEqual(finish(), ("error", "OSError: fixture allocation failed"))
+        self.assertEqual(self.result_path.read_bytes(), committed)
+        self.assertEqual(self.result_path.with_name("test.png").read_bytes(), _png("blue"))
 
     def test_recovery_refuses_wrong_account_runtime_run_and_bundle(self):
         self.status.return_value = {"done": True, "alive": False, "jobs": {}}
@@ -679,10 +889,55 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.assertEqual(stored["run_id"], result["run_id"])
         self.assertEqual((self.result_path.parent / "test.png").read_bytes(), self.image_bytes)
 
+    def test_first_publication_failure_keeps_the_verified_download_for_retry(self):
+        self.image_bytes = _png("blue")
+        self.status.return_value = self.done_status()
+        save_results = store.save_results
+
+        def fail_metadata(path, data):
+            if path == self.result_path and data["jobs"]["test"]["status"] == "done":
+                raise OSError("fixture metadata failure")
+            save_results(path, data)
+
+        with patch.object(store, "save_results", side_effect=fail_metadata):
+            failed = self.run_manifest()
+        self.assertFalse(self.result_path.with_name("test.png").exists())
+        self.assertFalse(self.result_path.with_name(".publish.json").exists())
+        self.assertIn("fixture metadata failure", failed["job_errors"]["test"]["error"])
+        self.runtimes.clear()
+        self.commands.clear()
+        self.assertEqual(R.recover_outputs(self.manifest, failed["run_id"])["synced"], ["test"])
+        self.assertEqual(self.result_path.with_name("test.png").read_bytes(), self.image_bytes)
+        self.assertEqual(self.commands, [])
+
+    def test_stop_after_image_replace_rolls_back_and_verifies_shutdown(self):
+        self.image_bytes = _png("blue")
+        self.status.return_value = self.done_status()
+        previous = self.run_manifest()["jobs"]["test"]
+        self.image_bytes = _png("red")
+        self.status.side_effect = [{"alive": False}, self.done_status()]
+        image_path = self.result_path.with_name("test.png")
+        copy_image = store._copy_image
+
+        def copy_then_stop(source, dest):
+            copy_image(source, dest)
+            if dest == image_path:
+                self.abort = "stop"
+
+        with patch.object(store, "_copy_image", side_effect=copy_then_stop):
+            with self.assertRaises(R.RunStopped) as stopped:
+                self.run_manifest(force=True)
+        self.assertEqual(stopped.exception.outcome, C.ReleaseState.CONFIRMED)
+        self.assertIsNone(C.keep_info(self.session))
+        self.assertEqual(image_path.read_bytes(), _png("blue"))
+        self.assertEqual(json.loads(self.result_path.read_text())["jobs"]["test"], previous)
+
     def test_worker_exit_after_image_replace_can_finish_from_local_journal(self):
+        self.image_bytes = _png("blue")
+        self.status.return_value = self.done_status()
         previous = self.run_manifest()["jobs"]["test"]
         old_image = self.image_bytes
-        self.image_bytes = b"new fixture image"
+        self.image_bytes = _png("red")
         self.status.return_value = self.done_status()
         replace = Path.replace
         image_path = self.result_path.with_name("test.png")
@@ -709,9 +964,13 @@ run_id = sys.argv[2]
 request = store.read_object(base / 'out' / '.runs' / run_id / 'request.json')
 outputs = store.RunOutputs(base, run_id, request)
 with outputs.lock():
-    results = store.read_object(outputs.results_path)
-    store.save_results = lambda *_: os._exit(73)
-    outputs.publish('test', results, lambda: None)
+    save_results = store.save_results
+    def interrupt(path, data):
+        if path == outputs.workspace.path:
+            os._exit(73)
+        save_results(path, data)
+    store.save_results = interrupt
+    outputs.publish('test', lambda: None)
 """, str(self.directory), run_id],
             check=False,
         )
@@ -719,11 +978,23 @@ with outputs.lock():
         self.assertEqual(image_path.read_bytes(), self.image_bytes)
         self.assertEqual(json.loads(self.result_path.read_text())["jobs"]["test"], previous)
         self.assertEqual((self.result_path.parent / "_stale" / f"test_{run_id}.png").read_bytes(), old_image)
+
+        original_manifest = self.manifest
+        self.manifest = self._workspace_manifest("other.json", "other")
+        other = dict(self.done_status()["jobs"]["test"], file="out/other.png")
+        self.status.side_effect = [{"alive": False}, dict(self.done_status(), jobs={"other": other})]
+        other_result = self.run_manifest()["jobs"]["other"]
+        self.assertEqual(image_path.read_bytes(), old_image)
+        self.assertEqual(json.loads(self.result_path.read_text())["jobs"]["test"], previous)
+
         self.runtimes.clear()
         self.commands.clear()
-        self.assertEqual(R.recover_outputs(self.manifest, run_id)["synced"], ["test"])
+        self.assertEqual(R.recover_outputs(original_manifest, run_id)["synced"], ["test"])
         self.assertEqual(self.commands, [])
-        self.assertEqual(json.loads(self.result_path.read_text())["jobs"]["test"]["run_id"], run_id)
+        stored = json.loads(self.result_path.read_text())["jobs"]
+        self.assertEqual(stored["test"]["run_id"], run_id)
+        self.assertEqual(stored["other"], other_result)
+        self.assertEqual(image_path.read_bytes(), self.image_bytes)
 
     def test_old_recovery_cannot_replace_a_newer_successful_job(self):
         self.status.return_value = {"done": True, "alive": False, "jobs": {}}

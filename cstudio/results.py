@@ -1,4 +1,4 @@
-"""Verify and publish run outputs with a per-job local recovery journal."""
+"""Verify and publish run outputs with local recovery journals."""
 from __future__ import annotations
 
 import hashlib
@@ -6,11 +6,18 @@ import json
 import os
 import shutil
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
-from filelock import FileLock
+from filelock import FileLock, Timeout as LockTimeout
 
-from remote.job_paths import SHA256, confined_path, file_sha256, json_digest
+from remote.job_paths import JOB_ID, RUN_ID, SHA256, confined_path, file_sha256, json_digest
+
+WORKSPACE_LOCK_TIMEOUT = 5
+RUN_SUMMARY_FIELDS = {
+    "session", "gpu", "run_id", "model", "bundle_hash", "minutes", "error",
+    "shutdown_state", "shutdown_pending", "cu_before", "cu_after", "cu_used",
+}
 
 
 def read_object(path: Path) -> dict:
@@ -114,13 +121,99 @@ class SupersededResult(RuntimeError):
     """Another run published a result for this job after this run began."""
 
 
+class WorkspaceResults:
+    def __init__(self, base: Path):
+        self.base = base
+
+    def _path(self, name: str) -> Path:
+        return confined_path(self.base, f"out/{name}", missing_ok=True)
+
+    @property
+    def path(self) -> Path:
+        return self._path("results.json")
+
+    def backup_path(self, run_id: str, jid: str, archive: bool) -> Path:
+        if archive:
+            return self._path(f"_stale/{jid}_{run_id}.png")
+        return self._path(f".runs/{run_id}/{jid}.previous.png")
+
+    @contextmanager
+    def transaction(self, timeout: float = WORKSPACE_LOCK_TIMEOUT):
+        lock = FileLock(self._path(".results.lock"), timeout=timeout)
+        try:
+            lock.acquire()
+        except LockTimeout:
+            raise RuntimeError("工作目錄正在發布成果，請稍後重試") from None
+        try:
+            current = read_object(self.path)
+            if not isinstance(current.setdefault("jobs", {}), dict):
+                raise ValueError("results.json 的成果清單格式錯誤")
+            self.restore_interrupted_image(current)
+            yield current
+        finally:
+            lock.release()
+
+    def mark_image_replace(self, jid: str, info: dict, *, had_image: bool, archive: bool):
+        save_results(self._path(".publish.json"), {
+            "jid": jid, "run_id": info["run_id"], "revision": done_revision(info),
+            "bytes": info["bytes"], "sha256": info["sha256"], "had_image": had_image, "archive": archive,
+        })
+
+    def restore_interrupted_image(self, current: dict):
+        """Undo an uncommitted replacement before another transaction sees the image."""
+        path = self._path(".publish.json")
+        pending = read_object(path)
+        if not pending and not path.exists():
+            return
+        jid, run_id = pending.get("jid"), pending.get("run_id")
+        if (
+            not isinstance(jid, str) or not JOB_ID.fullmatch(jid)
+            or not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id)
+            or not is_sha256(pending.get("revision")) or not is_sha256(pending.get("sha256"))
+            or type(pending.get("bytes")) is not int or pending["bytes"] <= 0
+            or type(pending.get("had_image")) is not bool or type(pending.get("archive")) is not bool
+        ):
+            raise ValueError("工作目錄的成果發布紀錄格式錯誤")
+        if done_revision(current.get("jobs", {}).get(jid)) != pending["revision"]:
+            final = self._path(f"{jid}.png")
+            if matches_image(final, pending):
+                if pending["had_image"]:
+                    _copy_image(self.backup_path(run_id, jid, pending["archive"]), final)
+                else:
+                    final.unlink()
+        path.unlink()
+
+    def finish(self, summary: dict, previous: dict, *, timeout: float) -> dict:
+        """Merge this batch's summary and failures into the latest workspace state."""
+        with self.transaction(timeout) as current:
+            jobs = current["jobs"]
+            stored_errors = current.get("job_errors")
+            errors = dict(stored_errors) if isinstance(stored_errors, dict) else {}
+            old_errors = previous.get("job_errors")
+            if not isinstance(old_errors, dict):
+                old_errors = {}
+            for jid, error in summary.get("job_errors", {}).items():
+                if jobs.get(jid) != previous["jobs"].get(jid) or errors.get(jid) != old_errors.get(jid):
+                    continue
+                errors[jid] = error
+                if done_revision(jobs.get(jid)) is None:
+                    jobs[jid] = error
+            if errors:
+                current["job_errors"] = errors
+            for field in RUN_SUMMARY_FIELDS:
+                current.pop(field, None)
+            current.update({key: value for key, value in summary.items() if key in RUN_SUMMARY_FIELDS})
+            save_results(self.path, current)
+            return current
+
+
 class RunOutputs:
     def __init__(self, base: Path, run_id: str, request: dict):
         self.base = base
         self.run_id = run_id
         self.request = request
         self.directory = confined_path(base, f"out/.runs/{run_id}", directory=True, missing_ok=True)
-        self.results_path = confined_path(base, "out/results.json", missing_ok=True)
+        self.workspace = WorkspaceResults(base)
 
     def _path(self, name: str) -> Path:
         return confined_path(self.directory, name, missing_ok=True)
@@ -144,8 +237,7 @@ class RunOutputs:
             )
         return record
 
-    def published(self, jid: str, results: dict) -> bool:
-        info = results["jobs"].get(jid)
+    def _published(self, jid: str, info) -> bool:
         if not isinstance(info, dict) or info.get("run_id") != self.run_id:
             return False
         try:
@@ -154,8 +246,7 @@ class RunOutputs:
             return False
         return expected == info and matches_image(self._destination(jid), info)
 
-    def check_previous(self, jid: str, results: dict):
-        info = results["jobs"].get(jid)
+    def _check_previous(self, jid: str, info):
         if isinstance(info, dict) and info.get("run_id") == self.run_id:
             return
         if done_revision(info) != self.request["jobs"][jid]["previous"]:
@@ -175,52 +266,55 @@ class RunOutputs:
             _copy_image(pulled, self._path(f"{jid}.png"))
         save_results(self._path(f".result-{jid}.json"), record)
 
-    def publish(self, jid: str, results: dict, check_active) -> bool:
-        """Replay a completed download, even if the source runtime has gone."""
+    def publish(self, jid: str, check_active, *, timeout: float = WORKSPACE_LOCK_TIMEOUT) -> tuple[dict | None, bool]:
+        """Return the verified local record and whether this call committed it."""
+        with self.workspace.transaction(timeout) as current:
+            check_active()
+            info = current["jobs"].get(jid)
+            self._check_previous(jid, info)
+            if self._published(jid, info):
+                return info, False
+            return self._publish(jid, current, check_active)
+
+    def _publish(self, jid: str, current: dict, check_active) -> tuple[dict | None, bool]:
         receipt = self._path(f".result-{jid}.json")
         if not receipt.is_file():
-            return False
+            return None, False
         info = read_object(receipt)
         if info != self._verified_record(jid, info):
             raise ValueError("暫存成果的批次或程式版本不符")
-        self.check_previous(jid, results)
         staged = self._path(f"{jid}.png")
         final = self._destination(jid)
         already_replaced = matches_image(final, info)
         if not already_replaced and not matches_image(staged, info):
             raise RuntimeError("暫存成果大小或 SHA-256 不符")
         archive = self.request["jobs"][jid]["archive"]
-        backup = self._path(f"{jid}.previous.png")
-        if archive:
-            backup = confined_path(self.base, f"out/_stale/{jid}_{self.run_id}.png", missing_ok=True)
-        check_active()
-        installed = False
-        if final.is_file() and not backup.is_file() and (archive or not already_replaced):
+        backup = self.workspace.backup_path(self.run_id, jid, archive)
+        had_image = final.is_file()
+        had_backup = backup.is_file()
+        if had_image and not had_backup and (archive or not already_replaced):
             backup.parent.mkdir(exist_ok=True)
             _copy_image(final, backup)
-        if not already_replaced:
-            check_active()
-            _copy_image(staged, final)
-            installed = True
-        current = dict(results, jobs={**results["jobs"], jid: info})
-        errors = results.get("job_errors")
-        if results.get("run_id") == self.run_id and isinstance(errors, dict) and jid in errors:
-            current["job_errors"] = {key: value for key, value in errors.items() if key != jid}
+        updated = dict(current, jobs={**current["jobs"], jid: info})
+        if current.keys() == {"jobs"} and not current["jobs"]:
+            updated.update(session=self.request["session"], run_id=self.run_id, bundle_hash=self.request["bundle_hash"])
+            updated.update({key: self.request[key] for key in ("gpu", "model") if key in self.request})
+        errors = current.get("job_errors")
+        if isinstance(errors, dict) and jid in errors:
+            updated["job_errors"] = {key: value for key, value in errors.items() if key != jid}
         try:
+            # A pre-upgrade journal may already have installed its image and kept the backup.
+            if not already_replaced or had_backup:
+                check_active()
+                self.workspace.mark_image_replace(jid, info, had_image=had_image, archive=archive)
+            if not already_replaced:
+                _copy_image(staged, final)
             check_active()
-            save_results(self.results_path, current)
-            results.update(current)
+            save_results(self.workspace.path, updated)
         except BaseException:
-            # A process kill can bypass rollback. The journal still has the
-            # verified bytes and the previous image for the next invocation.
-            stored = read_object(self.results_path).get("jobs", {})
-            if isinstance(stored, dict) and stored.get(jid) == info:
-                results.update(current)
-            elif backup.is_file():
-                _copy_image(backup, final)
-            elif installed:
-                final.unlink()
+            self.workspace.restore_interrupted_image(read_object(self.workspace.path))
             raise
+        self.workspace.restore_interrupted_image(updated)
         # A committed pair takes precedence over leftover staging files.
         try:
             receipt.unlink(missing_ok=True)
@@ -229,4 +323,4 @@ class RunOutputs:
                 backup.unlink(missing_ok=True)
         except OSError:
             pass
-        return True
+        return info, True

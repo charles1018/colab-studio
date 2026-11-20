@@ -22,8 +22,8 @@ from remote.manifest import normalize_manifest, normalize_quant, parse_manifest
 from . import colab_client as C
 from .redact import redact, redact_diagnostics
 from .results import (
-    RunOutputs, SupersededResult, done_revision, execution_digest, is_sha256, matches_image, read_object,
-    save_results, verify_receipt,
+    WORKSPACE_LOCK_TIMEOUT, RunOutputs, SupersededResult, WorkspaceResults, done_revision, execution_digest,
+    is_sha256, matches_image, read_object, save_results, verify_receipt,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -161,11 +161,12 @@ def classify_jobs(
     bundle_hash: str | None = None,
     input_shas: dict[str, str] | None = None,
     versions: dict | None = None,
+    prior_jobs: dict | None = None,
 ) -> tuple[dict[str, str], list[dict[str, Any]], list[str], list[tuple[str, str]]]:
     """Return (fps, todo_jobs, done_ids, stale_list[(jid, reason)])."""
-    res_file = confined_path(base_dir, "out/results.json", missing_ok=True)
-    old_results = read_object(res_file).get("jobs", {})
-    if not isinstance(old_results, dict):
+    if prior_jobs is None:
+        prior_jobs = read_object(WorkspaceResults(base_dir).path).get("jobs", {})
+    if not isinstance(prior_jobs, dict):
         raise ValueError("results.json 的成果清單格式錯誤")
 
     if versions is None:
@@ -189,7 +190,7 @@ def classify_jobs(
         if not out_img.is_file():
             todo.append(j)
             continue
-        prev = old_results.get(jid)
+        prev = prior_jobs.get(jid)
         reason = _stale_output(jid, out_img, prev if isinstance(prev, dict) else {}, fp, legacy,
                                use_fingerprint=use_fingerprint, pin_versions=pin_versions, pin_models=pin_models)
         if reason is None:
@@ -314,12 +315,6 @@ def recover_outputs(manifest_path: str | Path, run_id: str) -> dict:
 
 
 def _recover_outputs(outputs: RunOutputs, session: str, account: str, endpoint: str) -> dict:
-    results = read_object(outputs.results_path)
-    if not results:
-        results.update(session=session, run_id=outputs.run_id, bundle_hash=outputs.request["bundle_hash"])
-    jobs = results.setdefault("jobs", {})
-    if not isinstance(jobs, dict):
-        raise ValueError("results.json 的成果清單格式錯誤")
     report = {"synced": [], "already_synced": [], "pending": [], "unavailable": [], "errors": {}, "superseded": []}
     deadline = time.monotonic() + OUTPUT_RECOVERY_TIMEOUT
 
@@ -336,12 +331,12 @@ def _recover_outputs(outputs: RunOutputs, session: str, account: str, endpoint: 
     remaining = []
     for jid in outputs.request["jobs"]:
         try:
-            if outputs.published(jid, results):
-                report["already_synced"].append(jid)
-            elif outputs.publish(jid, results, check_local):
-                report["synced"].append(jid)
+            record, committed = outputs.publish(
+                jid, check_local, timeout=C.remaining_time(WORKSPACE_LOCK_TIMEOUT, deadline),
+            )
+            if record is not None:
+                report["synced" if committed else "already_synced"].append(jid)
             else:
-                outputs.check_previous(jid, results)
                 remaining.append(jid)
         except SupersededResult:
             report["superseded"].append(jid)
@@ -374,7 +369,13 @@ def _recover_outputs(outputs: RunOutputs, session: str, account: str, endpoint: 
         if isinstance(info, dict) and info.get("status") == "done":
             try:
                 outputs.pull(jid, redact_diagnostics(info), download, check_remote)
-                outputs.publish(jid, results, check_remote)
+                record, _ = outputs.publish(
+                    jid, check_remote, timeout=C.remaining_time(WORKSPACE_LOCK_TIMEOUT, deadline),
+                )
+                if record is None:
+                    raise RuntimeError("找不到已驗證的暫存成果")
+            except SupersededResult:
+                report["superseded"].append(jid)
             except (OSError, RuntimeError, ValueError) as exc:
                 report["errors"][jid] = redact(str(exc))
             else:
@@ -496,22 +497,21 @@ def run_manifest(
     cli_quant = normalize_quant(cli_quant)
     pin_versions = bool(pin_versions)
     pin_models = pin_versions and bool(pin_models)
+    workspace = WorkspaceResults(base)
     try:
         out_dir = confined_path(base, "out", directory=True, missing_ok=True)
-        res_file = confined_path(base, "out/results.json", missing_ok=True)
-        prev_results = read_object(res_file)
-        if not isinstance(prev_results.get("jobs", {}), dict):
-            raise ValueError("results.json 的成果清單格式錯誤")
         sources = _remote_sources()
         bundle_hash = bundle_digest(sources)
         all_input_shas = _reference_hashes(m["jobs"], base)
-        fps, todo, done_ids, stale = classify_jobs(
-            m, base, cli_quant=cli_quant, use_fingerprint=use_fingerprint, gpu=gpu,
-            pin_versions=pin_versions, pin_models=pin_models, bundle_hash=bundle_hash,
-            versions=json.loads(sources["versions.json"]), input_shas=all_input_shas,
-        )
         out_dir.mkdir(exist_ok=True)
-    except (OSError, ValueError) as exc:
+        with workspace.transaction() as prev_results:
+            fps, todo, done_ids, stale = classify_jobs(
+                m, base, cli_quant=cli_quant, use_fingerprint=use_fingerprint, gpu=gpu,
+                pin_versions=pin_versions, pin_models=pin_models, bundle_hash=bundle_hash,
+                versions=json.loads(sources["versions.json"]), input_shas=all_input_shas,
+                prior_jobs=prev_results["jobs"],
+            )
+    except (OSError, RuntimeError, ValueError) as exc:
         _fail(f"無法使用任務檔案：{exc}", exit_on_error)
 
     if force:
@@ -601,13 +601,13 @@ def run_manifest(
         abort_reason = "cancel"
         raise RunCancelled("本地已取消，尚未啟動遠端工作 (cancelled by user)")
 
-    def _check_active():
+    def _check_active(limit: float = deadline):
         _check_abort()
         if time.monotonic() >= deadline:
             raise RuntimeError(f"超過 {max_minutes} 分鐘上限，中止以保護運算單元")
         if C.account_scope() != account:
             raise RuntimeError("Colab 登入身分已變更，請重新確認目標 Session")
-        if endpoint and C.runtime_endpoint(session, deadline=deadline) != endpoint:
+        if endpoint and C.runtime_endpoint(session, deadline=limit) != endpoint:
             raise RuntimeError(f"Session {session} 的遠端識別已變更，請先確認目標")
         if attached and not _run_lease(C.keep_info(session) or {}):
             raise C.KeepChanged(f"Session {session} 的執行紀錄已變更或正在關機")
@@ -763,6 +763,7 @@ def run_manifest(
         request = {
             "schema": 2, "run_id": run_id, "session": session, "account_scope": account,
             "runtime_endpoint": endpoint, "bundle_hash": bundle_hash,
+            "gpu": gpu, "model": results["model"],
             "pin_versions": pin_versions, "pin_models": pin_models,
             "jobs": {jid: {"fingerprint": fps[jid], "previous": done_revision(results["jobs"].get(jid)),
                            "archive": jid in archived} for jid in sorted(expected_todo_ids)},
@@ -880,7 +881,7 @@ def run_manifest(
             sync_deadline = cancel_sync_deadline if cancel_sync_deadline is not None else deadline
 
             def check_sync():
-                _check_active()
+                _check_active(sync_deadline)
                 C.remaining_time(C.RECOVERY_TIMEOUT, sync_deadline)
 
             def download(file, dest):
@@ -896,12 +897,23 @@ def run_manifest(
                     for pull_try in range(max_pull_tries):
                         _check_abort()
                         try:
-                            check_sync()
-                            if not outputs.publish(jid, results, check_sync):
+                            rec, _ = outputs.publish(
+                                jid, check_sync, timeout=C.remaining_time(WORKSPACE_LOCK_TIMEOUT, sync_deadline),
+                            )
+                            if rec is None:
                                 outputs.pull(jid, jinfo, download, check_sync)
-                                outputs.publish(jid, results, check_sync)
+                                rec, _ = outputs.publish(
+                                    jid, check_sync, timeout=C.remaining_time(WORKSPACE_LOCK_TIMEOUT, sync_deadline),
+                                )
+                                if rec is None:
+                                    raise RuntimeError("找不到已驗證的暫存成果")
                         except (RunStopped, RunCancelled, C.KeepChanged):
                             raise
+                        except SupersededResult as exc:
+                            _record_job_error(jid, jinfo, "sync_error", str(exc))
+                            synced_any = True
+                            print(f"⚠️ {exc}", flush=True)
+                            break
                         except (OSError, RuntimeError, ValueError) as exc:
                             _check_active()
                             pull_err = redact(str(exc))
@@ -915,7 +927,7 @@ def run_manifest(
                         got.add(jid)
                         local_synced.add(jid)
                         synced_any = True
-                        rec = results["jobs"][jid]
+                        results["jobs"][jid] = rec
                         print(f"⬇️ 已同步回本地：{out_dir / f'{jid}.png'} ({rec['bytes'] / 1024:.1f} KB)", flush=True)
                         if isinstance(rec.get("refined_prompt"), str) and rec["refined_prompt"]:
                             print(f"   ✨ Prompt Enhancer 擴寫結果：{redact(rec['refined_prompt'])[:160]}...", flush=True)
@@ -1017,11 +1029,19 @@ def run_manifest(
                     C.drop_keep(session, expected=current)
                     print(f"⚠️ 批次未完成，外部 Session {session} 仍在運行。", flush=True)
             finally:
+                batch_error = sys.exception()
                 try:
                     cu_after, _ = C.usage(account=account, deadline=cleanup_deadline)
                     cu_used = round(cu_before - cu_after, 2) if (cu_before is not None and cu_after is not None) else None
                     results.update(cu_before=cu_before, cu_after=cu_after, cu_used=cu_used)
-                    save_results(res_file, results)
+                    try:
+                        results = workspace.finish(results, prev_results, timeout=max(
+                            0, min(WORKSPACE_LOCK_TIMEOUT, cleanup_deadline - time.monotonic()),
+                        ))
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        if batch_error is None:
+                            raise
+                        print(f"⚠️ 無法寫入批次摘要：{redact(str(exc))}", flush=True)
                     if cu_used is not None:
                         print(f"💳 本批預估消耗 {cu_used} 運算單元（{cu_before} → {cu_after}；Colab 用量可能延遲更新）", flush=True)
                 finally:
