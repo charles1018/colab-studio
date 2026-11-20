@@ -10,20 +10,24 @@ Steps:
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -36,6 +40,7 @@ OUT = JOB / "out"
 WORK = JOB / "work"
 STATUS = JOB / "status.json"
 COMFY = Path(os.environ.get("CSTUDIO_COMFY", "/content/ComfyUI"))
+HF_MODELS = Path("/content/hf")
 MARK = Path("/content/.cstudio_setup_v1")
 COMFY_URL = os.environ.get("CSTUDIO_COMFY_URL", "http://127.0.0.1:8188")
 
@@ -52,6 +57,7 @@ STATE: dict = {
 }
 
 MODEL_EXT = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin")
+MODEL_CHUNK_SIZE = 8 * 1024**2
 OBJECT_INFO: dict = {}
 FITTED: dict = {}
 IN_FLIGHT: dict[str, bool] = {}
@@ -235,65 +241,178 @@ def _model_pin_index(pins: dict | None) -> dict[tuple[str, str], dict]:
     return idx
 
 
+def _model_identity(info: os.stat_result) -> list[int]:
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def _hash_model(model, identity: list[int]) -> str:
+    digest = hashlib.sha256()
+    while chunk := model.read(MODEL_CHUNK_SIZE):
+        check_cancel()
+        digest.update(chunk)
+    if _model_identity(os.fstat(model.fileno())) != identity:
+        raise RuntimeError(f"模型檔案在驗證期間變更：{Path(model.name).name}")
+    return digest.hexdigest()
+
+
+def _model_verification_path(dest: Path) -> Path:
+    return dest.with_name(f".{dest.name}.cstudio-verified.json")
+
+
+def _save_model_verification(dest: Path, pin: dict, identity: list[int]):
+    try:
+        with tempfile.TemporaryDirectory(dir=dest.parent, prefix=".cstudio-model-") as tmp:
+            record = Path(tmp) / "verified.json"
+            record.write_text(json.dumps({"pin": pin, "identity": identity}), encoding="utf-8")
+            record.replace(_model_verification_path(dest))
+    except OSError:
+        log(f"models: cannot save verification for {dest.name}; will recheck next run")
+
+
+def _model_cached(dest: Path, pin: dict | None) -> bool:
+    info = dest.stat() if dest.is_file() else None
+    if info is None:
+        return False
+    if pin is None:
+        return info.st_size > 1024
+    if info.st_size != pin["bytes"]:
+        return False
+
+    identity = _model_identity(info)
+    try:
+        record = json.loads(_model_verification_path(dest).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        record = None
+    if record == {"pin": pin, "identity": identity}:
+        return True
+
+    log(f"models: verifying SHA-256 of {dest.name}", "models")
+    with dest.open("rb") as model:
+        if _model_identity(os.fstat(model.fileno())) != identity:
+            raise RuntimeError(f"模型檔案在驗證期間變更：{dest.name}")
+        if _hash_model(model, identity) != pin["sha256"]:
+            return False
+    if _model_identity(dest.stat()) != identity:
+        raise RuntimeError(f"模型檔案在驗證期間變更：{dest.name}")
+    _save_model_verification(dest, pin, identity)
+    return True
+
+
+def _stage_model(source: Path, staged: Path, *, keep_source: bool):
+    if keep_source:
+        try:
+            os.link(source, staged)
+        except OSError:
+            shutil.move(source, staged)
+        return
+    try:
+        source.replace(staged)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        with source.open("rb") as model, staged.open("wb") as out:
+            while chunk := model.read(MODEL_CHUNK_SIZE):
+                check_cancel()
+                out.write(chunk)
+
+
+def _publish_model(staged: Path, dest: Path, pin: dict | None):
+    if pin is None:
+        check_cancel()
+        staged.replace(dest)
+        return
+
+    with staged.open("rb") as model:
+        identity = _model_identity(os.fstat(model.fileno()))
+        if identity[2] != pin["bytes"]:
+            raise RuntimeError(f"下載檔案大小不符 {dest.name}: 預期 {pin['bytes']} bytes, 實際 {identity[2]} bytes")
+        if _hash_model(model, identity) != pin["sha256"]:
+            raise RuntimeError(f"下載檔案 SHA-256 不符：{dest.name}")
+        check_cancel()
+        if _model_identity(staged.stat()) != identity:
+            raise RuntimeError(f"模型檔案在發布前變更：{dest.name}")
+        staged.replace(dest)
+        # Rename can change ctime. Read the published identity from the verified open file.
+        published = _model_identity(os.fstat(model.fileno()))
+        if published[:-1] != identity[:-1] or _model_identity(dest.stat()) != published:
+            raise RuntimeError(f"模型檔案在發布期間變更：{dest.name}")
+    _save_model_verification(dest, pin, published)
+
+
 def download_models(files: list[tuple[str, str, str]], pins: dict | None = None):
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
     pin_idx = _model_pin_index(pins)
-    # Check free disk space before downloading missing files
-    needed_bytes = 0
-    for repo, name, folder in files:
-        dest = COMFY / "models" / folder / Path(name).name
-        if not dest.exists() or dest.stat().st_size <= 1024:
-            p = pin_idx.get((repo, name))
-            if p and p.get("bytes"):
-                needed_bytes += int(p["bytes"])
-
-    free_bytes = shutil.disk_usage("/content").free
-    if needed_bytes > 0 and free_bytes < needed_bytes + 3 * (1024**3):
-        raise RuntimeError(
-            f"Colab 磁碟空間不足：需要約 {needed_bytes / 1e9:.1f} GB，剩餘 {free_bytes / 1e9:.1f} GB"
-        )
+    # Keep the download in a process the runner can stop without interrupting ComfyUI.
+    code = (
+        "import json, sys\n"
+        "from huggingface_hub import hf_hub_download\n"
+        "repo, name, rev, local_dir = sys.argv[1:]\n"
+        "path = hf_hub_download(repo_id=repo, filename=name, revision=rev or None,\n"
+        "                       local_dir=local_dir, force_download=bool(rev))\n"
+        "print('CSTUDIO_MODEL ' + json.dumps(path))\n"
+    )
 
     for i, (repo, name, folder) in enumerate(files, 1):
         check_cancel()
         dest = COMFY / "models" / folder / Path(name).name
+        pin = None
+        if pins is not None:
+            entry = pin_idx.get((repo, name), {})
+            if (
+                entry.get("dest") != folder
+                or type(entry.get("bytes")) is not int or entry["bytes"] <= 0
+                or not isinstance(entry.get("revision"), str) or not entry["revision"]
+                or not isinstance(entry.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+            ):
+                raise RuntimeError(f"缺少有效的模型釘選資料：{repo}/{name}")
+            pin = {key: entry[key] for key in ("repo", "file", "revision", "bytes", "sha256")}
+            # ComfyUI searches the legacy unet directory before diffusion_models.
+            legacy_unet = dest.parent.with_name("unet") / dest.name
+            if folder == "diffusion_models" and legacy_unet.is_file():
+                dest = legacy_unet
+
+        if _model_cached(dest, pin):
+            log(f"models [{i}/{len(files)}]: cached {dest.name} ({dest.stat().st_size / 1e9:.2f} GB)")
+            continue
+
         dest.parent.mkdir(parents=True, exist_ok=True)
-        p = pin_idx.get((repo, name))
-        exp_bytes = int(p["bytes"]) if p and p.get("bytes") else None
-        rev = p.get("revision") if p else None
+        HF_MODELS.mkdir(parents=True, exist_ok=True)
+        if pin is not None:
+            # The old file stays in place. Each filesystem needs room for the new file.
+            needed = [(HF_MODELS, pin["bytes"] + 3 * 1024**3)]
+            if HF_MODELS.stat().st_dev != dest.parent.stat().st_dev:
+                needed.append((dest.parent, pin["bytes"]))
+            for location, needed_bytes in needed:
+                free_bytes = shutil.disk_usage(location).free
+                if free_bytes < needed_bytes:
+                    raise RuntimeError(
+                        f"Colab 磁碟空間不足：{location} 暫存 {dest.name} 需要約 {needed_bytes / 1e9:.1f} GB，"
+                        f"剩餘 {free_bytes / 1e9:.1f} GB"
+                    )
 
-        if dest.exists() and dest.stat().st_size > 1024:
-            if exp_bytes is None or dest.stat().st_size == exp_bytes:
-                log(f"models [{i}/{len(files)}]: cached {dest.name} ({dest.stat().st_size / 1e9:.2f} GB)")
-                continue
-            log(f"models [{i}/{len(files)}]: size mismatch on {dest.name}, re-downloading")
-            dest.unlink()
-
+        rev = pin["revision"] if pin else ""
         log(f"models [{i}/{len(files)}]: downloading {dest.name} from {repo}" + (f" @ {rev[:8]}" if rev else ""), "models")
-        # Keep the download in a process the runner can stop without interrupting ComfyUI.
-        code = (
-            "import json, sys\n"
-            "from huggingface_hub import hf_hub_download\n"
-            "repo, name, rev = sys.argv[1:]\n"
-            "path = hf_hub_download(repo_id=repo, filename=name, revision=rev or None, local_dir='/content/hf')\n"
-            "print('CSTUDIO_MODEL ' + json.dumps(path))\n"
+        download_cache = (
+            tempfile.TemporaryDirectory(dir=HF_MODELS, prefix=".cstudio-download-")
+            if pin else nullcontext(str(HF_MODELS))
         )
-        transfer = setup_command([sys.executable, "-c", code, repo, name, rev or ""], read_stdout=True)
-        for line in reversed(transfer.stdout.splitlines()):
-            if line.startswith("CSTUDIO_MODEL "):
-                got = Path(json.loads(line.partition(" ")[2]))
-                break
-        else:
-            raise RuntimeError(f"模型下載程序未回傳檔案：{dest.name}")
-        check_cancel()
-        if exp_bytes is not None and got.stat().st_size != exp_bytes:
-            raise RuntimeError(f"下載檔案大小不符 {dest.name}: 預期 {exp_bytes} bytes, 實際 {got.stat().st_size} bytes")
-        if dest.exists() or dest.is_symlink():
-            dest.unlink()
-        try:
-            os.link(got, dest)
-        except OSError:
-            shutil.move(str(got), str(dest))
+        with download_cache as download_dir:
+            transfer = setup_command([sys.executable, "-c", code, repo, name, rev, download_dir], read_stdout=True)
+            for line in reversed(transfer.stdout.splitlines()):
+                if line.startswith("CSTUDIO_MODEL "):
+                    got = Path(json.loads(line.partition(" ")[2]))
+                    break
+            else:
+                raise RuntimeError(f"模型下載程序未回傳檔案：{dest.name}")
+            check_cancel()
+            if got != Path(download_dir) / name or not stat.S_ISREG(got.lstat().st_mode):
+                raise RuntimeError(f"模型下載程序回傳非預期檔案：{dest.name}")
+
+            with tempfile.TemporaryDirectory(dir=dest.parent, prefix=".cstudio-model-") as tmp:
+                staged = Path(tmp) / "model.part"
+                _stage_model(got, staged, keep_source=pin is None)
+                _publish_model(staged, dest, pin)
         log(f"models [{i}/{len(files)}]: ready {dest.name} ({dest.stat().st_size / 1e9:.2f} GB)")
         check_cancel()
 
@@ -472,8 +591,10 @@ def fit_names(graph: dict):
     return changes
 
 
-def queue_prompt(graph: dict) -> str:
+def queue_prompt(graph: dict, *, pin_models: bool = False) -> str:
     fitted = fit_names(graph)
+    if pin_models and fitted:
+        raise RuntimeError("ComfyUI 模型路徑偏離已驗證的檔名：" + ", ".join(new for _, _, _, new in fitted))
     check_cancel()
     pid = str(uuid.uuid4())
     IN_FLIGHT[pid] = False
@@ -605,6 +726,9 @@ def run_batch():
             raise ValueError("遠端 manifest 含有不合法的任務 ID")
 
     pins = load_pins(manifest)
+    pin_models = manifest.get("_pin_versions") is not False and bool(manifest.get("_pin_models", True))
+    if pin_models and not isinstance(pins, dict):
+        raise RuntimeError("缺少有效的模型釘選表 versions.json")
     plugin = get_model_plugin(manifest.get("model"))
     cli_quant = manifest.get("_cli_quant")
 
@@ -614,7 +738,7 @@ def run_batch():
 
     # 2. Download required models for this batch
     req_models = plugin.required_models_for_batch(manifest, cli_quant=cli_quant)
-    download_models(req_models, pins=pins if manifest.get("_pin_models", True) else None)
+    download_models(req_models, pins=pins if pin_models else None)
     check_cancel()
 
     # 3. Start ComfyUI
@@ -645,7 +769,7 @@ def run_batch():
                 cli_quant=cli_quant,
                 uploaded_inputs=staged_inputs,
             )
-            pid = queue_prompt(graph)
+            pid = queue_prompt(graph, pin_models=pin_models)
             refine_on = bool(job.get("refine_prompt", manifest.get("refine_prompt", False)))
             timeout_s = int(job.get("timeout", 1200 if refine_on else 600))
             h = wait_history(pid, timeout=timeout_s, what=jid)

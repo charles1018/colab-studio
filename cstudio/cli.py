@@ -175,7 +175,7 @@ def main():
     p_run.add_argument("--remake-stale", action="store_true", help="重新生成已變更/過期的項目（舊檔移至 out/_stale/）")
     p_run.add_argument("--no-fingerprint", action="store_true", help="只檢查檔案是否存在，不比對指紋")
     p_run.add_argument("--no-pin-versions", action="store_true", help="不釘選 ComfyUI 與節點 commit")
-    p_run.add_argument("--no-pin-models", action="store_true", help="不釘選 HuggingFace 模型 revision 與大小")
+    p_run.add_argument("--no-pin-models", action="store_true", help="略過 Hugging Face 模型的 revision、大小與 SHA-256 釘選")
     p_run.add_argument("--assign-retries", type=int, default=5)
     p_run.add_argument("--assign-wait", type=int, default=120)
 

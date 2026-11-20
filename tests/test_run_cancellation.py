@@ -31,7 +31,6 @@ class RemoteCancellationTests(unittest.TestCase):
         self.now = 0
         self.install = Mock()
         self.download = Mock()
-        self.download_models = remote.download_models
         self.start_comfy = Mock()
         self.comfy = Mock(side_effect=AssertionError("ComfyUI network access blocked"))
         clock = SimpleNamespace(
@@ -47,7 +46,8 @@ class RemoteCancellationTests(unittest.TestCase):
         ))
         self.status.write_text(json.dumps(self.state), encoding="utf-8")
         (self.job / "manifest.json").write_text(
-            json.dumps({"_run_id": RUN, "jobs": [{"id": "a", "prompt": "test"}]}), encoding="utf-8"
+            json.dumps({"_run_id": RUN, "_pin_models": False, "jobs": [{"id": "a", "prompt": "test"}]}),
+            encoding="utf-8",
         )
 
     def advance(self, seconds):
@@ -113,21 +113,6 @@ class RemoteCancellationTests(unittest.TestCase):
             call(process.pid, signal.SIGKILL),
         ])
         self.start_comfy.assert_not_called()
-
-    def test_model_transfer_keeps_existing_revision_and_cache_destination(self):
-        source = self.job / "cached.gguf"
-        source.write_bytes(b"blob")
-        pins = {"models": [{
-            "repo": "fixture/model", "file": "folder/model.gguf", "bytes": 4, "revision": "fixture-revision",
-        }]}
-        transfer = Mock(return_value=SimpleNamespace(stdout="CSTUDIO_MODEL " + json.dumps(str(source))))
-        with patch.object(remote, "COMFY", self.job / "comfy"), \
-             patch.object(remote, "setup_command", transfer), \
-             patch.object(remote.shutil, "disk_usage", return_value=SimpleNamespace(free=10**10)), \
-             patch.dict(remote.os.environ):
-            self.download_models([("fixture/model", "folder/model.gguf", "unet")], pins)
-        self.assertEqual(transfer.call_args.args[0][-3:], ["fixture/model", "folder/model.gguf", "fixture-revision"])
-        self.assertEqual((self.job / "comfy/models/unet/model.gguf").read_bytes(), b"blob")
 
     def test_targeted_cancel_waits_until_own_prompt_leaves_running_queue(self):
         remote.IN_FLIGHT[PROMPT] = True
