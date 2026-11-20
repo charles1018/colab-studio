@@ -688,6 +688,51 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"fixture-ui-runtime", fast.body)
         self.assertIn(b"[redacted]", fast.body)
 
+    async def test_status_routes_share_session_view_and_reject_expired_browser_selection(self):
+        cookie = await self.open_ui()
+        self.cloud["sessions"].return_value = (["external"], "[external] fixture-old-endpoint | Hardware: A100")
+        slow = await self.request("/api/colab/status?force=true", headers=(cookie, UI_HEADER))
+        fast = await self.request("/api/run/status", headers=(cookie,))
+        slow_view, fast_view = json.loads(slow.body), json.loads(fast.body)
+        self.assertEqual(slow_view["view_id"], fast_view["view_id"])
+        self.assertGreater(fast_view["revision"], slow_view["revision"])
+        self.assertEqual(fast_view["sessions"], slow_view["sessions"])
+        self.cloud["sessions"].assert_called_once()
+        self.assertNotIn(b"fixture-old-endpoint", slow.body)
+        selection = fast_view["sessions"][0]["id"]
+        self.cloud["sessions"].return_value = (["external"], "[external] fixture-new-endpoint | Hardware: L4")
+        await self.request("/api/colab/status?force=true", headers=(cookie, UI_HEADER))
+
+        form_header = ("content-type", "application/x-www-form-urlencoded")
+        origin = ("origin", ORIGIN)
+        form = urlencode({"prompt": "Synthetic prompt", "session": "external", "session_id": selection}).encode()
+        start = await self.request("/api/run/start", method="POST", headers=(cookie, UI_HEADER, origin, form_header),
+                                   body=form)
+        self.assertEqual(start.status, 409)
+        self.run_manifest.assert_not_called()
+        self.assertEqual(list(self.jobs.iterdir()), [self.image.parents[1]])
+        for action in ("keep", "cancel"):
+            rejected = await self.request(f"/api/colab/{action}", method="POST",
+                                          headers=(cookie, UI_HEADER, origin, JSON_HEADER),
+                                          body=json.dumps({"session": "external", "session_id": selection}).encode())
+            self.assertEqual(rejected.status, 409)
+        self.cloud["keep_target"].assert_not_called()
+        self.cloud["request_cancel"].assert_not_called()
+
+        current = await self.request("/api/run/status", headers=(cookie,))
+        new_id = json.loads(current.body)["sessions"][0]["id"]
+        form = urlencode({"prompt": "Synthetic prompt", "session": "external", "session_id": new_id}).encode()
+        with patch.object(W, "threading", SimpleNamespace(
+            Thread=lambda *, target, **_: SimpleNamespace(start=target),
+        )):
+            accepted = await self.request("/api/run/start", method="POST",
+                                          headers=(cookie, UI_HEADER, origin, form_header), body=form)
+        self.assertEqual(accepted.status, 202, accepted.body)
+        self.assertEqual(self.run_manifest.call_args.kwargs["expected_endpoint"], "fixture-new-endpoint")
+        self.assertFalse(json.loads(accepted.body)["status"]["running"])
+        await self.request("/api/run/status", headers=(cookie,))
+        self.assertEqual(self.cloud["sessions"].call_count, 3, "completion triggers one additional listing")
+
     def test_launcher_binds_only_supported_loopback_hosts_and_disables_forwarding(self):
         with patch("uvicorn.run") as run, patch.object(W.webbrowser, "open") as open_browser, patch("builtins.print"):
             for host in ("0.0.0.0", "::", "192.0.2.10", "workbench.example.test"):

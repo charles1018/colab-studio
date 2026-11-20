@@ -196,8 +196,8 @@ def parse_sessions(out: str) -> list[str]:
     return names
 
 
-def listed_assignments(out: str) -> dict[str, str] | None:
-    """Return endpoint → alias for a complete listing, including unnamed assignments."""
+def listed_runtimes(out: str) -> dict[str, tuple[str, str]] | None:
+    """Return endpoint → (alias, hardware) for a complete listing."""
     rows = [
         line for line in out.strip().splitlines() if line
         and not re.fullmatch(r"\[colab\] Pruned \d+ stale local session\(s\)\.", line)
@@ -213,15 +213,21 @@ def listed_assignments(out: str) -> dict[str, str] | None:
     assignments = {}
     names = set()
     for row in rows:
-        match = re.fullmatch(r"\[([^\]]+)\] (\S+) \| Hardware: .+", row)
+        match = re.fullmatch(r"\[([^\]]+)\] (\S+) \| Hardware: (.+)", row)
         if not match:
             return None
-        name, endpoint = match.groups()
+        name, endpoint, hardware = match.groups()
         if endpoint in assignments or (name != "?" and name in names):
             return None
-        assignments[endpoint] = name
+        assignments[endpoint] = name, hardware.split(" | ", 1)[0]
         names.add(name)
     return assignments or None
+
+
+def listed_assignments(out: str) -> dict[str, str] | None:
+    """Return endpoint → alias, including unnamed assignments."""
+    runtimes = listed_runtimes(out)
+    return None if runtimes is None else {ep: name for ep, (name, _) in runtimes.items()}
 
 
 def sessions(

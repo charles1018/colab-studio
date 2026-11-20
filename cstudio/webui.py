@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from dataclasses import replace
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from . import colab_login as L
 from . import runner as R
 from .redact import redact
 from .web_inputs import MAX_REFERENCES, GenerationRoute, prepare_reference_images
+from .web_sessions import CACHE_SECONDS, STALE_SECONDS, CloudStatus, session_id, session_rows
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -42,17 +44,20 @@ from models import qwen_image_21 as Q  # noqa: E402
 
 STAGE_LABELS_ZH: dict[str, str] = {
     "idle": "待命中",
+    "selecting_vm": "🔎 正在確認 Colab Session 目標...",
     "booting_vm": "🚀 正在 Google Colab 分配並啟動 GPU...",
     "reusing_vm": "♻️ 正在連線沿用開啟中的 Colab GPU...",
     "syncing_code": "📦 正在同步遠端引擎與任務設定...",
     "uploading_inputs": "⬆️ 正在上傳參考圖片至 Colab...",
     "starting": "▶️ 正在啟動遠端生成引擎...",
+    "not started": "▶️ 正在等待遠端生成引擎回報...",
     "install": "🔧 正在安裝雲端 ComfyUI 與自訂節點環境...",
     "models": "⬇️ 正在高速下載／驗證 HuggingFace 權重模型...",
     "comfy": "⚙️ 正在啟動雲端 ComfyUI 伺服器...",
-    "generate": "🎨 正在執行 Qwen-Image-2.1 8 步極速取樣（含 Prompt Enhancer 擴寫）...",
+    "running": "🎨 正在執行雲端生成任務...",
     "syncing_outputs": "⬇️ 遠端生成完成，正在下載回本地並執行 SHA256 校驗...",
     "done": "✅ 生成與 SHA256 校驗下載完成！",
+    "done_with_errors": "⚠️ 部分雲端任務失敗，正在收尾",
     "cancelling": "⏳ 已要求取消，等待遠端確認",
     "cancelled": "⏹️ 已確認任務取消",
     "cancel_failed": "⚠️ 無法確認遠端任務已停止",
@@ -62,6 +67,13 @@ STAGE_LABELS_ZH: dict[str, str] = {
     "shutdown_pending": "⏳ Colab Session 關機待確認",
     "error": "❌ 執行發生錯誤",
     "crashed": "❌ 遠端程序異常中止",
+}
+
+PROGRESS_STEPS = {
+    "selecting_vm": "boot", "booting_vm": "boot", "reusing_vm": "boot",
+    "syncing_code": "boot", "uploading_inputs": "boot", "starting": "boot", "not started": "boot",
+    "install": "install", "models": "models", "comfy": "generate", "running": "generate",
+    "syncing_outputs": "sync", "done": "sync", "done_with_errors": "sync",
 }
 
 
@@ -334,6 +346,8 @@ class StudioUIState:
         self.lock = threading.Lock()
         self.colab_query_lock = threading.Lock()
         self.revision: int = 0
+        self.view_id = uuid.uuid4().hex
+        self.session_key = secrets.token_bytes(32)
         self.running: bool = False
         self.provisioning: bool = False
         self.cancel_requested: bool = False
@@ -343,10 +357,15 @@ class StudioUIState:
         self.job_id: str | None = None
         self.stage: str = "idle"
         self.stage_label: str = STAGE_LABELS_ZH["idle"]
+        self.progress_step: str | None = None
         self.session: str | None = None
         self.session_account: str | None = None
+        self.session_endpoint: str | None = None
+        self.runtime_attached = False
         self.shutdown_endpoint: str | None = None
-        self.gpu: str = "L4"
+        self.requested_gpu: str | None = None
+        self.actual_gpu: str | None = None
+        self.gpu_source: str | None = None
         self.quant: str = Q.DEFAULT_QUANT
         self.started_at: float | None = None
         self.finished_at: float | None = None
@@ -355,17 +374,9 @@ class StudioUIState:
         self.synced_images: list[dict[str, Any]] = []
         self.last_recipe: dict[str, Any] | None = None
 
-        # Cached slow-path Colab status
         self.colab_cache_account: str | None = None
-        self.colab_cache: dict[str, Any] = {
-            "checked_at": 0.0,
-            "token_ok": C.token_ok(),
-            "cu": None,
-            "cu_raw": "尚未查詢",
-            "sessions": [],
-            "sessions_raw": "",
-            "refreshing": False,
-        }
+        self.colab_cache = CloudStatus()
+        self.cloud_generation = 0
 
     def _bump(self) -> int:
         self.revision += 1
@@ -386,16 +397,30 @@ class StudioUIState:
                 self.run_id = str(st["run_id"])
             if st.get("session"):
                 self.session = str(st["session"])
-            if st.get("gpu"):
-                self.gpu = str(st["gpu"])
             raw_stage = str(st.get("stage") or self.stage or "starting")
+            endpoint = st.get("_runtime_endpoint")
+            if endpoint and endpoint != self.session_endpoint:
+                self.session_endpoint = endpoint
+                if self.colab_cache.runtimes.get(endpoint, (None,))[0] != self.session:
+                    self.invalidate_cloud()
+            self.runtime_attached = st.get("_runtime_attached", self.runtime_attached)
+            gpu_info = st.get("gpu_info")
+            detected = gpu_info.get("name") if isinstance(gpu_info, dict) else None
+            listed = st.get("_listed_hardware")
+            if isinstance(detected, str) and detected.strip():
+                self.actual_gpu, self.gpu_source = redact(detected.strip()), "cuda"
+            elif self.actual_gpu is None and isinstance(listed, str) and listed.strip():
+                self.actual_gpu, self.gpu_source = redact(listed.strip()), "colab"
             if raw_stage == "booting_vm":
+                if not self.provisioning:
+                    self.invalidate_cloud()
                 self.provisioning = True
             elif raw_stage in ("reusing_vm", "syncing_code"):
                 self.provisioning = False
             if self.abort_action != "stop":
                 self.stage = raw_stage
                 self.stage_label = STAGE_LABELS_ZH.get(raw_stage, f"🔄 執行中 ({raw_stage})...")
+                self.progress_step = PROGRESS_STEPS.get(raw_stage, self.progress_step)
 
             for line in st.get("log") or []:
                 s_line = redact(str(line)).strip()
@@ -441,132 +466,143 @@ class StudioUIState:
 
             self._bump()
 
-    def fast_status(self) -> dict[str, Any]:
-        now = time.time()
-        keeps = read_local_keeps()
+    def _observe_account(self) -> str | None:
+        account = C.account_scope()
+        if account != self.colab_cache_account:
+            self.colab_cache_account = account
+            self.colab_cache = CloudStatus()
+            self.cloud_generation += 1
+        return account
+
+    def invalidate_cloud(self) -> None:
+        """Discard in-flight observations after an operation that can change assignments."""
+        self.cloud_generation += 1
+        self.colab_cache = replace(self.colab_cache, complete=False, checked_mono=None)
+
+    def selected_endpoint(self, account: str | None, name: str, selection: str) -> str:
+        """Resolve a UI selection to the exact endpoint that the browser saw."""
         with self.lock:
-            elapsed = round(now - self.started_at, 1) if (self.running and self.started_at) else (
-                round(self.finished_at - self.started_at, 1)
-                if (self.started_at and self.finished_at)
-                else 0.0
-            )
-            active_sess = self.session
-            if not active_sess and keeps:
-                active_sess = keeps[0]["session"]
-            active_keep = next((k for k in keeps if k["session"] == active_sess), None)
-            return {
-                "revision": self.revision,
-                "running": self.running,
-                "cancel_requested": self.cancel_requested,
-                "run_id": self.run_id,
-                "job_dir": self.job_dir,
-                "job_id": self.job_id,
-                "stage": self.stage,
-                "stage_label": self.stage_label,
-                "session": active_sess,
-                "gpu": self.gpu,
-                "quant": self.quant,
-                "elapsed_sec": elapsed,
-                "logs": list(self.logs[-30:]),
-                "error": self.error,
-                "synced_images": list(self.synced_images),
-                "last_recipe": self.last_recipe,
-                "local_keeps": keeps,
-                "active_keep": active_keep,
-                "token_ok": C.token_ok(),
-            }
+            if account and self._observe_account() == account:
+                for endpoint, (alias, _) in self.colab_cache.runtimes.items():
+                    if alias == name and selection == session_id(self.session_key, account, name, endpoint):
+                        return endpoint
+        raise HTTPException(status_code=409, detail="所選的 Colab Session 已變更，請重新整理並選擇")
+
+    def _status(self, account: str | None) -> dict[str, Any]:
+        now = time.time()
+        cache = self.colab_cache
+        fresh = cache.fresh(time.monotonic(), STALE_SECONDS)
+        complete = fresh and cache.complete
+        sessions = session_rows(cache, account, self.session_key, now, complete) if account else []
+        same_account = bool(account and self.session_account == account)
+        run_visible = same_account or self.session_account is None
+        run_session = self.session if self.running and same_account else None
+        run_key = (session_id(self.session_key, account, run_session, self.session_endpoint)
+                   if run_session and self.session_endpoint else None)
+        attached = bool(run_session and self.runtime_attached)
+        elapsed = (round((now if self.running else self.finished_at) - self.started_at, 1)
+                   if self.started_at is not None and (self.running or self.finished_at is not None) else 0.0)
+        target = next((row for row in sessions if attached and row["id"] == run_key), None)
+        gpu, gpu_source = (self.actual_gpu, self.gpu_source) if run_visible else (None, None)
+        if gpu is None and target and target["presence"] == "present" and target["hardware"]:
+            gpu, gpu_source = target["hardware"], "colab"
+        active = target
+        if active is None:
+            active = next((row for row in sessions if row["presence"] != "gone"), sessions[0] if sessions else None)
+        return {
+            "view_id": self.view_id,
+            "revision": self._bump(),
+            "running": self.running,
+            "can_cancel": self.running and run_visible and not self.cancel_requested,
+            "run_id": self.run_id if run_visible else None,
+            "job_dir": self.job_dir,
+            "job_id": self.job_id,
+            "stage": self.stage,
+            "stage_label": (self.stage_label if run_visible or not self.running
+                            else "⏳ Colab 登入身分已變更，正在等待本機批次結束"),
+            "progress_step": self.progress_step,
+            "session": run_session,
+            "run_session_id": run_key,
+            "runtime_attached": attached,
+            "requested_gpu": self.requested_gpu if run_visible else None,
+            "gpu": gpu,
+            "gpu_source": gpu_source,
+            "quant": self.quant,
+            "elapsed_sec": elapsed,
+            "logs": list(self.logs[-30:]) if run_visible else [],
+            "error": self.error if run_visible else None,
+            "synced_images": list(self.synced_images),
+            "last_recipe": self.last_recipe,
+            "token_ok": bool(account),
+            "cu": cache.cu if fresh else None,
+            "cu_raw": cache.cu_raw if fresh else "尚未查詢",
+            "cloud_status": "confirmed" if complete else "unknown",
+            "checked_at": cache.checked_at,
+            "confirmed_at": cache.confirmed_at,
+            "sessions_failed": fresh and cache.failed,
+            "cu_failed": fresh and cache.cu_failed,
+            "unnamed_sessions": sum(name == "?" for name, _ in cache.runtimes.values()) if complete else 0,
+            "sessions": sessions,
+            "active_session": active,
+        }
+
+    def fast_status(self) -> dict[str, Any]:
+        with self.lock:
+            return self._status(self._observe_account())
 
     def refresh_colab_cache(self, force: bool = False) -> dict[str, Any]:
-        account = C.account_scope()
-        now = time.time()
         with self.lock:
-            age = now - float(self.colab_cache.get("checked_at") or 0.0)
-            if not force and account == self.colab_cache_account and self.colab_cache.get("checked_at") and age < 30.0:
-                return dict(self.colab_cache, local_keeps=read_local_keeps())
+            account = self._observe_account()
+            baseline = self.colab_cache
+            if not account or (not force and baseline.fresh(time.monotonic(), CACHE_SECONDS)):
+                return self._status(account)
 
-        # Single-flight query so concurrent requests don't spawn duplicate `colab` CLI processes
+        # Concurrent requests for the same account/generation share the query, including force.
         with self.colab_query_lock:
-            account = C.account_scope()
-            now2 = time.time()
             with self.lock:
-                age2 = now2 - float(self.colab_cache.get("checked_at") or 0.0)
-                if not force and account == self.colab_cache_account and self.colab_cache.get("checked_at") and age2 < 10.0:
-                    return dict(self.colab_cache, local_keeps=read_local_keeps())
-                self.colab_cache["refreshing"] = True
+                account = self._observe_account()
+                cache = self.colab_cache
+                if not account or (cache is not baseline and cache.checked_mono is not None):
+                    return self._status(account)
+                generation = self.cloud_generation
 
-            tok = C.token_ok()
-            cu_val: float | None = None
-            cu_raw = "尚未登入"
-            sess_names: list[str] = []
-            sess_raw = ""
-            if account:
-                cu_val, cu_raw = C.usage(account=account)
-                try:
-                    sess_names, sess_raw = C.sessions(check=True, account=account)
-                except (OSError, RuntimeError, SystemExit):
-                    sess_raw = "無法確認 Colab Session 清單"
+            try:
+                cu, cu_raw = C.usage(account=account)
+            except (OSError, ValueError, RuntimeError, SystemExit):
+                cu, cu_raw = None, "無法讀取剩餘運算單元"
+            try:
+                names, listing = C.sessions(check=True, account=account)
+                runtimes = C.listed_runtimes(listing)
+            except (OSError, RuntimeError, SystemExit):
+                names, listing, runtimes = None, "", None
 
-            keeps_by_name = {k["session"]: k for k in read_local_keeps()}
-            assignments = C.listed_assignments(sess_raw)
-            endpoints = {name: ep for ep, name in (assignments or {}).items()}
-            sessions_detail: list[dict[str, Any]] = []
-            seen_names: set[str] = set()
-            for n in sess_names:
-                seen_names.add(n)
-                k = keeps_by_name.get(n)
-                record = C.keep_info(n) or {}
-                if record.get("runtime_endpoint") != endpoints.get(n) or record.get("account_scope", account) != account:
-                    k = None
-                sessions_detail.append(
-                    {
-                        "name": n,
-                        "alive": True,
-                        "owned": C.is_owned_session(n, account=account, assignments=assignments),
-                        "remaining_sec": k["remaining_sec"] if k else None,
-                        "busy": k["busy"] if k else False,
-                        "release_pending": k["release_pending"] if k else False,
-                    }
+            with self.lock:
+                current = self._observe_account()
+                if current != account or generation != self.cloud_generation:
+                    return self._status(current)
+                now = time.time()
+                self.colab_cache = CloudStatus(
+                    runtimes=runtimes if runtimes is not None else cache.runtimes,
+                    complete=runtimes is not None,
+                    checked_at=now,
+                    checked_mono=time.monotonic(),
+                    confirmed_at=now if runtimes is not None else cache.confirmed_at,
+                    cu=cu if cu is not None and math.isfinite(cu) else None,
+                    cu_raw=redact(cu_raw),
+                    failed=runtimes is None,
+                    cu_failed=cu is None or not math.isfinite(cu),
                 )
-            for k_name, k in keeps_by_name.items():
-                if k_name not in seen_names:
-                    sessions_detail.append(
-                        {
-                            "name": k_name,
-                            "alive": False,
-                            "owned": k["owner"] == "owned",
-                            "remaining_sec": k["remaining_sec"],
-                            "busy": k["busy"],
-                            "release_pending": k["release_pending"],
-                        }
-                    )
-
-            updated = {
-                "checked_at": time.time(),
-                "checked_at_str": time.strftime("%H:%M:%S"),
-                "token_ok": tok,
-                "cu": cu_val,
-                "cu_raw": redact(cu_raw),
-                "sessions": sessions_detail,
-                "active_session_names": sess_names,
-                "sessions_raw": redact(sess_raw),
-                "refreshing": False,
-                "local_keeps": list(keeps_by_name.values()),
-            }
-            with self.lock:
-                self.colab_cache = updated
-                self.colab_cache_account = account
                 if (
                     not self.running and self.session and self.stage == "shutdown_pending"
-                    and account and account == self.session_account == C.account_scope()
-                    and not C.keep_file(self.session).exists()
-                    and C.session_gone(self.session, sess_names, sess_raw, self.shutdown_endpoint)
+                    and account == self.session_account and not C.keep_file(self.session).exists()
+                    and C.session_gone(self.session, names, listing, self.shutdown_endpoint)
                 ):
                     self.session = None
                     self.shutdown_endpoint = None
                     self.stage = "stopped"
                     self.stage_label = STAGE_LABELS_ZH["stopped"]
-                self._bump()
-            return dict(updated)
+                return self._status(account)
+
 
 
 STATE = StudioUIState()
@@ -720,6 +756,8 @@ def api_login_code(payload: Any = Body(None)):
         raise HTTPException(status_code=400, detail=str(exc)) from None
     except Exception:
         raise HTTPException(status_code=400, detail="Google OAuth 授權碼驗證失敗") from None
+    with STATE.lock:
+        STATE._observe_account()
     return {"ok": True}
 
 
@@ -760,6 +798,8 @@ def api_colab_keep(payload: dict[str, Any]):
     minutes = max(1.0, min(240.0, minutes))
     account = C.account_scope()
     session = _resolve_target_session(payload.get("session"))
+    selection = payload.get("session_id")
+    expected = STATE.selected_endpoint(account, session, selection) if selection is not None else None
     now = time.time()
     record = C.keep_info(session)
     cur_info = record or {}
@@ -767,6 +807,8 @@ def api_colab_keep(payload: dict[str, Any]):
         raise HTTPException(status_code=409, detail="此 Session 正在關機，無法延長待命")
     try:
         target = C.keep_target(session, cur_info, account)
+        if expected is not None and target["extra"]["runtime_endpoint"] != expected:
+            raise RuntimeError("所選的 Colab Session 已變更，請重新整理並選擇")
         cur_exp = cur_info.get("expires")
         base_time = max(now, float(cur_exp)) if isinstance(cur_exp, (int, float)) else now
         new_exp = min(now + 240.0 * 60.0, base_time + minutes * 60.0)
@@ -789,13 +831,14 @@ def api_colab_keep(payload: dict[str, Any]):
 def api_colab_cancel(payload: dict[str, Any] | None = None):
     payload = payload or {}
     requested = str(payload.get("session") or "").strip()
+    selection = payload.get("session_id")
     run_id = str(payload["run_id"]).strip() if payload.get("run_id") else None
     if run_id and not re.fullmatch(r"[0-9a-f]{12}", run_id):
         raise HTTPException(status_code=400, detail="不合法的批次 ID")
     if requested:
         requested = _resolve_target_session(requested)
     with STATE.lock:
-        if STATE.running and (not requested or requested == STATE.session):
+        if selection is None and STATE.running and (not requested or requested == STATE.session):
             if STATE.session_account is not None and STATE.session_account != C.account_scope():
                 raise HTTPException(status_code=409, detail="工作台的 Colab 登入身分已變更")
             if run_id and run_id != STATE.run_id:
@@ -812,8 +855,15 @@ def api_colab_cancel(payload: dict[str, Any] | None = None):
             })
 
     target_session = _resolve_target_session(requested)
+    account = C.account_scope()
+    expected = STATE.selected_endpoint(account, target_session, selection) if selection is not None else None
     try:
-        res = C.request_cancel(target_session, run_id)
+        if expected is None:
+            res = C.request_cancel(target_session, run_id)
+        else:
+            if C.active_endpoint(target_session, account) != expected:
+                raise HTTPException(status_code=409, detail="所選的 Colab Session 已變更，請重新整理並選擇")
+            res = C.request_cancel(target_session, run_id, account=account, endpoint=expected)
     except (OSError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=502, detail="未收到可確認的遠端取消結果") from exc
     state = res["state"]
@@ -887,11 +937,13 @@ def api_colab_stop(payload: dict[str, Any] | None = None):
         else:
             failed.append(session)
     with STATE.lock:
-        if not STATE.running and STATE.session in stopped:
+        if stopped or pending:
+            STATE.invalidate_cloud()
+        if not STATE.running and STATE.session in stopped and STATE.session_account in (None, account):
             STATE.session = None
             STATE.stage = "stopped"
             STATE.stage_label = STAGE_LABELS_ZH["stopped"]
-        elif not STATE.running and STATE.session in pending:
+        elif not STATE.running and STATE.session in pending and STATE.session_account in (None, account):
             STATE.session_account = account
             STATE.shutdown_endpoint = (C.keep_info(STATE.session) or {}).get("runtime_endpoint")
             STATE.stage = "shutdown_pending"
@@ -940,6 +992,7 @@ async def api_run_start(
     gpu: str = Form("L4"),
     quant: str = Form("INT8"),
     session: str = Form(""),
+    session_id: str = Form(""),
     idle_minutes: float = Form(15.0),
     stop_after: str = Form("false"),
     batch_name: str = Form(""),
@@ -1095,11 +1148,16 @@ async def api_run_start(
     # The runner selects automatic reuse from the authenticated assignment listing.
     req_sess = str(session or "").strip()
     target_session = None
+    expected_endpoint = None
     if req_sess and req_sess != "__new__":
         try:
             target_session = C.sanitize_session_name(req_sess)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+    if isinstance(session_id, str) and session_id:
+        if target_session is None:
+            raise HTTPException(status_code=400, detail="請指定要沿用的 Colab Session")
+        expected_endpoint = STATE.selected_endpoint(account, target_session, session_id)
 
     try:
         JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1138,12 +1196,17 @@ async def api_run_start(
         STATE.run_id = None
         STATE.job_dir = folder_name
         STATE.job_id = job_id
-        STATE.stage = "booting_vm"
-        STATE.stage_label = f"🚀 正在確認 Google Colab {gpu_clean} 的目標 Session..."
+        STATE.stage = "selecting_vm"
+        STATE.stage_label = STAGE_LABELS_ZH["selecting_vm"]
+        STATE.progress_step = "boot"
         STATE.session = target_session
         STATE.session_account = account
+        STATE.session_endpoint = expected_endpoint
+        STATE.runtime_attached = False
         STATE.shutdown_endpoint = None
-        STATE.gpu = gpu_clean
+        STATE.requested_gpu = gpu_clean
+        STATE.actual_gpu = None
+        STATE.gpu_source = None
         STATE.quant = quant_clean
         STATE.started_at = time.time()
         STATE.finished_at = None
@@ -1180,6 +1243,7 @@ async def api_run_start(
                 account=account,
                 auto_reuse=not req_sess,
                 reuse_only=target_session is not None,
+                expected_endpoint=expected_endpoint,
                 cli_quant=quant_clean,
                 idle_minutes=idle_mins,
                 stop_after=stop_after_bool,
@@ -1224,10 +1288,13 @@ async def api_run_start(
         finally:
             with STATE.lock:
                 if STATE.stage == "shutdown_pending" and STATE.session:
-                    STATE.shutdown_endpoint = (C.keep_info(STATE.session) or {}).get("runtime_endpoint")
+                    STATE.shutdown_endpoint = (
+                        STATE.session_endpoint or (C.keep_info(STATE.session) or {}).get("runtime_endpoint")
+                    )
                 STATE.running = False
                 STATE.provisioning = False
                 STATE.finished_at = time.time()
+                STATE.invalidate_cloud()
                 STATE._bump()
             try:
                 STATE.refresh_colab_cache(force=True)

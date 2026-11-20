@@ -425,6 +425,32 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.assertNotIn("new", self.commands)
         self.assertEqual(C.keep_info(self.session), original)
 
+    def test_web_selected_endpoint_rejects_replacement_even_without_a_local_keep(self):
+        self.runtimes[self.session] = "replacement-endpoint"
+        with self.assertRaisesRegex(RuntimeError, "Session 已變更"):
+            self.run_manifest(reuse_only=True, expected_endpoint=self.endpoint)
+        C.remote_exec.assert_not_called()
+        C.poll_remote_status.assert_not_called()
+        self.assertNotIn("new", self.commands)
+        self.assertIsNone(C.keep_info(self.session))
+
+    def test_reuse_progress_reports_assignment_hardware_separately_from_request(self):
+        self.runtimes[self.session] = self.endpoint
+        self.status.side_effect = [
+            {"alive": False}, dict(self.done_status(), gpu_info={"name": "NVIDIA L4"}),
+        ]
+        progress = Mock()
+        result = self.run_manifest(gpu="H100", reuse_only=True, expected_endpoint=self.endpoint, progress_cb=progress)
+        events = [call.args[0] for call in progress.call_args_list]
+        reused = next(event for event in events if event["stage"] == "reusing_vm")
+        self.assertEqual(reused["_listed_hardware"], "L4")
+        self.assertEqual(reused["_runtime_endpoint"], self.endpoint)
+        synced = next(event for event in events if event["stage"] == "syncing_outputs")
+        self.assertTrue(synced["_runtime_attached"])
+        self.assertEqual(synced["gpu_info"]["name"], "NVIDIA L4")
+        self.assertEqual(result["gpu"], "H100")
+        self.assertNotIn("new", self.commands)
+
     def test_account_change_during_allocation_preserves_original_recovery_record(self):
         self.on_allocate.side_effect = lambda: setattr(C.account_scope, "return_value", "another-account")
         with self.assertRaisesRegex(RuntimeError, "登入身分已變更"):

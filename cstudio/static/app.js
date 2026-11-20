@@ -50,13 +50,18 @@ const ui = {
   selectedItem: null,
   lastSeed: "",
   loginFlowState: null,
+  viewId: null,
+  retiredViews: new Set(),
   lastRevision: -1,
+  lastStatus: null,
+  finishedJob: null,
   wasRunning: false,
+  canCancel: false,
   runId: null,
   runSession: null,
   activeSession: null,
   remainingSec: null,
-  sessionBusy: false,
+  countdownOwned: false,
 };
 
 // DOM Elements
@@ -65,11 +70,13 @@ const el = {
   authLabel: document.getElementById("authLabel"),
   btnToggleLogin: document.getElementById("btnToggleLogin"),
   cuValue: document.getElementById("cuValue"),
+  sessionStatusPill: document.getElementById("sessionStatusPill"),
   activeSessionLabel: document.getElementById("activeSessionLabel"),
   countdownBadge: document.getElementById("countdownBadge"),
   gpuSelect: document.getElementById("gpuSelect"),
   quantSelect: document.getElementById("quantSelect"),
   btnRefreshColab: document.getElementById("btnRefreshColab"),
+  colabRefreshError: document.getElementById("colabRefreshError"),
   btnKeep30: document.getElementById("btnKeep30"),
   btnKeep60: document.getElementById("btnKeep60"),
   btnCancelTop: document.getElementById("btnCancelTop"),
@@ -562,204 +569,211 @@ async function loadGallery(selectNewest = false) {
 // ----------------------------------------------------------------------------
 // Fast & Slow Polling (Colab Status + Run Progress)
 // ----------------------------------------------------------------------------
-function updateStepChips(stage) {
-  const order = ["boot", "install", "models", "generate", "done"];
-  let currentIdx = 0;
-  if (["booting_vm", "reusing_vm", "syncing_code", "uploading_inputs", "starting"].includes(stage)) {
-    currentIdx = 0;
-  } else if (stage === "install") {
-    currentIdx = 1;
-  } else if (stage === "models") {
-    currentIdx = 2;
-  } else if (["comfy", "generate"].includes(stage)) {
-    currentIdx = 3;
-  } else if (["syncing_outputs", "done"].includes(stage)) {
-    currentIdx = 4;
-  }
-
-  const chips = el.stageStepper.querySelectorAll(".step-chip");
-  chips.forEach((chip) => {
-    const stepKey = chip.dataset.step;
-    const idx = order.indexOf(stepKey);
-    chip.classList.toggle("active", idx === currentIdx && stage !== "done");
-    chip.classList.toggle("done", idx < currentIdx || stage === "done");
+function updateStepChips(step, done) {
+  const order = ["boot", "install", "models", "generate", "sync"];
+  const current = order.indexOf(step);
+  el.stageStepper.querySelectorAll(".step-chip").forEach((chip) => {
+    const idx = order.indexOf(chip.dataset.step);
+    chip.classList.toggle("active", idx === current && !done);
+    chip.classList.toggle("done", idx < current || done);
   });
 }
 
-function applySessionKeepUI(sessionName, keepObj, isRunning) {
-  ui.activeSession = sessionName || null;
-  if (!sessionName) {
-    el.activeSessionLabel.textContent = "尚無開啟機器";
-    el.countdownBadge.hidden = true;
-    ui.remainingSec = null;
-    ui.sessionBusy = false;
-    return;
-  }
-  el.activeSessionLabel.textContent = sessionName;
-  if (keepObj?.release_pending) {
-    ui.sessionBusy = false;
-    ui.remainingSec = null;
-    el.countdownBadge.hidden = false;
-    el.countdownBadge.className = "countdown-badge warn";
-    el.countdownBadge.textContent = "⏳ 關機待確認";
-  } else if (isRunning || (keepObj && keepObj.busy)) {
-    ui.sessionBusy = true;
-    ui.remainingSec = null;
-    el.countdownBadge.hidden = false;
-    el.countdownBadge.className = "countdown-badge busy";
-    el.countdownBadge.textContent = "⚡ 雲端任務執行中";
-  } else if (keepObj && typeof keepObj.remaining_sec === "number") {
-    ui.sessionBusy = false;
-    ui.remainingSec = keepObj.remaining_sec;
-    renderCountdownTick();
-  } else {
-    ui.sessionBusy = false;
-    ui.remainingSec = null;
-    el.countdownBadge.hidden = true;
-  }
+function sessionStateLabel(row) {
+  if (row.presence === "gone") return "已確認消失";
+  const local = {
+    release_pending: "關機待確認",
+    allocating: "配置待確認",
+    busy: "本機有執行紀錄",
+    idle: row.owned ? "本機待命" : "外部 Session · 本機待命",
+  }[row.local_state];
+  const presence = row.presence === "unknown" ? "雲端待確認" : null;
+  return [local || (row.blocked && !presence ? "本機識別需核對" : null), presence]
+    .filter(Boolean).join(" · ") || (row.owned ? "Studio Session" : "外部 Session");
+}
+
+function renderSessionStatus(st) {
+  const row = st.active_session;
+  el.activeSessionLabel.textContent = row
+    ? [row.name, row.hardware].filter(Boolean).join(" · ")
+    : !st.token_ok ? "尚未登入" : st.cloud_status === "unknown" ? "雲端狀態待確認"
+      : st.unnamed_sessions ? `雲端有 ${st.unnamed_sessions} 台未命名 Session` : "已確認無開啟的 Session";
+  const executing = st.runtime_attached && row?.id === st.run_session_id && row?.presence !== "gone"
+    && row?.local_state !== "release_pending";
+  const label = executing ? (row.presence === "present" ? "工作台執行中" : "工作台執行中 · 雲端待確認")
+    : row ? sessionStateLabel(row) : null;
+  el.countdownBadge.hidden = !label;
+  el.countdownBadge.textContent = label || "";
+  const badgeTone = row?.presence !== "present" || row?.local_state === "release_pending" ? "warn"
+    : executing || row?.local_state === "busy" ? "busy" : "";
+  el.countdownBadge.className = `countdown-badge ${badgeTone}`;
+  el.sessionStatusPill.title = st.confirmed_at == null ? "尚未確認 Colab Session 清單"
+    : `上次確認雲端清單 ${new Date(st.confirmed_at * 1000).toLocaleTimeString()}`;
+  ui.activeSession = row?.presence === "present" && row.id && !row.blocked ? row : null;
+  ui.remainingSec = !executing && row?.presence === "present" && row.local_state === "idle" ? row.remaining_sec : null;
+  ui.countdownOwned = row?.owned;
+  renderCountdownTick();
+  el.btnKeep30.disabled = el.btnKeep60.disabled = !ui.activeSession || row.local_state === "release_pending"
+    || (st.running && !executing);
 }
 
 function renderCountdownTick() {
-  if (ui.sessionBusy || ui.remainingSec === null) return;
-  el.countdownBadge.hidden = false;
-  const warn = ui.remainingSec <= 300;
-  el.countdownBadge.className = `countdown-badge ${warn ? "warn" : ""}`;
-  el.countdownBadge.textContent = `⏱️ ${formatCountdown(ui.remainingSec)} 後自動關機`;
+  if (ui.remainingSec === null) return;
+  el.countdownBadge.className = `countdown-badge ${ui.remainingSec <= 300 ? "warn" : ""}`;
+  if (ui.countdownOwned) {
+    el.countdownBadge.textContent = ui.remainingSec === 0 ? "待命期滿 · 等待回收確認"
+      : `⏱️ 待命 ${formatCountdown(ui.remainingSec)}`;
+  } else {
+    el.countdownBadge.textContent = `外部 Session · 本機保留 ${formatCountdown(ui.remainingSec)}`;
+  }
 }
 
+let statusRequest = 0;
+let lastStatusRequest = 0;
 let fastPollInFlight = false;
+let slowPoll = null;
+let queuedForce = null;
+let slowTransportFailed = false;
+
+function renderRefreshStatus(st) {
+  const message = slowTransportFailed ? "無法重新整理 Colab 狀態"
+    : st.sessions_failed ? "無法查詢雲端 Session" : st.cu_failed ? "無法查詢剩餘 CU" : "";
+  el.colabRefreshError.textContent = message;
+  el.colabRefreshError.hidden = !message;
+}
+
+function renderFinishedRun(st) {
+  if (ui.finishedJob === st.job_dir) return;
+  ui.finishedJob = st.job_dir;
+  if (st.stage === "cancelled") {
+    showToast("⏹️ 已確認任務取消", true);
+  } else if (["stopped", "stopped_local", "shutdown_pending"].includes(st.stage)) {
+    showToast(st.stage_label, true);
+  } else if (st.stage === "error" || st.error) {
+    showToast(`❌ 生成失敗：${st.error || "未知錯誤"}`);
+  } else if (st.stage === "done") {
+    showToast("✅ 雲端生成與 SHA256 校驗下載完成！", true);
+  }
+  loadGallery(true);
+}
+
+function applyStatus(st, request) {
+  if (!st?.view_id || typeof st.revision !== "number") return false;
+  if (st.view_id !== ui.viewId) {
+    if (ui.retiredViews.has(st.view_id) || request < lastStatusRequest) return false;
+    if (ui.viewId) ui.retiredViews.add(ui.viewId);
+    ui.viewId = st.view_id;
+    ui.lastRevision = -1;
+    ui.wasRunning = false;
+    ui.finishedJob = null;
+  }
+  if (st.revision <= ui.lastRevision) return false;
+  ui.lastRevision = st.revision;
+  ui.lastStatus = st;
+  lastStatusRequest = Math.max(request, lastStatusRequest);
+
+  el.authDot.className = `dot ${st.token_ok ? "ok" : "err"}`;
+  el.authLabel.textContent = st.token_ok ? "Google Colab 已登入" : "尚未登入 Colab";
+  el.cuValue.textContent = typeof st.cu === "number" ? `${st.cu.toFixed(2)} CU`
+    : !st.token_ok ? "未登入" : st.cu_failed ? "暫時查不到" : "尚無資料";
+  renderRefreshStatus(st);
+  renderSessionStatus(st);
+  updateSessionDropdown(st.sessions || []);
+
+  ui.runId = st.running ? st.run_id : null;
+  ui.runSession = st.running ? st.session : null;
+  ui.canCancel = st.running ? st.can_cancel : Boolean(ui.activeSession);
+  el.btnCancelRun.disabled = el.btnCancelTop.disabled = !ui.canCancel;
+  el.btnCancelRun.hidden = el.progressOverlay.hidden = !st.running;
+  el.btnGenerate.disabled = st.running;
+  el.btnGenerate.textContent = st.running ? "⏳ 雲端生成進行中..." : "🚀 開始生成 (Generate)";
+  if (st.running) {
+    ui.wasRunning = true;
+    el.progressStageText.textContent = st.stage_label;
+    const target = st.session || "待確認";
+    const gpu = st.gpu ? `GPU${st.gpu_source === "colab" ? "（Colab 配置）" : ""}：${st.gpu}`
+      : st.requested_gpu ? `GPU 待確認（請求 ${st.requested_gpu}）` : "GPU 待確認";
+    el.progressMetaText.textContent = [
+      `${st.runtime_attached ? "執行 Session" : "目標 Session"}：${target}`, gpu, `權重：${st.quant}`, `已耗時 ${st.elapsed_sec} 秒`,
+    ].join(" | ");
+    updateStepChips(st.progress_step, st.stage === "done");
+    el.progressLogs.textContent = st.logs?.join("\n") || "正在等待 Colab 回應...";
+    el.progressLogs.scrollTop = el.progressLogs.scrollHeight;
+  } else if (ui.wasRunning) {
+    ui.wasRunning = false;
+    renderFinishedRun(st);
+  }
+  return true;
+}
 
 async function pollFastRunStatus() {
   if (fastPollInFlight) return;
   fastPollInFlight = true;
+  const request = ++statusRequest;
   try {
-    const st = await apiFetch("/api/run/status");
-    if (typeof st.revision === "number") {
-      if (st.revision < ui.lastRevision) {
-        return;
-      }
-      ui.lastRevision = st.revision;
-    }
-
-    // Update auth dot from fast check
-    el.authDot.className = `dot ${st.token_ok ? "ok" : "err"}`;
-    el.authLabel.textContent = st.token_ok ? "Google Colab 已登入" : "尚未登入 Colab";
-
-    applySessionKeepUI(st.session, st.active_keep, st.running);
-    ui.runId = st.running ? st.run_id : null;
-    ui.runSession = st.running ? st.session : null;
-
-    // Populate session select dropdown with any known local keeps
-    updateSessionDropdown(st.local_keeps || []);
-
-    if (st.running) {
-      ui.wasRunning = true;
-      el.btnGenerate.disabled = true;
-      el.btnGenerate.textContent = "⏳ 雲端生成進行中...";
-      el.btnCancelRun.hidden = false;
-      el.progressOverlay.hidden = false;
-      el.progressStageText.textContent = st.stage_label || "🔄 執行中...";
-      el.progressMetaText.textContent = `Session: ${st.session || "--"} | GPU: ${st.gpu || "L4"} | 權重: ${st.quant || "INT8"} | 已耗時 ${st.elapsed_sec ?? 0} 秒`;
-      updateStepChips(st.stage);
-      if (Array.isArray(st.logs) && st.logs.length > 0) {
-        el.progressLogs.textContent = st.logs.join("\n");
-        el.progressLogs.scrollTop = el.progressLogs.scrollHeight;
-      }
-    } else {
-      el.btnGenerate.disabled = false;
-      el.btnGenerate.textContent = "🚀 開始生成 (Generate)";
-      el.btnCancelRun.hidden = true;
-      el.progressOverlay.hidden = true;
-
-      if (ui.wasRunning) {
-        ui.wasRunning = false;
-        if (st.stage === "error" || st.error) {
-          showToast(`❌ 生成失敗：${st.error || "未知錯誤"}`);
-        } else if (st.stage === "cancelled") {
-          showToast("⏹️ 已確認任務取消", true);
-        } else if (st.stage === "stopped" || st.stage === "stopped_local" || st.stage === "shutdown_pending") {
-          showToast(st.stage_label, true);
-        } else if (st.stage === "done") {
-          showToast("✅ 雲端生成與 SHA256 校驗下載完成！", true);
-        }
-        await loadGallery(true);
-        refreshSlowColabStatus(true);
-      }
-    }
+    applyStatus(await apiFetch("/api/run/status"), request);
   } catch (err) {
-    // Ignore transient polling errors
+    // A transient polling error leaves the most recent snapshot visible.
   } finally {
     fastPollInFlight = false;
   }
 }
 
-function updateSessionDropdown(keeps) {
-  const currentVal = el.sessionSelect.value;
-  const existingNames = [];
-  for (const k of keeps) {
-    if (k && k.session && !existingNames.includes(k.session)) {
-      existingNames.push(k.session);
-    }
+function updateSessionDropdown(sessions) {
+  const select = el.sessionSelect;
+  const selected = select.value;
+  const options = sessions.filter((row) => row.id && row.presence !== "gone").map((row) => ({
+    id: row.id, name: row.name, disabled: !row.reusable,
+    label: [row.name, row.hardware, sessionStateLabel(row)].filter(Boolean).join(" · "),
+  }));
+  if (selected && selected !== "__new__" && !options.some((opt) => opt.id === selected)) {
+    options.push({ id: selected, name: "", disabled: true, label: "原目標已無法沿用，請重新選擇" });
   }
-  const currentDynamic = [];
-  for (let i = 2; i < el.sessionSelect.options.length; i++) {
-    currentDynamic.push(el.sessionSelect.options[i].value);
+  const previous = [...select.options].slice(2);
+  if (options.length === previous.length && options.every((row, i) => (
+    previous[i].value === row.id && previous[i].textContent === row.label && previous[i].disabled === row.disabled
+  ))) return;
+
+  while (select.options.length > 2) select.remove(2);
+  for (const row of options) {
+    const option = document.createElement("option");
+    option.value = row.id;
+    option.dataset.session = row.name;
+    option.textContent = row.label;
+    option.disabled = row.disabled;
+    select.appendChild(option);
   }
-  if (
-    existingNames.length === currentDynamic.length &&
-    existingNames.every((v, idx) => v === currentDynamic[idx])
-  ) {
-    return;
-  }
-  while (el.sessionSelect.options.length > 2) {
-    el.sessionSelect.remove(2);
-  }
-  for (const name of existingNames) {
-    const opt = document.createElement("option");
-    opt.value = name;
-    opt.textContent = `沿用開啟中：${name}`;
-    el.sessionSelect.appendChild(opt);
-  }
-  if ([...el.sessionSelect.options].some((o) => o.value === currentVal)) {
-    el.sessionSelect.value = currentVal;
-  }
+  select.value = selected;
 }
 
-async function refreshSlowColabStatus(force = false) {
-  try {
-    el.btnRefreshColab.disabled = true;
-    const data = await apiFetch(`/api/colab/status?force=${force ? "true" : "false"}`);
-    el.authDot.className = `dot ${data.token_ok ? "ok" : "err"}`;
-    el.authLabel.textContent = data.token_ok ? "Google Colab 已登入" : "尚未登入 Colab";
-    if (!data.token_ok) {
-      el.loginDrawer.hidden = false;
+function refreshSlowColabStatus(force = false, afterChange = false) {
+  if (slowPoll) {
+    if (force && (afterChange || !slowPoll.force)) {
+      queuedForce ??= slowPoll.promise.then(() => {
+        queuedForce = null;
+        return refreshSlowColabStatus(true);
+      });
+      return queuedForce;
     }
-
-    if (typeof data.cu === "number") {
-      el.cuValue.textContent = `${data.cu.toFixed(2)} CU`;
-    } else {
-      el.cuValue.textContent = data.token_ok ? "查詢中 / 無資料" : "未登入";
-    }
-
-    const activeSessions = (data.sessions || []).filter((s) => s.alive);
-    if (!ui.wasRunning && activeSessions.length > 0) {
-      const primary = activeSessions[0];
-      applySessionKeepUI(
-        primary.name,
-        {
-          remaining_sec: primary.remaining_sec,
-          busy: primary.busy,
-          release_pending: primary.release_pending,
-        },
-        false
-      );
-    }
-    updateSessionDropdown(data.local_keeps || []);
-  } catch (err) {
-    showToast(`查詢 Colab 狀態失敗：${err.message}`);
-  } finally {
-    el.btnRefreshColab.disabled = false;
+    return slowPoll.promise;
   }
+  const request = ++statusRequest;
+  const promise = (async () => {
+    if (force) el.btnRefreshColab.disabled = true;
+    try {
+      const data = await apiFetch(`/api/colab/status?force=${force}`);
+      slowTransportFailed = false;
+      if (applyStatus(data, request) && !data.token_ok) el.loginDrawer.hidden = false;
+    } catch (err) {
+      slowTransportFailed = true;
+      renderRefreshStatus({});
+    } finally {
+      slowPoll = null;
+      el.btnRefreshColab.disabled = false;
+    }
+  })();
+  slowPoll = { force, promise };
+  return promise;
 }
 
 // ----------------------------------------------------------------------------
@@ -777,6 +791,12 @@ async function handleStartGenerate() {
     showToast("圖片編輯（Edit）模式需要至少 1 張參考圖片 (<image1> 主畫布)");
     return;
   }
+  const sessionOption = el.sessionSelect.selectedOptions[0];
+  if (sessionOption?.disabled) {
+    showToast("所選 Session 目前無法沿用，請重新選擇");
+    el.sessionSelect.focus();
+    return;
+  }
 
   const fd = new FormData();
   fd.append("mode", ui.mode);
@@ -790,7 +810,9 @@ async function handleStartGenerate() {
   fd.append("seed", el.seedInput.value.trim());
   fd.append("gpu", el.gpuSelect.value);
   fd.append("quant", el.quantSelect.value);
-  fd.append("session", el.sessionSelect.value);
+  const sessionName = sessionOption?.dataset.session;
+  fd.append("session", sessionName || el.sessionSelect.value);
+  if (sessionName) fd.append("session_id", el.sessionSelect.value);
   fd.append("idle_minutes", el.idleMinutesInput.value || "15");
   fd.append("stop_after", el.chkStopAfter.checked ? "true" : "false");
   fd.append("batch_name", el.batchNameInput.value.trim());
@@ -810,6 +832,7 @@ async function handleStartGenerate() {
 
   try {
     el.btnGenerate.disabled = true;
+    const request = ++statusRequest;
     const res = await apiFetch("/api/run/start", {
       method: "POST",
       body: fd,
@@ -817,7 +840,10 @@ async function handleStartGenerate() {
     if (res.seed) {
       ui.lastSeed = String(res.seed);
     }
-    ui.wasRunning = true;
+    applyStatus(res.status, request);
+    if (ui.lastStatus && ui.lastStatus.job_dir === res.job_dir && !ui.lastStatus.running) {
+      renderFinishedRun(ui.lastStatus);
+    }
     await pollFastRunStatus();
   } catch (err) {
     el.btnGenerate.disabled = false;
@@ -919,11 +945,14 @@ async function initStudio() {
   // Generate & Cancel
   el.btnGenerate.addEventListener("click", handleStartGenerate);
   const doCancel = async () => {
+    if (!ui.canCancel) return;
+    const target = ui.wasRunning ? { session: ui.runSession, run_id: ui.runId }
+      : { session: ui.activeSession.name, session_id: ui.activeSession.id };
     try {
       const res = await apiFetch("/api/colab/cancel", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session: ui.runSession || ui.activeSession, run_id: ui.runId }),
+        body: JSON.stringify(target),
       });
       const message = {
         pending: "⏳ 已要求取消，等待遠端確認",
@@ -943,13 +972,14 @@ async function initStudio() {
   // Top Bar Colab Controls
   el.btnRefreshColab.addEventListener("click", () => refreshSlowColabStatus(true));
   const doKeep = async (minutes) => {
+    if (!ui.activeSession || el.btnKeep30.disabled) return;
     try {
       const res = await apiFetch("/api/colab/keep", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session: ui.activeSession, minutes }),
+        body: JSON.stringify({ session: ui.activeSession.name, session_id: ui.activeSession.id, minutes }),
       });
-      showToast(`⏳ 已將 ${res.session} 的自動關機時間設為 ${minutes} 分鐘後`, true);
+      showToast(`⏳ 已為 ${res.session} 更新本機待命期限，剩餘 ${formatCountdown(res.remaining_sec)}`, true);
       await pollFastRunStatus();
     } catch (err) {
       showToast(`延長保留失敗：${err.message}`);
@@ -972,7 +1002,7 @@ async function initStudio() {
       if (res.failed?.length) summary.push(`⚠️ 無法確認 ${res.failed.join(", ")}`);
       showToast(summary.join(" · ") || "⚪ 目前沒有已登記的 Colab Studio Session 需要關閉", !res.failed?.length);
       await pollFastRunStatus();
-      refreshSlowColabStatus(true);
+      refreshSlowColabStatus(true, true);
     } catch (err) {
       showToast(`關機失敗：${err.message}`);
     }
@@ -1017,7 +1047,8 @@ async function initStudio() {
       el.loginUrlLink.hidden = true;
       el.loginDrawer.hidden = true;
       showToast("✅ Google Colab OAuth 登入成功！", true);
-      await refreshSlowColabStatus(true);
+      pollFastRunStatus();
+      await refreshSlowColabStatus(true, true);
     } catch (err) {
       showToast(`登入驗證失敗：${err.message}`);
     }
@@ -1065,9 +1096,10 @@ async function initStudio() {
 
   // Fast status polling every 1.5s
   setInterval(pollFastRunStatus, 1500);
+  setInterval(refreshSlowColabStatus, 60_000);
   // Local 1-second countdown ticker
   setInterval(() => {
-    if (!ui.sessionBusy && typeof ui.remainingSec === "number" && ui.remainingSec > 0) {
+    if (typeof ui.remainingSec === "number" && ui.remainingSec > 0) {
       ui.remainingSec -= 1;
       renderCountdownTick();
     }

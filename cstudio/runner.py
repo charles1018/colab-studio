@@ -479,6 +479,7 @@ def run_manifest(
     account: str | None = None,
     auto_reuse: bool = False,
     reuse_only: bool = False,
+    expected_endpoint: str | None = None,
 ) -> dict[str, Any]:
     if gpu not in C.GPUS:
         _fail(f"不支援的 GPU {gpu!r}（可用：{', '.join(C.GPUS)}）", exit_on_error)
@@ -560,8 +561,11 @@ def run_manifest(
         try:
             snap = dict(payload)
             snap.setdefault("run_id", run_id)
-            snap.setdefault("session", session)
+            snap["session"] = session
             snap.setdefault("gpu", gpu)
+            snap["_runtime_endpoint"] = endpoint
+            snap["_listed_hardware"] = listed_hardware
+            snap["_runtime_attached"] = attached
             snap.setdefault("_local_synced_jobs", sorted(local_synced))
             snap.setdefault("_local_results", json.loads(json.dumps(results, ensure_ascii=False)))
             progress_cb(snap)
@@ -576,6 +580,7 @@ def run_manifest(
     cancel_sent = False
     cancel_failed = False
     endpoint: str | None = None
+    listed_hardware: str | None = None
     attached = False
 
     def _run_lease(info: dict) -> bool:
@@ -637,10 +642,13 @@ def run_manifest(
     _check_active()
     alive, listing = C.sessions_checked(account=account, deadline=deadline)
     _check_active()
-    assignments = C.listed_assignments(listing) if alive is not None else None
-    if assignments is None:
+    runtimes = C.listed_runtimes(listing) if alive is not None else None
+    if runtimes is None:
         _fail("無法確認開啟中的 Colab Session，請稍後再試", exit_on_error)
+    assignments = {ep: name for ep, (name, _) in runtimes.items()}
     active = {name: ep for ep, name in assignments.items() if name != "?"}
+    if expected_endpoint is not None and (session is None or active.get(session) != expected_endpoint):
+        _fail("所選的 Colab Session 已變更，請重新整理並選擇", exit_on_error)
 
     allocation_reserved = False
     allocation_attempted = False
@@ -687,6 +695,7 @@ def run_manifest(
 
         if reuse:
             endpoint = active[session]
+            listed_hardware = runtimes[endpoint][1]
             if keep.get("runtime_endpoint") not in (None, endpoint) or C.runtime_endpoint(session, deadline=deadline) != endpoint:
                 _fail(f"Session {session} 的遠端識別已變更，請先確認目標", exit_on_error)
             owned = C.is_owned_session(session, account=account, assignments=assignments, deadline=deadline)
