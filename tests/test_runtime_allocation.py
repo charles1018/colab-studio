@@ -37,6 +37,8 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.reservations = []
         self.commands = []
         self.real_colab = C.colab
+        self.status = Mock(return_value=self.done_status())
+        self.bundle_hash = R.compute_remote_bundle_hash()
 
         self.log = self.enterContext(redirect_stdout(io.StringIO()))
         self.clock = SimpleNamespace(time=lambda: self.now, monotonic=lambda: self.now, sleep=self.advance, strftime=time.strftime)
@@ -50,9 +52,21 @@ class RuntimeAllocationTests(unittest.TestCase):
             token_ok=Mock(return_value=True),
             runtime_endpoint=Mock(side_effect=lambda name, **_: self.runtimes.get(name)),
             start_watchdog=Mock(side_effect=self.start_fake_watchdog),
-            poll_remote_status=Mock(return_value=self.done_status()),
-            remote_exec=Mock(return_value='CSTUDIO_PREP {"launched": true, "missing_inputs": []}'),
+            poll_remote_status=Mock(side_effect=self.poll_status),
+            remote_exec=Mock(side_effect=lambda *_args, **_opts: self.prep_reply()),
         ))
+
+    def poll_status(self, session, *, run_id=None, **opts):
+        st = self.status(session, **opts)
+        if run_id is None or not isinstance(st, dict):
+            return st
+        return {"bundle_hash": self.bundle_hash, "run_id": run_id, **st}
+
+    def prep_reply(self, *, state="running", **extra):
+        run_id = C.keep_info(self.session)["active_run_id"]
+        return "CSTUDIO_PREP " + json.dumps({
+            "state": state, "run_id": run_id, "bundle_hash": self.bundle_hash, "missing_inputs": [], **extra,
+        })
 
     def advance(self, seconds):
         self.now += seconds
@@ -90,6 +104,7 @@ class RuntimeAllocationTests(unittest.TestCase):
     def done_status(self):
         return {
             "done": True,
+            "alive": False,
             "stage": "done",
             "jobs": {"test": {
                 "status": "done", "file": "out/test.png",
@@ -306,7 +321,7 @@ class RuntimeAllocationTests(unittest.TestCase):
             C.set_keep(name, self.now + 60, owner="owned", extra={
                 "runtime_endpoint": self.runtimes[name], "account_scope": account,
             })
-        C.poll_remote_status.side_effect = [{"alive": False}, self.done_status()]
+        self.status.side_effect = [{"alive": False}, self.done_status()]
         result = R.run_manifest(self.manifest, auto_reuse=True, exit_on_error=False)
         self.assertEqual(result["session"], self.session)
         self.assertNotIn("new", self.commands)
@@ -320,7 +335,7 @@ class RuntimeAllocationTests(unittest.TestCase):
     def test_name_only_legacy_keep_reuses_as_external_without_cache(self):
         self.runtimes[self.session] = self.endpoint
         C.set_keep(self.session, self.now + 60, owner="owned", extra={"bundle_hash": R.compute_remote_bundle_hash()})
-        C.poll_remote_status.side_effect = [{"alive": False}, self.done_status()]
+        self.status.side_effect = [{"alive": False}, self.done_status()]
         with patch.object(R, "bundle_and_launch_code", wraps=R.bundle_and_launch_code) as bundle:
             self.run_manifest()
         self.assertIsNotNone(bundle.call_args.args[0])
@@ -346,7 +361,7 @@ class RuntimeAllocationTests(unittest.TestCase):
         status = self.done_status()
         status["log"] = ["refresh_token=fixture-log-refresh"]
         status["jobs"]["test"]["traceback"] = "code_verifier=fixture-job-verifier"
-        C.poll_remote_status.return_value = status
+        self.status.return_value = status
         transport = C.colab.side_effect
 
         def fail_download(operation, *args, **options):
@@ -374,21 +389,76 @@ class RuntimeAllocationTests(unittest.TestCase):
 
     def test_upload_is_limited_to_the_declared_nested_input(self):
         ref = self.edit_reference()
-        C.remote_exec.side_effect = [
-            'CSTUDIO_PREP {"launched": false, "missing_inputs": ["inputs/style/ref.png"]}',
-            '{"started": true}',
-        ]
-        self.assertEqual(self.run_manifest()["jobs"]["test"]["status"], "done")
+        C.remote_exec.side_effect = lambda *_args, **_opts: (
+            self.prep_reply(state="prepared", missing_inputs=["inputs/style/ref.png"])
+            if C.remote_exec.call_count == 1 else self.prep_reply()
+        )
+        result = self.run_manifest()
+        self.assertEqual(result["jobs"]["test"]["status"], "done")
         args, = [call.args for call in C.colab.call_args_list if call.args[0] == "upload"]
-        self.assertEqual(args, ("upload", "-s", self.session, ref, "/content/cstudio/inputs/inputs/style/ref.png"))
+        run_dir = f"/content/cstudio/runs/{result['run_id']}"
+        self.assertEqual(args, ("upload", "-s", self.session, ref, f"{run_dir}/uploads/inputs/style/ref.png"))
+        download, = [call.args for call in C.colab.call_args_list if call.args[0] == "download"]
+        self.assertEqual(download[-2], f"{run_dir}/out/test.png")
 
     def test_unexpected_remote_upload_path_stops_before_upload_or_worker_launch(self):
         self.edit_reference()
-        C.remote_exec.return_value = 'CSTUDIO_PREP {"launched": false, "missing_inputs": ["unlisted.png"]}'
+        C.remote_exec.side_effect = lambda *_args, **_opts: self.prep_reply(state="prepared", missing_inputs=["unlisted.png"])
         with self.assertRaisesRegex(RuntimeError, "待上傳清單"):
             self.run_manifest()
         C.remote_exec.assert_called_once()
         self.assertNotIn("upload", self.commands)
+
+    def test_rejected_start_receipt_cannot_poll_or_download_other_run(self):
+        self.edit_reference()
+        C.remote_exec.side_effect = lambda *_args, **_opts: (
+            self.prep_reply(state="prepared", missing_inputs=["inputs/style/ref.png"])
+            if C.remote_exec.call_count == 1 else self.prep_reply(run_id="a" * 12)
+        )
+        with self.assertRaisesRegex(RuntimeError, "批次 ID 不符"):
+            self.run_manifest()
+        C.poll_remote_status.assert_not_called()
+        self.assertNotIn("download", self.commands)
+
+    def test_busy_receipt_protects_another_run_even_with_stop_after(self):
+        self.runtimes[self.session] = self.endpoint
+        C.set_keep(self.session, self.now + 60, owner="owned", extra={
+            "runtime_endpoint": self.endpoint, "account_scope": "fixture-account",
+        })
+        self.status.return_value = {"alive": False}
+        C.remote_exec.side_effect = lambda *_args, **_opts: self.prep_reply(state="busy", reason="busy", bundle_hash=None)
+        with self.assertRaisesRegex(RuntimeError, "拒絕本批啟動"):
+            self.run_manifest(stop_after=True)
+        self.assertNotIn("stop", self.commands)
+        self.assertIsNone(C.keep_info(self.session)["active_run_id"])
+        self.assertEqual(C.poll_remote_status.call_count, 1)
+
+    def test_old_status_or_mismatched_bundle_cannot_supply_results(self):
+        self.status.side_effect = [
+            dict(self.done_status(), run_id="a" * 12),
+            dict(self.done_status(), bundle_hash="0" * 64),
+            self.done_status(),
+        ]
+        result = self.run_manifest()
+        download, = [call.args for call in C.colab.call_args_list if call.args[0] == "download"]
+        self.assertEqual(download[-2], f"/content/cstudio/runs/{result['run_id']}/out/test.png")
+        self.assertTrue(all(call.kwargs["run_id"] == result["run_id"] for call in C.poll_remote_status.call_args_list))
+        self.assertEqual(C.poll_remote_status.call_count, 3)
+
+    def test_stale_keep_bundle_hint_is_resubmitted_and_verified(self):
+        self.runtimes[self.session] = self.endpoint
+        C.set_keep(self.session, self.now + 60, owner="owned", extra={
+            "runtime_endpoint": self.endpoint, "account_scope": "fixture-account", "bundle_hash": self.bundle_hash,
+        })
+        self.status.side_effect = [{"alive": False}, self.done_status()]
+        C.remote_exec.side_effect = lambda *_args, **_opts: (
+            self.prep_reply(state="bundle_required", bundle_hash=None) if C.remote_exec.call_count == 1 else self.prep_reply()
+        )
+        with patch.object(R, "bundle_and_launch_code", wraps=R.bundle_and_launch_code) as bundle:
+            self.assertEqual(self.run_manifest()["jobs"]["test"]["status"], "done")
+        self.assertIsNone(bundle.call_args_list[0].args[0])
+        sent = bundle.call_args_list[1].args[0]
+        self.assertEqual(R.bundle_digest(sent), self.bundle_hash)
 
     def test_symlinked_output_root_stops_before_any_colab_command(self):
         other_job = self.directory / "other"
@@ -405,7 +475,7 @@ class RuntimeAllocationTests(unittest.TestCase):
     def test_unexpected_remote_result_filename_is_never_downloaded(self):
         status = self.done_status()
         status["jobs"]["test"]["file"] = "out/other.png"
-        C.poll_remote_status.return_value = status
+        self.status.return_value = status
         result = self.run_manifest()
         self.assertEqual(result["jobs"]["test"]["status"], "sync_error")
         self.assertNotIn("download", self.commands)
@@ -416,7 +486,7 @@ class RuntimeAllocationTests(unittest.TestCase):
         C.set_keep(self.session, self.now + 60, owner="owned", extra={
             "runtime_endpoint": self.endpoint, "bundle_hash": R.compute_remote_bundle_hash(),
         })
-        C.poll_remote_status.side_effect = [{"alive": False}, self.done_status()]
+        self.status.side_effect = [{"alive": False}, self.done_status()]
         with patch.object(R, "bundle_and_launch_code", wraps=R.bundle_and_launch_code) as bundle:
             result = self.run_manifest()
         self.assertEqual(result["jobs"]["test"]["status"], "done")
@@ -427,7 +497,7 @@ class RuntimeAllocationTests(unittest.TestCase):
 
     def test_reuse_external_runtime_never_arms_a_hard_deadline(self):
         self.runtimes[self.session] = self.endpoint
-        C.poll_remote_status.side_effect = [{"alive": False}, self.done_status()]
+        self.status.side_effect = [{"alive": False}, self.done_status()]
         self.assertEqual(self.run_manifest()["jobs"]["test"]["status"], "done")
         keep = C.keep_info(self.session)
         self.assertEqual(keep["created_by"], "external")
@@ -491,7 +561,7 @@ class RuntimeAllocationTests(unittest.TestCase):
         C.set_keep(self.session, self.now, owner="owned", extra={
             "runtime_endpoint": self.endpoint, "account_scope": "fixture-account",
         })
-        C.poll_remote_status.return_value = {"alive": True}
+        self.status.return_value = {"alive": True}
         limit = self.now + C.IDLE_ACTIVE_GRACE
         self.on_stop.side_effect = lambda: self.assertEqual(self.now, limit)
         C.watchdog_loop(self.session)
@@ -541,7 +611,7 @@ class RuntimeAllocationTests(unittest.TestCase):
             C.set_keep(self.session, extended)
             return self.done_status()
 
-        C.poll_remote_status.side_effect = status
+        self.status.side_effect = status
         self.run_manifest()
         keep = C.keep_info(self.session)
         self.assertEqual(keep["expires"], extended)
@@ -662,7 +732,7 @@ class RuntimeAllocationTests(unittest.TestCase):
 
         def prepare(_session, _code, **_opts):
             self.abort = "cancel"
-            return 'CSTUDIO_PREP {"launched": true, "missing_inputs": []}'
+            return self.prep_reply()
 
         def snapshot(_session, **_target):
             run_id = progress.call_args.args[0]["run_id"]
@@ -671,7 +741,7 @@ class RuntimeAllocationTests(unittest.TestCase):
             return dict(self.done_status(), run_id=run_id, stage="cancelled", cancel_protocol=1)
 
         C.remote_exec.side_effect = prepare
-        C.poll_remote_status.side_effect = snapshot
+        self.status.side_effect = snapshot
         with patch.object(C, "request_cancel", return_value={"state": "pending"}) as send:
             with self.assertRaisesRegex(R.RunCancelled, "已確認遠端批次取消"):
                 self.run_manifest(progress_cb=progress)
@@ -689,10 +759,10 @@ class RuntimeAllocationTests(unittest.TestCase):
 
         def prepare(_session, _code, **_opts):
             self.abort = "cancel"
-            return 'CSTUDIO_PREP {"launched": true, "missing_inputs": []}'
+            return self.prep_reply()
 
         C.remote_exec.side_effect = prepare
-        C.poll_remote_status.side_effect = lambda _session, **_target: {
+        self.status.side_effect = lambda _session, **_target: {
             "run_id": progress.call_args.args[0]["run_id"], "stage": "cancel_failed",
             "done": True, "error": "fixture: remote task still active", "cancel_protocol": 1,
         }
@@ -704,7 +774,7 @@ class RuntimeAllocationTests(unittest.TestCase):
 
     def test_an_unconfirmed_cancellation_blocks_reuse(self):
         self.runtimes[self.session] = self.endpoint
-        C.poll_remote_status.return_value = {"stage": "cancel_failed", "alive": False}
+        self.status.return_value = {"stage": "cancel_failed", "alive": False}
         with self.assertRaisesRegex(RuntimeError, "待確認的取消"):
             self.run_manifest()
         C.remote_exec.assert_not_called()
@@ -714,7 +784,7 @@ class RuntimeAllocationTests(unittest.TestCase):
     def test_lost_cancel_reply_retries_without_treating_it_as_confirmation(self):
         progress = Mock()
         C.remote_exec.side_effect = lambda *_args, **_opts: (
-            setattr(self, "abort", "cancel") or 'CSTUDIO_PREP {"launched": true, "missing_inputs": []}'
+            setattr(self, "abort", "cancel") or self.prep_reply()
         )
 
         def snapshot(_session, **_target):
@@ -723,7 +793,7 @@ class RuntimeAllocationTests(unittest.TestCase):
                 return {"run_id": run_id, "stage": "running", "done": False}
             return dict(self.done_status(), run_id=run_id)
 
-        C.poll_remote_status.side_effect = snapshot
+        self.status.side_effect = snapshot
         with patch.object(C, "request_cancel", side_effect=[RuntimeError("lost reply"), {"state": "finished"}]) as send:
             result = self.run_manifest(progress_cb=progress)
         self.assertEqual(send.call_count, 2)

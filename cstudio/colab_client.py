@@ -24,6 +24,7 @@ from .redact import redact, redact_diagnostics
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 REMOTE = ROOT / "remote"
+REMOTE_ROOT = "/content/cstudio"
 GPUS = ("L4", "G4", "A100", "H100", "T4")
 PREFIX = "cstudio-"
 ASSIGN_TIMEOUT = 900
@@ -569,9 +570,11 @@ def remote_exec(
             kernel_timeout = remaining_time(timeout, deadline)
             out = colab("exec", "-s", session, "-f", f.name, "--timeout", kernel_timeout,
                         timeout=timeout + 30, check=False, account=account, endpoint=endpoint, deadline=deadline)
-            if "CSTUDIO_EXEC_OK" in out:
-                return out.replace("CSTUDIO_EXEC_OK", "").strip()
-            print(f"…exec 沒有回應，重試（{k + 1}/{tries}）", flush=True)
+            lines = out.splitlines()
+            if "CSTUDIO_EXEC_OK" in lines:
+                return "\n".join(line for line in lines if line != "CSTUDIO_EXEC_OK").strip()
+            if k + 1 < tries:
+                print(f"…exec 沒有回應，重試（{k + 1}/{tries - 1}）", flush=True)
         raise RuntimeError("colab exec 連續沒有回應")
     finally:
         os.unlink(f.name)
@@ -579,18 +582,34 @@ def remote_exec(
 
 def poll_remote_status(
     session: str, timeout: int = 60, *, account: str, endpoint: str, deadline: float | None = None,
+    run_id: str | None = None,
 ) -> dict | None:
-    status_py = REMOTE / "status.py"
-    kernel_timeout = remaining_time(timeout, deadline)
-    out = colab("exec", "-s", session, "-f", status_py, "--timeout", kernel_timeout,
-                timeout=timeout + 20, check=False, account=account, endpoint=endpoint, deadline=deadline)
+    code = vm_program("STATUS", "runtime_status", run_id)
+    try:
+        out = remote_exec(session, code, timeout=timeout, tries=1, account=account, endpoint=endpoint, deadline=deadline)
+    except ColabTimeout:
+        raise
+    except RuntimeError:
+        return None
     for line in reversed(out.splitlines()):
-        if "CSTUDIO_STATUS " in line:
+        if line.startswith("CSTUDIO_STATUS "):
             try:
-                return json.loads(line.split("CSTUDIO_STATUS ", 1)[1])
-            except Exception:
+                status = json.loads(line.partition(" ")[2])
+                if isinstance(status, dict) and (run_id is None or status.get("run_id") == run_id):
+                    return status
+            except ValueError:
                 return None
     return None
+
+
+def vm_program(label: str, function: str, *args, include_start: bool = False, root: str | None = None) -> str:
+    sources = ["job_paths.py", "cancel.py", "status.py"]
+    if include_start:
+        sources.append("start.py")
+    files = "\n\n".join((REMOTE / name).read_text(encoding="utf-8") for name in sources)
+    params = ", ".join(repr(arg) for arg in args)
+    source = files + f"\nprint('CSTUDIO_{label} ' + json.dumps({function}(Path({root or REMOTE_ROOT!r}), {params}), ensure_ascii=False))\n"
+    return f"exec({source!r}, {{'__name__': 'cstudio_vm', '__package__': None}})"
 
 
 def active_endpoint(session: str, account: str, *, deadline: float | None = None) -> str:
@@ -636,11 +655,7 @@ def request_cancel(
     if not account:
         raise RuntimeError("無法確認 Colab 登入身分")
     endpoint = endpoint or active_endpoint(session, account, deadline=deadline)
-    source = (REMOTE / "cancel.py").read_text(encoding="utf-8")
-    code = source + (
-        f"\nprint('CSTUDIO_CANCEL ' + json.dumps("
-        f"request_cancel(Path('/content/cstudio'), {run_id!r}, allow_start={allow_start!r})))\n"
-    )
+    code = vm_program("CANCEL", "request_run_cancel", run_id, allow_start)
     out = remote_exec(session, code, timeout=15, tries=1, account=account, endpoint=endpoint, deadline=deadline)
     for line in reversed(out.splitlines()):
         if line.startswith("CSTUDIO_CANCEL "):

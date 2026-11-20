@@ -55,8 +55,8 @@ class ColabDiagnosticTests(unittest.TestCase):
             })
             completed.stdout = "10 compute units\nAuthorization: Bearer fixture-passed-access"
             units, summary = C.usage(account="fixture-scope")
-            prompt = "A poster with the literal sample token=example printed on it"
-            completed.stdout = "CSTUDIO_STATUS " + json.dumps({"run_id": "fixture-run", "refined_prompt": prompt})
+            prompt = "A poster with the literal sample token=example and CSTUDIO_EXEC_OK printed on it"
+            completed.stdout = "CSTUDIO_STATUS " + json.dumps({"run_id": "fixture-run", "refined_prompt": prompt}) + "\nCSTUDIO_EXEC_OK"
             completed.stderr = "Authorization: Bearer fixture-stderr"
             completed.returncode = 1
             status = C.poll_remote_status("studio", account="fixture-scope", endpoint="runtime-endpoint")

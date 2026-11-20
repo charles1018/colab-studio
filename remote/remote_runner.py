@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Runs ON the Colab VM. Started in the background by start.py; progress goes to /content/cstudio/status.json.
+"""Runs on the Colab VM with a batch-specific workspace and shared model cache.
 
 Steps:
-  1. install (skipped when setup marker exists): ComfyUI + ComfyUI-GGUF + pip requirements (gguf, huggingface_hub, hf_xet)
+  1. verify or install ComfyUI, ComfyUI-GGUF and their Python requirements
   2. models: download required GGUF denoiser, text encoder, VAE, and optional Prompt Enhancer from Hugging Face
   3. start ComfyUI (127.0.0.1:8188), private to the VM
-  4. execute every job in manifest.json -> /content/cstudio/out/<id>.png (and record refined_prompt if refine_prompt=True)
+  4. execute the batch manifest and write results and status in its run directory
 """
 from __future__ import annotations
 
@@ -38,13 +38,15 @@ from job_paths import JOB_ID, confined_path  # noqa: E402
 from models import get_model_plugin  # noqa: E402
 
 JOB = Path(os.environ.get("CSTUDIO_DIR", "/content/cstudio"))
+RUNTIME = Path(os.environ.get("CSTUDIO_RUNTIME_DIR", str(JOB)))
+MANAGED_RUN_ID = os.environ.get("CSTUDIO_RUN_ID")
 OUT = JOB / "out"
 WORK = JOB / "work"
 STATUS = JOB / "status.json"
 COMFY = Path(os.environ.get("CSTUDIO_COMFY", "/content/ComfyUI"))
 HF_MODELS = Path("/content/hf")
 MARK = Path("/content/.cstudio_setup_v1")
-COMFY_PROCESS = JOB / "comfy-process.json"
+COMFY_PROCESS = RUNTIME / "comfy-process.json"
 COMFY_LOG = Path("/content/comfyui.log")
 DEFAULT_COMFY_URL = "http://127.0.0.1:8188"
 COMFY_URL = os.environ.get("CSTUDIO_COMFY_URL", DEFAULT_COMFY_URL)
@@ -55,7 +57,8 @@ EXTRA_PIP = ("huggingface_hub>=0.26.0", "hf_xet", "gguf>=0.13.0")
 
 STATE: dict = {
     "stage": "starting",
-    "run_id": None,
+    "run_id": MANAGED_RUN_ID,
+    "bundle_hash": os.environ.get("CSTUDIO_BUNDLE_HASH"),
     "cancel_protocol": CANCEL_PROTOCOL,
     "log": [],
     "jobs": {},
@@ -193,7 +196,8 @@ def load_pins(manifest: dict) -> dict | None:
     if manifest.get("_pin_versions") is False:
         return None
     try:
-        pins = json.loads((JOB / "versions.json").read_text(encoding="utf-8"))
+        versions_dir = Path(__file__).resolve().parent if MANAGED_RUN_ID else JOB
+        pins = json.loads(confined_path(versions_dir, "versions.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise RuntimeError("缺少有效的釘選表 versions.json") from exc
     if not isinstance(pins, dict):
@@ -912,11 +916,12 @@ def wait_history(pid: str, timeout: int, what: str) -> dict:
 
 
 def stage_input_image(rel_path: str, job_id: str, idx: int) -> str:
-    """Copy an uploaded input image from /content/cstudio/inputs/<rel_path> into ComfyUI/input/."""
+    """Copy a verified reference from this run into ComfyUI's input directory."""
     input_root = confined_path(JOB, "inputs", directory=True)
     src = confined_path(input_root, rel_path)
     ext = src.suffix.lower() or ".png"
-    safe_name = f"cstudio_{job_id}_in{idx}{ext}"
+    prefix = f"cstudio_{MANAGED_RUN_ID}_{job_id}" if MANAGED_RUN_ID else f"cstudio_{job_id}"
+    safe_name = f"{prefix}_in{idx}{ext}"
     dest = confined_path(COMFY, f"input/{safe_name}", missing_ok=True)
     dest.parent.mkdir(exist_ok=True)
     shutil.copy2(src, dest)
@@ -967,6 +972,8 @@ def collect_output_image(history_entry: dict, dest_path: Path, *, save_node: str
 def run_batch():
     manifest_path = confined_path(JOB, "manifest.json")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if MANAGED_RUN_ID and manifest.get("_run_id") != MANAGED_RUN_ID:
+        raise RuntimeError("遠端 manifest 與執行中的批次不符")
     STATE["run_id"] = manifest.get("_run_id")
     save()
     check_cancel()
@@ -1018,6 +1025,9 @@ def run_batch():
                 cli_quant=cli_quant,
                 uploaded_inputs=staged_inputs,
             )
+            save_node = next(nid for nid, node in graph.items() if node["class_type"] == "SaveImage")
+            if MANAGED_RUN_ID:
+                graph[save_node]["inputs"]["filename_prefix"] = f"cstudio_{MANAGED_RUN_ID}_{jid}"
             pid = queue_prompt(graph, pin_models=pin_models)
             refine_on = bool(job.get("refine_prompt", manifest.get("refine_prompt", False)))
             timeout_s = int(job.get("timeout", 1200 if refine_on else 600))
@@ -1033,7 +1043,6 @@ def run_batch():
                 log(f"job {jid}: prompt enhanced ({len(refined_text)} chars)")
 
             out_file = confined_path(JOB, f"{OUT.name}/{jid}.png", missing_ok=True)
-            save_node = next(nid for nid, node in graph.items() if node["class_type"] == "SaveImage")
             collect_output_image(h, out_file, save_node=save_node, prefix=graph[save_node]["inputs"]["filename_prefix"])
             sha256 = hashlib.sha256(out_file.read_bytes()).hexdigest()
             elapsed = round(time.time() - t_job, 2)

@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from remote.job_paths import JOB_ID, confined_path
+from remote.job_paths import JOB_ID, bundle_digest, confined_path
 
 from . import colab_client as C
 from .redact import redact, redact_diagnostics
@@ -271,8 +271,6 @@ REMOTE_CODE_FILES = (
     "cancel.py",
     "job_paths.py",
     "remote_runner.py",
-    "start.py",
-    "status.py",
     "versions.json",
     "models/__init__.py",
     "models/qwen_image_21.py",
@@ -281,11 +279,7 @@ REMOTE_CODE_FILES = (
 
 
 def compute_remote_bundle_hash() -> str:
-    h = hashlib.sha256()
-    for rel in REMOTE_CODE_FILES:
-        h.update(rel.encode("utf-8"))
-        h.update((REMOTE / rel).read_bytes())
-    return h.hexdigest()
+    return bundle_digest({rel: (REMOTE / rel).read_text(encoding="utf-8") for rel in REMOTE_CODE_FILES})
 
 
 def bundle_and_launch_code(
@@ -294,66 +288,37 @@ def bundle_and_launch_code(
     manifest_json: str,
     input_shas: dict[str, str],
 ) -> str:
-    """Single-roundtrip Python code executed on Colab VM:
-    1. Creates /content/cstudio directories and input subdirs
-    2. Writes remote code files if code_files is provided (when bundle_hash changed)
-    3. Writes /content/cstudio/manifest.json
-    4. Checks which input files already exist on Colab with matching SHA256
-    5. If no input files are missing, starts remote_runner.py immediately!
-    """
-    payload = {
-        "code_files": code_files,
-        "bundle_hash": bundle_hash,
-        "manifest_json": manifest_json,
-        "input_shas": input_shas,
-    }
-    return (REMOTE / "job_paths.py").read_text(encoding="utf-8") + "\n" + (
-        "import hashlib, json, shutil, subprocess, sys, time\n"
-        f"P = json.loads({json.dumps(payload, ensure_ascii=False)!r})\n"
-        "JOB = Path('/content/cstudio')\n"
-        "confined_path(JOB.parent, JOB.name, directory=True, missing_ok=True).mkdir(exist_ok=True)\n"
-        "input_root = confined_path(JOB, 'inputs', directory=True, missing_ok=True)\n"
-        "input_root.mkdir(exist_ok=True)\n"
-        "inputs = {rel: confined_path(input_root, rel, missing_ok=True) for rel in P['input_shas']}\n"
-        "for fp in inputs.values():\n"
-        "    fp.parent.mkdir(parents=True, exist_ok=True)\n"
-        "confined_path(JOB, 'models', directory=True, missing_ok=True).mkdir(exist_ok=True)\n"
-        "if P['code_files']:\n"
-        "    for rel, content in P['code_files'].items():\n"
-        "        dst = confined_path(JOB, rel, missing_ok=True)\n"
-        "        dst.parent.mkdir(parents=True, exist_ok=True)\n"
-        "        dst.write_text(content, encoding='utf-8')\n"
-        "    confined_path(JOB, '.bundle_sha256', missing_ok=True).write_text(P['bundle_hash'], encoding='utf-8')\n"
-        "confined_path(JOB, 'manifest.json', missing_ok=True).write_text(P['manifest_json'], encoding='utf-8')\n"
-        "missing = []\n"
-        "for rel, exp_sha in P['input_shas'].items():\n"
-        "    fp = inputs[rel]\n"
-        "    if not fp.is_file() or hashlib.sha256(fp.read_bytes()).hexdigest() != exp_sha:\n"
-        "        missing.append(rel)\n"
-        "res = {'missing_inputs': missing, 'launched': False}\n"
-        "if not missing:\n"
-        "    running = subprocess.run(['pgrep', '-f', 'cstudio/remote_runner.py'], capture_output=True, text=True).stdout.strip()\n"
-        "    out_dir = confined_path(JOB, 'out', directory=True, missing_ok=True)\n"
-        "    status = confined_path(JOB, 'status.json', missing_ok=True)\n"
-        "    if running:\n"
-        "        res['launched'] = True\n"
-        "        res['already_running'] = True\n"
-        "        res['pid'] = running\n"
-        "    else:\n"
-        "        worker = confined_path(JOB, 'remote_runner.py')\n"
-        "        log_path = confined_path(JOB, 'remote_runner.log', missing_ok=True)\n"
-        "        if status.exists():\n"
-        "            status.rename(confined_path(JOB, f'status_{int(time.time())}.json', missing_ok=True))\n"
-        "        if out_dir.exists():\n"
-        "            shutil.rmtree(out_dir, ignore_errors=True)\n"
-        "        out_dir.mkdir(exist_ok=True)\n"
-        "        with log_path.open('w') as log:\n"
-        "            p = subprocess.Popen([sys.executable, str(worker)], cwd=str(JOB),\n"
-        "                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\n"
-        "        res['launched'] = True\n"
-        "        res['pid'] = p.pid\n"
-        "print('CSTUDIO_PREP ' + json.dumps(res))\n"
+    """Prepare a run and start it immediately when there are no references to upload."""
+    return C.vm_program(
+        "PREP", "prepare_run", bundle_hash, list(REMOTE_CODE_FILES), code_files, manifest_json, input_shas,
+        include_start=True,
     )
+
+
+def _prepare_result(output: str, run_id: str, bundle_hash: str, input_shas: dict[str, str]) -> dict:
+    result = None
+    for line in reversed(output.splitlines()):
+        if line.startswith("CSTUDIO_PREP "):
+            try:
+                result = json.loads(line.partition(" ")[2])
+            except ValueError:
+                pass
+            break
+    if not isinstance(result, dict) or result.get("run_id") != run_id:
+        raise RuntimeError("收到無法驗證的遠端準備結果，批次 ID 不符")
+    state = result.get("state")
+    if state in ("bundle_required", "busy"):
+        return result
+    if state not in ("prepared", "running", "finished") or result.get("bundle_hash") != bundle_hash:
+        raise RuntimeError("收到無法驗證的遠端準備結果，狀態或程式版本不符")
+    missing = result.get("missing_inputs")
+    if (
+        not isinstance(missing, list)
+        or any(not isinstance(name, str) or name not in input_shas for name in missing)
+        or len(set(missing)) != len(missing) or (state != "prepared" and missing)
+    ):
+        raise RuntimeError("遠端待上傳清單不符合當批參考圖片")
+    return result
 
 
 class RunCancelled(RuntimeError):
@@ -486,6 +451,7 @@ def run_manifest(
     abort_reason: str | None = None
     stopped: RunStopped | None = None
     remote_attempted = False
+    remote_conflict = False
     cancel_pending = False
     cancel_sent = False
     cancel_failed = False
@@ -589,7 +555,7 @@ def run_manifest(
                 _fail(f"Session {session} 的遠端識別已變更，請先確認目標", exit_on_error)
             owned = C.is_owned_session(session, account=account, assignments=assignments, deadline=deadline)
             st_check = C.poll_remote_status(session, account=account, endpoint=endpoint, deadline=deadline)
-            if not isinstance(st_check, dict):
+            if not isinstance(st_check, dict) or type(st_check.get("alive")) is not bool:
                 _fail(f"無法確認 Session {session} 的遠端工作狀態", exit_on_error)
             if st_check.get("stage") == "cancel_failed":
                 _fail(f"Session {session} 仍有待確認的取消結果，請先檢查遠端任務", exit_on_error)
@@ -652,78 +618,60 @@ def run_manifest(
             remote_m["_cli_quant"] = cli_quant
         manifest_json = json.dumps(remote_m, ensure_ascii=False, indent=1)
 
-        bundle_hash = compute_remote_bundle_hash()
+        sources = {rel: (REMOTE / rel).read_text(encoding="utf-8") for rel in REMOTE_CODE_FILES}
+        bundle_hash = bundle_digest(sources)
         k_info = C.keep_info(session) or {}
         need_code = created or k_info.get("bundle_hash") != bundle_hash
-        code_files = (
-            {rel: (REMOTE / rel).read_text(encoding="utf-8") for rel in REMOTE_CODE_FILES}
-            if need_code
-            else None
-        )
 
         files = sorted({f for j in todo for f in (j.get("inputs") or [])})
         input_shas = {f: hashlib.sha256(confined_path(base, f).read_bytes()).hexdigest() for f in files}
+        remote_run = f"{C.REMOTE_ROOT}/runs/{run_id}"
+
+        def request_preparation(code: str) -> dict:
+            nonlocal remote_attempted, remote_conflict
+            remote_attempted = True
+            reply = _prepare_result(C.remote_exec(session, code, **short), run_id, bundle_hash, input_shas)
+            remote_attempted = reply["state"] in ("running", "finished")
+            if reply["state"] == "busy":
+                remote_conflict = True
+                if reply.get("reason") == "cancel_failed":
+                    raise RuntimeError(f"Session {session} 仍有待確認的取消結果")
+                raise RuntimeError(f"Session {session} 已有執行中的批次，遠端拒絕本批啟動")
+            return reply
 
         _emit({"stage": "syncing_code", "done": False, "log": [f"正在同步遠端程式與任務設定至 {session}..."]})
         _check_active()
-        remote_attempted = True
-        prep_out = C.remote_exec(
-            session,
-            bundle_and_launch_code(code_files, bundle_hash, manifest_json, input_shas),
-            **short,
-        )
-        prep_info = None
-        for line in reversed(prep_out.splitlines()):
-            if "CSTUDIO_PREP " in line:
-                try:
-                    prep_info = json.loads(line.split("CSTUDIO_PREP ", 1)[1])
-                except ValueError:
-                    pass
-                break
-        if not isinstance(prep_info, dict) or type(prep_info.get("launched")) is not bool:
-            raise RuntimeError("收到無法驗證的遠端準備結果")
-        missing_inputs = prep_info.get("missing_inputs")
-        if (
-            not isinstance(missing_inputs, list)
-            or any(not isinstance(f, str) or f not in input_shas for f in missing_inputs)
-            or len(set(missing_inputs)) != len(missing_inputs)
-            or (prep_info["launched"] and missing_inputs)
-        ):
-            raise RuntimeError("遠端待上傳清單不符合當批參考圖片")
-        if not prep_info["launched"]:
-            remote_attempted = False
-
-        if need_code:
+        prep = request_preparation(bundle_and_launch_code(sources if need_code else None, bundle_hash, manifest_json, input_shas))
+        if prep["state"] == "bundle_required" and not need_code:
             _check_active()
-            current = C.keep_info(session) or {}
-            if _run_lease(current):
-                try:
-                    C.set_keep(session, current.get("expires"), expected=current, extra={"bundle_hash": bundle_hash})
-                except C.KeepChanged:
-                    pass  # The bundle cache can be rebuilt after a concurrent keep update.
+            prep = request_preparation(bundle_and_launch_code(sources, bundle_hash, manifest_json, input_shas))
+        if prep["state"] == "bundle_required":
+            raise RuntimeError("遠端未確認批次所需的程式版本")
+        _check_active()
+        current = C.keep_info(session) or {}
+        if _run_lease(current) and current.get("bundle_hash") != bundle_hash:
+            try:
+                C.set_keep(session, current.get("expires"), expected=current, extra={"bundle_hash": bundle_hash})
+            except C.KeepChanged:
+                pass  # The bundle cache can be rebuilt after a concurrent keep update.
 
-        for f in missing_inputs:
+        for f in prep["missing_inputs"]:
             _check_active()
-            if cancel_pending:
-                break
             print(f"⬆️ 上傳參考圖：{f}", flush=True)
             _emit({"stage": "uploading_inputs", "done": False, "log": [f"正在上傳參考圖片：{f}"]})
-            C.colab("upload", "-s", session, confined_path(base, f), f"/content/cstudio/inputs/{f}", timeout=600, **target)
+            C.colab("upload", "-s", session, confined_path(base, f), f"{remote_run}/uploads/{f}", timeout=600, **target)
 
         _check_active()
-        if not cancel_pending:
-            if prep_info.get("launched"):
-                print(f"▶️ 已單次指令同步並啟動遠端引擎 (pid={prep_info.get('pid')})", flush=True)
-                _emit({"stage": "starting", "done": False, "log": [f"已啟動遠端生成引擎 (pid={prep_info.get('pid')})"]})
-            else:
-                remote_attempted = True
-                launch_out = C.remote_exec(session, (REMOTE / "start.py").read_text(encoding="utf-8"), **short)
-                print(f"▶️ 已啟動遠端生成引擎：{redact(launch_out).strip()[-200:]}", flush=True)
-                _emit({"stage": "starting", "done": False, "log": ["已啟動遠端生成引擎"]})
+        if prep["state"] == "prepared":
+            launch = C.vm_program("PREP", "launch_run", run_id, bundle_hash, list(REMOTE_CODE_FILES), include_start=True)
+            prep = request_preparation(launch)
+            if not remote_attempted:
+                raise RuntimeError("遠端尚未啟動本批，程式版本或參考圖片未通過驗證")
+        results["bundle_hash"] = bundle_hash
+        _emit({"stage": "starting", "done": False, "log": ["已確認遠端接受本批次"]})
 
         shown_log: set[str] = set()
         last_ok = time.monotonic()
-        boot_grace_until = last_ok + 25.0
 
         while True:
             time.sleep(C.remaining_time(4, deadline))
@@ -739,8 +687,8 @@ def run_manifest(
                     raise RuntimeError("此遠端批次不支援指定任務取消，無法確認已停止")
                 cancel_sent = receipt["state"] in {"pending", "confirmed", "finished", "failed"}
 
-            st = C.poll_remote_status(session, **target)
-            if not st:
+            st = C.poll_remote_status(session, run_id=run_id, **target)
+            if not isinstance(st, dict) or st.get("run_id") != run_id or st.get("bundle_hash") != bundle_hash:
                 if time.monotonic() - last_ok > 15 * 60:
                     raise RuntimeError("連續 15 分鐘無法讀取 Colab 狀態，連線可能已中斷")
                 print("…等待 Colab 回應中", flush=True)
@@ -752,14 +700,10 @@ def run_manifest(
                     jid: redact_diagnostics(info) if isinstance(info, dict) else info
                     for jid, info in st["jobs"].items()
                 }
-            st_run_id = st.get("run_id")
-            if st_run_id and st_run_id != run_id:
-                continue
-            if st.get("stage") == "cancelled" and (st_run_id != run_id or st.get("cancel_protocol") != 1):
+            if st.get("stage") == "cancelled" and st.get("cancel_protocol") != 1:
                 raise RuntimeError("收到無法驗證的遠端取消結果")
-            # If remote_runner just started and hasn't written status.json yet, give it a brief grace window
-            if not st_run_id and st.get("stage") in ("crashed", "not started") and time.monotonic() < boot_grace_until:
-                continue
+            if st.get("active_run_id") not in (None, run_id) or st.get("legacy_alive"):
+                remote_conflict = True
 
             last_ok = time.monotonic()
             for line in st.get("log") or []:
@@ -787,7 +731,7 @@ def run_manifest(
                     expected_file = f"out/{jid}.png"
                     if jinfo.get("file") != expected_file:
                         if st.get("done"):
-                            results["jobs"][jid] = {"status": "sync_error", "error": "遠端成果路徑與當批任務不符"}
+                            results["jobs"][jid] = {"status": "sync_error", "run_id": run_id, "error": "遠端成果路徑與當批任務不符"}
                             save_results(res_file, results)
                             got.add(jid)
                         continue
@@ -798,7 +742,7 @@ def run_manifest(
                     for pull_try in range(max_pull_tries):
                         _check_active()
                         try:
-                            C.colab("download", "-s", session, f"/content/cstudio/{expected_file}", tmp_pull,
+                            C.colab("download", "-s", session, f"{remote_run}/{expected_file}", tmp_pull,
                                     timeout=600, **target)
                             pulled = confined_path(base, f"out/{tmp_pull.name}")
                             if pulled.stat().st_size == 0:
@@ -808,7 +752,7 @@ def run_manifest(
                             if exp_sha and got_sha != exp_sha:
                                 raise RuntimeError(f"SHA256 校驗不符 (expected {exp_sha[:10]}, got {got_sha[:10]})")
                             pulled.replace(final_dst)
-                            rec = dict(jinfo, fingerprint=fps.get(jid), local_synced=True)
+                            rec = dict(jinfo, run_id=run_id, fingerprint=fps.get(jid), local_synced=True)
                             results["jobs"][jid] = rec
                             save_results(res_file, results)
                             got.add(jid)
@@ -831,12 +775,12 @@ def run_manifest(
                             else:
                                 print(f"⚠️ 拉回 {jid}.png 失敗：{pull_err}", flush=True)
                     if pull_err and st.get("done"):
-                        results["jobs"][jid] = dict(jinfo, status="sync_error", error=f"遠端已生成但下載回本地失敗：{pull_err}")
+                        results["jobs"][jid] = dict(jinfo, run_id=run_id, status="sync_error", error=f"遠端已生成但下載回本地失敗：{pull_err}")
                         save_results(res_file, results)
                         got.add(jid)
                         synced_any = True
                 elif jinfo.get("status") == "error":
-                    results["jobs"][jid] = dict(jinfo)
+                    results["jobs"][jid] = dict(jinfo, run_id=run_id)
                     save_results(res_file, results)
                     got.add(jid)
                     synced_any = True
@@ -872,8 +816,9 @@ def run_manifest(
                 current = C.keep_info(session) or {}
                 same_keep = _run_lease(current)
                 release = abort_reason == "stop" or (
-                    abort_reason != "cancel" and (
-                        stop_after or (not finished and (created or (owned and time.monotonic() >= deadline)))
+                    not remote_conflict and abort_reason != "cancel" and (
+                        (stop_after and (finished or (owned and not remote_attempted)))
+                        or (not finished and (created or (owned and time.monotonic() >= deadline)))
                     )
                 )
                 if release:

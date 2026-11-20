@@ -2,6 +2,7 @@
 import hashlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from cstudio import runner as R
+from cstudio import colab_client as C, runner as R
 from remote import job_paths
 from remote import remote_runner as remote
 
@@ -84,62 +85,68 @@ class JobPathTests(unittest.TestCase):
         with patch.object(Path, "lstat", unreadable), self.assertRaisesRegex(RuntimeError, "無法使用輸入圖片"):
             R.load_manifest(manifest, exit_on_error=False)
 
+    def prepare_program(self, run_id, inputs):
+        files = {"remote_runner.py": "# synthetic worker"}
+        digest = job_paths.bundle_digest(files)
+        manifest = json.dumps({"_run_id": run_id, "jobs": []})
+        code = C.vm_program("PREP", "prepare_run", digest, list(files), files, manifest, inputs,
+                            include_start=True, root=str(self.job))
+        return digest, code
+
+    @unittest.skipUnless(os.name == "posix", "Colab worker locks use flock")
     def test_remote_bundle_uses_same_path_checks_before_marking_uploads_ready(self):
+        run_id = "a" * 12
         sha = hashlib.sha256(b"reference").hexdigest()
-        runner = R.bundle_and_launch_code(None, "fixture", "{}", {"nested/ref.png": sha})
-        runner = runner.replace("Path('/content/cstudio')", f"Path({str(self.job)!r})")
-        compiled = compile(runner, "<fixture bundle>", "exec")
+        digest, program = self.prepare_program(run_id, {"nested/ref.png": sha})
+        job = self.job / "runs" / run_id
         with patch("subprocess.Popen") as spawn, redirect_stdout(io.StringIO()) as out:
-            exec(compiled, {})
+            exec(program, {})
         spawn.assert_not_called()
-        self.assertTrue((self.job / "inputs" / "nested").is_dir())
+        self.assertTrue((job / "uploads" / "nested").is_dir())
         self.assertEqual(json.loads(out.getvalue().split("CSTUDIO_PREP ", 1)[1]), {
-            "missing_inputs": ["nested/ref.png"], "launched": False,
+            "state": "prepared", "run_id": run_id, "bundle_hash": digest, "missing_inputs": ["nested/ref.png"],
         })
-        self.link(self.job / "inputs" / "nested" / "ref.png", self.root / "yard.png")
-        with patch("subprocess.Popen") as spawn, self.assertRaisesRegex(ValueError, "符號連結"):
-            exec(compiled, {})
-        spawn.assert_not_called()
+        self.link(job / "uploads" / "nested" / "ref.png", self.root / "yard.png")
+        launch = C.vm_program("PREP", "launch_run", run_id, digest, ["remote_runner.py"],
+                              include_start=True, root=str(self.job))
+        for code in (program, launch):
+            with patch("subprocess.Popen") as spawn, self.assertRaisesRegex(ValueError, "符號連結"):
+                exec(code, {})
+            spawn.assert_not_called()
 
-    def test_both_remote_start_paths_verify_files_before_launch(self):
-        worker = self.job / "remote_runner.py"
-        worker.write_text("# synthetic worker", encoding="utf-8")
-        (self.job / "job_paths.py").write_text((R.REMOTE / "job_paths.py").read_text(encoding="utf-8"), encoding="utf-8")
-        inline = R.bundle_and_launch_code(None, "fixture", "{}", {})
-        fallback = (R.REMOTE / "start.py").read_text(encoding="utf-8")
-        for source, token in ((inline, "'/content/cstudio'"), (fallback, '"/content/cstudio"')):
-            with self.subTest(token=token):
-                code = compile(source.replace(token, repr(str(self.job))), "<fixture start>", "exec")
-                with (
-                    patch.object(sys, "path", sys.path.copy()),
-                    patch.dict(sys.modules, {"job_paths": job_paths}),
-                    patch("subprocess.run", return_value=SimpleNamespace(stdout="")),
-                    patch("subprocess.Popen", return_value=SimpleNamespace(pid=42)) as spawn,
-                    redirect_stdout(io.StringIO()),
-                ):
-                    exec(code, {})
-                spawn.assert_called_once()
-                self.assertEqual(spawn.call_args.args[0], [sys.executable, str(worker)])
-                self.assertEqual(spawn.call_args.kwargs["cwd"], str(self.job))
-
-        log = self.job / "remote_runner.log"
-        log.unlink()
-        old_output = self.job / "out" / "old.png"
+    @unittest.skipUnless(os.name == "posix", "Colab worker locks use flock")
+    def test_both_remote_start_paths_check_run_paths_before_launch(self):
+        run_id = "b" * 12
+        old_output = self.job / "old.png"
         old_output.write_bytes(b"keep prior output")
+        digest, prepare = self.prepare_program(run_id, {})
+        job = self.job / "runs" / run_id
+        launch = C.vm_program("PREP", "launch_run", run_id, digest, ["remote_runner.py"],
+                              include_start=True, root=str(self.job))
+
+        def fail_to_launch(_args, **opts):
+            self.assertEqual(opts["cwd"], str(job))
+            self.assertEqual(opts["env"]["CSTUDIO_DIR"], str(job))
+            self.assertEqual(len(opts["pass_fds"]), 1)
+            raise OSError("fixture start failure")
+
+        with patch("subprocess.Popen", side_effect=fail_to_launch) as spawn, self.assertRaises(OSError):
+            exec(prepare, {})
+        self.assertEqual(spawn.call_args.args[0], [
+            sys.executable, str(self.job / "bundles" / digest / "remote_runner.py"), str(self.job / "remote_runner.py"),
+        ])
+        log = job / "remote_runner.log"
+        log.unlink()
         self.link(log, old_output)
-        for source, token in ((inline, "'/content/cstudio'"), (fallback, '"/content/cstudio"')):
-            with self.subTest(token=token):
-                code = compile(source.replace(token, repr(str(self.job))), "<fixture start>", "exec")
-                with (
-                    patch.object(sys, "path", sys.path.copy()),
-                    patch.dict(sys.modules, {"job_paths": job_paths}),
-                    patch("subprocess.run", return_value=SimpleNamespace(stdout="")),
-                    patch("subprocess.Popen") as spawn,
-                    self.assertRaisesRegex(ValueError, "符號連結"),
-                ):
-                    exec(code, {})
-                spawn.assert_not_called()
-                self.assertEqual(old_output.read_bytes(), b"keep prior output")
+        for code in (prepare, launch):
+            with patch("subprocess.Popen") as spawn, self.assertRaisesRegex(ValueError, "符號連結"):
+                exec(code, {})
+            spawn.assert_not_called()
+            self.assertEqual(old_output.read_bytes(), b"keep prior output")
+        log.unlink()
+        with patch("subprocess.Popen", return_value=SimpleNamespace(pid=42)) as spawn, redirect_stdout(io.StringIO()):
+            exec(launch, {})
+        spawn.assert_called_once()
 
     def test_remote_staging_keeps_nested_inputs_and_confines_both_ends(self):
         comfy = self.root / "comfy"

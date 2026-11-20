@@ -1,10 +1,14 @@
 """File boundaries shared by the local client and the Colab runner."""
+import hashlib
+import json
 import re
 import stat
 from pathlib import Path
 
 
 JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,60}")
+RUN_ID = re.compile(r"[0-9a-f]{12}")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 INVALID_PATH_CHARS = re.compile(r'[<>:"\\|?*\x00-\x1f\x7f]')
 WINDOWS_DEVICE = re.compile(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[1-9¹²³])", re.IGNORECASE)
 
@@ -40,3 +44,8 @@ def confined_path(root: Path, relative: str, *, directory: bool = False, missing
         if not expected(info.st_mode) or getattr(info, "st_reparse_tag", 0):
             raise ValueError(f"路徑必須是一般檔案或目錄，且不可使用符號連結：{current}")
     return current
+
+
+def bundle_digest(files: dict[str, str]) -> str:
+    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
