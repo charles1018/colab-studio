@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,6 +113,32 @@ class ColabIdentityTests(unittest.TestCase):
         self.assertIsNone(self.execute("stop", "-s", "shared", endpoint="original"))
         self.client.unassign.assert_called_once_with("original")
         self.assertEqual(self.store.get("shared").endpoint, "replacement")
+
+    def test_scoped_adapter_redacts_bare_oauth_and_proxy_tokens_before_writing_output(self):
+        self.register("original")
+        updated_proxy = "fixture-rotated-proxy-secret"
+        access = "fixture-adapter-access-secret"
+        self.token.write_text(json.dumps(dict(self.grant, token=access)), encoding="utf-8")
+
+        def command(**_options):
+            store = _colab.cli.state.store
+            runtime = store.get("shared")
+            updated = runtime.model_copy(update={"token": updated_proxy})
+            store.add(updated)
+            print(f"stdout: {access} {self.grant['refresh_token']} {runtime.token} {updated_proxy}")
+            print(f"stderr: {self.grant['client_secret']}", file=sys.stderr)
+            return 0
+
+        with patch.object(_colab.cli, "app", side_effect=command), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(self.execute("download", "-s", "shared", endpoint="original"), 0)
+        emitted = self.output.getvalue() + errors.getvalue()
+        for private in (access, self.grant["refresh_token"], self.grant["client_secret"],
+                        "fixture-proxy-token", updated_proxy):
+            self.assertNotIn(private, emitted)
+        self.assertEqual(emitted.count("[redacted]"), 5)
+        self.assertEqual(self.store.get("shared").token, updated_proxy)
+        if os.name == "posix":
+            self.assertEqual(Path(self.store.path).stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

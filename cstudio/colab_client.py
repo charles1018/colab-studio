@@ -19,6 +19,7 @@ from typing import Callable
 from filelock import FileLock, Timeout as LockTimeout
 
 from .colab_login import account_scope
+from .redact import redact, redact_diagnostics
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -26,6 +27,7 @@ REMOTE = ROOT / "remote"
 GPUS = ("L4", "G4", "A100", "H100", "T4")
 PREFIX = "cstudio-"
 ASSIGN_TIMEOUT = 900
+ALLOCATION_REFUSED = "[colab] Allocation refused (precondition failed)."
 RECOVERY_TIMEOUT = 30
 WATCHDOG_TICK = 30
 WATCHDOG_START_TIMEOUT = 10
@@ -73,6 +75,7 @@ def colab(
     *args, timeout: int = 600, check: bool = True,
     account: str | None = None, endpoint: str | None = None, deadline: float | None = None,
 ) -> str:
+    operation = str(args[0]) if args else "指令"
     env = ENV
     command = [colab_exe()] if account is None else [sys.executable, "-m", "cstudio._colab"]
     if account is not None:
@@ -96,12 +99,25 @@ def colab(
         if deadline is not None and (timeout_left < timeout or time.monotonic() >= deadline):
             raise ColabDeadline("已到達 Colab 批次時間上限，遠端結果待確認") from None
         if check:
-            raise ColabTimeout(f"colab {' '.join(map(str, args))} 超過 {timeout} 秒沒有回應") from None
+            raise ColabTimeout(f"colab {operation} 超過 {timeout} 秒沒有回應") from None
         return ""
-    out = (p.stdout or "") + (p.stderr or "")
-    if check and p.returncode != 0:
-        raise RuntimeError(f"colab {' '.join(map(str, args))} 失敗（{p.returncode}）：\n{out[-2000:]}")
-    return out
+    except OSError:
+        raise RuntimeError(f"無法啟動 colab {operation}") from None
+    stdout, stderr = p.stdout or "", p.stderr or ""
+    if p.returncode and check:
+        lines = stdout.splitlines() + stderr.splitlines()
+        # Preserve the pinned client's explicit refusal receipt for allocation retry logic.
+        refusal = operation == "new" and any(line.startswith(ALLOCATION_REFUSED) for line in lines)
+        hint = f"\n{ALLOCATION_REFUSED}" if refusal else ""
+        if not refusal and operation == "new" and any(
+            line.startswith("[colab] Backend rejected accelerator ") for line in lines
+        ):
+            hint = "\nColab 拒絕所選的 GPU 規格，請檢查帳號配額"
+        raise RuntimeError(f"colab {operation} 失敗（{p.returncode}）{hint}")
+    if operation == "exec":
+        # A remote status/exec receipt can exist even if the local CLI later exits nonzero.
+        return "\n".join(line for line in (stdout, redact(stderr)) if line)
+    return "" if p.returncode else redact("\n".join(line for line in (stdout, stderr) if line))
 
 
 def new_session_name() -> str:
@@ -129,8 +145,7 @@ def new_runtime(
             out = colab("new", "-s", session, "--gpu", gpu, timeout=timeout, account=account, deadline=deadline)
         except RuntimeError as e:
             # Only the upstream explicit 412 rejection proves this request did not allocate.
-            refused = any(line.startswith("[colab] Allocation refused (precondition failed).")
-                          for line in str(e).splitlines())
+            refused = any(line.startswith(ALLOCATION_REFUSED) for line in str(e).splitlines())
             if isinstance(e, ColabTimeout) or attempt == retries or not refused or runtime_endpoint(session, deadline=deadline):
                 raise
             print(
@@ -157,10 +172,10 @@ def usage(*, account: str | None = None, deadline: float | None = None) -> tuple
         return None, "無法確認 Colab 登入身分"
     try:
         out = colab("usage", timeout=120, check=False, account=account, deadline=deadline)
-    except Exception as e:
-        out = f"（讀取失敗：{e}）"
+    except Exception:
+        out = ""
     m = re.search(r"([\d.]+)\s*(?:compute units|運算單元|units)", out, re.I)
-    return (float(m.group(1)) if m else None), out.strip()
+    return (float(m.group(1)) if m else None), redact(out).strip() or "無法讀取剩餘運算單元"
 
 
 def parse_sessions(out: str) -> list[str]:
@@ -635,7 +650,7 @@ def request_cancel(
                 and result.get("state") in ("idle", "pending", "confirmed", "finished", "failed", "unsupported")
                 and (run_id is None or result.get("run_id") == run_id)
             ):
-                return result
+                return redact_diagnostics(result)
     raise RuntimeError("遠端未回傳可確認的取消狀態")
 
 
@@ -825,4 +840,4 @@ def _monitor_keep(session: str, leader: FileLock):
                 continue
             say("release unconfirmed; will verify on next tick")
         except Exception as e:
-            say(f"error (will retry): {type(e).__name__}: {str(e)[:200]}")
+            say(f"error (will retry): {type(e).__name__}: {redact(str(e))[:200]}")

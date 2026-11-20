@@ -156,7 +156,7 @@ def main():
 
     p_login = sub.add_parser("login", help="兩步驟 Google Colab OAuth 登入 (status / url / code)")
     p_login.add_argument("action", nargs="?", default="status", choices=["status", "url", "code"])
-    p_login.add_argument("auth_code", nargs="?", default=None)
+    p_login.add_argument("auth_code", nargs="?", default=None, help="舊版位置參數，省略時由隱藏提示或 stdin 讀取")
 
     p_plan = sub.add_parser("plan", help="離線檢查 manifest、顯示將下載的模型與指紋狀態（不開機）")
     p_plan.add_argument("manifest", help="manifest.json 路徑")

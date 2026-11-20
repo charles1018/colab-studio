@@ -16,6 +16,7 @@ from typing import Any, Callable
 from remote.job_paths import JOB_ID, confined_path
 
 from . import colab_client as C
+from .redact import redact, redact_diagnostics
 
 ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / "remote"
@@ -717,7 +718,7 @@ def run_manifest(
             else:
                 remote_attempted = True
                 launch_out = C.remote_exec(session, (REMOTE / "start.py").read_text(encoding="utf-8"), **short)
-                print(f"▶️ 已啟動遠端生成引擎：{launch_out.strip()[-200:]}", flush=True)
+                print(f"▶️ 已啟動遠端生成引擎：{redact(launch_out).strip()[-200:]}", flush=True)
                 _emit({"stage": "starting", "done": False, "log": ["已啟動遠端生成引擎"]})
 
         shown_log: set[str] = set()
@@ -745,6 +746,12 @@ def run_manifest(
                 print("…等待 Colab 回應中", flush=True)
                 continue
 
+            st = redact_diagnostics(st)
+            if isinstance(st.get("jobs"), dict):
+                st["jobs"] = {
+                    jid: redact_diagnostics(info) if isinstance(info, dict) else info
+                    for jid, info in st["jobs"].items()
+                }
             st_run_id = st.get("run_id")
             if st_run_id and st_run_id != run_id:
                 continue
@@ -809,20 +816,20 @@ def run_manifest(
                             synced_any = True
                             print(f"⬇️ 已同步回本地：{final_dst} ({final_dst.stat().st_size / 1024:.1f} KB)", flush=True)
                             if rec.get("refined_prompt"):
-                                print(f"   ✨ Prompt Enhancer 擴寫結果：{rec['refined_prompt'][:160]}...", flush=True)
+                                print(f"   ✨ Prompt Enhancer 擴寫結果：{redact(rec['refined_prompt'])[:160]}...", flush=True)
                             pull_err = None
                             break
                         except C.ColabDeadline:
                             tmp_pull.unlink(missing_ok=True)
                             raise
                         except Exception as e:
-                            pull_err = str(e)
+                            pull_err = redact(str(e))
                             tmp_pull.unlink(missing_ok=True)
                             if pull_try + 1 < max_pull_tries:
-                                print(f"⚠️ 拉回 {jid}.png 失敗，重試中 ({pull_try + 1}/{max_pull_tries})：{e}", flush=True)
+                                print(f"⚠️ 拉回 {jid}.png 失敗，重試中 ({pull_try + 1}/{max_pull_tries})：{pull_err}", flush=True)
                                 time.sleep(C.remaining_time(2, deadline))
                             else:
-                                print(f"⚠️ 拉回 {jid}.png 失敗：{e}", flush=True)
+                                print(f"⚠️ 拉回 {jid}.png 失敗：{pull_err}", flush=True)
                     if pull_err and st.get("done"):
                         results["jobs"][jid] = dict(jinfo, status="sync_error", error=f"遠端已生成但下載回本地失敗：{pull_err}")
                         save_results(res_file, results)
@@ -854,7 +861,7 @@ def run_manifest(
 
     except BaseException as exc:
         if "error" not in results:
-            results["error"] = str(exc)
+            results["error"] = redact(str(exc))
         raise
     finally:
         results["minutes"] = round((time.monotonic() - t0) / 60, 2)

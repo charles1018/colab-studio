@@ -997,6 +997,10 @@ async function initStudio() {
     }
   });
   el.btnSubmitLoginCode.addEventListener("click", async () => {
+    if (!ui.loginFlowState) {
+      showToast("請先在此分頁取得 Google 登入網址");
+      return;
+    }
     const code = el.loginCodeInput.value.trim();
     if (!code) {
       showToast("請貼上 Google 授權碼");
@@ -1009,6 +1013,8 @@ async function initStudio() {
         body: JSON.stringify({ code, state: ui.loginFlowState }),
       });
       el.loginCodeInput.value = "";
+      ui.loginFlowState = null;
+      el.loginUrlLink.hidden = true;
       el.loginDrawer.hidden = true;
       showToast("✅ Google Colab OAuth 登入成功！", true);
       await refreshSlowColabStatus(true);

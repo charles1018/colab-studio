@@ -562,6 +562,8 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
                 ))
                 self.assertEqual(response.status, 202 if path == "/api/run/start" else 200, response.body)
                 self.assertTrue(json.loads(response.body)["ok"])
+                if path == "/api/colab/login/code":
+                    self.assertEqual(json.loads(response.body), {"ok": True})
         job_dir = json.loads(response.body)["job_dir"]
         manifest = self.jobs / job_dir / "manifest.json"
         self.assertEqual(json.loads(manifest.read_text(encoding="utf-8"))["jobs"][0]["prompt"], "Synthetic prompt")
@@ -575,6 +577,59 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
         self.cloud["start_watchdog"].assert_called_once_with("fixture")
         self.cloud["request_cancel"].assert_called_once_with("fixture", None)
         self.cloud["release_runtime"].assert_called_once_with("fixture", owned_only=False, account="fixture-account")
+
+    async def test_web_login_requires_explicit_state_and_never_reflects_codes_or_provider_errors(self):
+        cookie = await self.open_ui()
+        headers = (cookie, ("origin", ORIGIN), UI_HEADER, JSON_HEADER)
+        code = "fixture-auth-code"
+        for payload in (
+            [code], {"code": code}, {"code": code, "state": None}, {"code": code, "state": ""},
+            {"code": code, "state": {"unexpected": True}},
+        ):
+            with self.subTest(payload_type=type(payload).__name__):
+                response = await self.request("/api/colab/login/code", method="POST",
+                                              body=json.dumps(payload).encode(), headers=headers)
+                self.assertEqual(response.status, 400)
+                self.assertNotIn(code.encode(), response.body)
+        self.assert_no_effects()
+
+        private = (code, "fixture-access-token", "fixture-refresh-token", "fixture-pkce-verifier", str(self.token))
+        self.finish_login.side_effect = RuntimeError(" ".join(private))
+        response = await self.request("/api/colab/login/code", method="POST", headers=headers,
+                                      body=json.dumps({"code": code, "state": "exact-state"}).encode())
+        self.assertEqual(response.status, 400)
+        self.finish_login.assert_called_once_with(code, state="exact-state")
+        self.cloud["usage"].assert_not_called()
+        for value in private:
+            self.assertNotIn(value.encode(), response.body)
+
+        self.begin_login.side_effect = RuntimeError(" ".join(private))
+        response = await self.request("/api/colab/login/url", method="POST", headers=headers)
+        self.assertEqual(response.status, 500)
+        for value in private:
+            self.assertNotIn(value.encode(), response.body)
+        self.assertEqual(self.token.read_text(encoding="utf-8"), "original token")
+
+    async def test_diagnostic_status_masks_oauth_and_runtime_fields(self):
+        cookie = await self.open_ui()
+        self.cloud["usage"].return_value = (10.0, "10 compute units Authorization: Bearer fixture-ui-access")
+        self.cloud["sessions"].return_value = ([], "x-colab-runtime-proxy-token: fixture-ui-proxy")
+        slow = await self.request("/api/colab/status?force=true", headers=(cookie, UI_HEADER))
+        self.assertEqual(slow.status, 200)
+        self.assertEqual(json.loads(slow.body)["cu"], 10.0)
+        self.assertIn(b"compute units", slow.body)
+        self.assertNotIn(b"fixture-ui-access", slow.body)
+        self.assertNotIn(b"fixture-ui-proxy", slow.body)
+        self.state.on_runner_progress({
+            "stage": "error",
+            "log": ["token refresh failed, refresh_token=fixture-ui-refresh"],
+            "error": "could not connect to https://example.test/runtime?token=fixture-ui-runtime",
+        })
+        fast = await self.request("/api/run/status", headers=(cookie,))
+        self.assertEqual(fast.status, 200)
+        self.assertNotIn(b"fixture-ui-refresh", fast.body)
+        self.assertNotIn(b"fixture-ui-runtime", fast.body)
+        self.assertIn(b"[redacted]", fast.body)
 
     def test_launcher_binds_only_supported_loopback_hosts_and_disables_forwarding(self):
         with patch("uvicorn.run") as run, patch.object(W.webbrowser, "open") as open_browser, patch("builtins.print"):

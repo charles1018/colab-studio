@@ -18,7 +18,7 @@ uv run cstudio check
 
 # 若尚未登入 Google Colab（兩步驟 OAuth）：
 uv run cstudio login url          # 取得登入網址交給使用者
-uv run cstudio login code <CODE>  # 貼回授權碼完成登入
+uv run cstudio login code         # 在隱藏提示中貼上授權碼，也可從 stdin 提供
 
 # 離線預覽批次任務（不開機，檢查將下載哪些模型、哪些任務已完成或過期）
 uv run cstudio plan jobs/demo_qwen21/manifest.json --gpu L4 [--quant Q4_K_M]
@@ -120,6 +120,7 @@ uv run cstudio sheet jobs/demo_qwen21/out/*.png
 - **啟動方式**：`uv run cstudio ui [--host 127.0.0.1] [--port 7860] [--open]`（或 `uv run cstudio-ui`）。
 - **部署範圍**僅限直接的本機 loopback 連線。`--host` 接受 `127.0.0.1`、`localhost`（綁定 `127.0.0.1`）與 `::1`（瀏覽器網址用 `[::1]`）。其他位址會在啟動前被拒絕。工作台信任能直接連線的本機使用者與程序。請勿透過反向代理、通道或連接埠轉送對外提供工作台。轉送器若讓請求看起來是直接的 loopback 連線，會繼承本機信任。
 - 開啟首頁時，瀏覽器會取得工作台程序的 session cookie。API 與圖片需要該 cookie，程序重啟後須重新開啟首頁。控制請求須有與工作台協定、主機及埠相符的 `Origin`，並帶 `X-Colab-Studio-Request: 1`。會查詢 Colab 的狀態端點也需要此自訂標頭。工作台會拒絕代理轉送標頭。
+- 請在取得 Google 登入網址的分頁貼回授權碼。登入網址有效 10 分鐘，每筆待登入流程只能交換一次。CLI 使用自己的待登入流程。提交後若交換失敗，請重新取得登入網址。成功登入會更新與 Colab CLI 共用的憑證。
 - Web 改圖最多接受 10 張參考圖。上傳與畫廊沿用的圖片均限每張 35 MiB、單邊 8192 像素、總面積 16,777,216 像素。支援 PNG、JPEG、WebP、AVIF、GIF、BMP 和 TIFF，以首幀轉存 PNG。生成用 multipart 請求含表單內容共限 352 MiB，URL 編碼表單限 2 MiB。每個工作台程序同時處理一個生成請求的上傳與圖片轉檔。
 - **核心功能**：
   - 頂部即時顯示 Google Colab OAuth 登入狀態（支援網頁兩步驟授權登入）、剩餘運算單元 (`CU`)、運行中 `Session` 與自動關機倒數計時，並提供 GPU (`L4`/`G4`/`A100` 等)、14 種權重規格（預設原生 `INT8`）、`+30/+60 分鐘延長保留`、`⏹️ 中斷當前任務` 與 `🛑 立即關機` 控制。

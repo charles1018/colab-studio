@@ -342,6 +342,27 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.assertEqual(self.commands.count("new"), 1)
         self.assertNotIn("stop", self.commands)
 
+    def test_transport_and_remote_diagnostics_are_redacted_in_results_progress_and_console(self):
+        status = self.done_status()
+        status["log"] = ["refresh_token=fixture-log-refresh"]
+        status["jobs"]["test"]["traceback"] = "code_verifier=fixture-job-verifier"
+        C.poll_remote_status.return_value = status
+        transport = C.colab.side_effect
+
+        def fail_download(operation, *args, **options):
+            if operation == "download":
+                raise RuntimeError("HTTP download failed at https://example.test/asset?token=fixture-download-secret")
+            return transport(operation, *args, **options)
+
+        C.colab.side_effect = fail_download
+        progress = Mock()
+        result = self.run_manifest(progress_cb=progress)
+        self.assertEqual(result["jobs"]["test"]["status"], "sync_error")
+        for output in (self.result_path.read_text(encoding="utf-8"), self.log.getvalue(), str(progress.call_args_list)):
+            self.assertIn("[redacted]", output)
+            for secret in ("fixture-log-refresh", "fixture-job-verifier", "fixture-download-secret"):
+                self.assertNotIn(secret, output)
+
     def edit_reference(self):
         ref = self.directory / "inputs" / "style" / "ref.png"
         ref.parent.mkdir(parents=True)

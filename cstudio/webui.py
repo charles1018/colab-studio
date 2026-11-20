@@ -17,7 +17,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
@@ -26,6 +26,7 @@ from remote.job_paths import confined_path, relative_parts
 from . import colab_client as C
 from . import colab_login as L
 from . import runner as R
+from .redact import redact
 from .web_inputs import MAX_REFERENCES, GenerationRoute, prepare_reference_images
 
 HERE = Path(__file__).resolve().parent
@@ -369,6 +370,7 @@ class StudioUIState:
         return self.revision
 
     def append_log(self, msg: str) -> None:
+        msg = redact(msg)
         with self.lock:
             if not self.logs or self.logs[-1] != msg:
                 self.logs.append(msg)
@@ -394,14 +396,14 @@ class StudioUIState:
                 self.stage_label = STAGE_LABELS_ZH.get(raw_stage, f"🔄 執行中 ({raw_stage})...")
 
             for line in st.get("log") or []:
-                s_line = str(line).strip()
+                s_line = redact(str(line)).strip()
                 if s_line and s_line not in self.logs:
                     self.logs.append(s_line)
             if len(self.logs) > 80:
                 self.logs = self.logs[-80:]
 
             if st.get("error") and raw_stage in ("error", "crashed", "cancelled"):
-                self.error = str(st["error"])
+                self.error = redact(str(st["error"]))
 
             synced_ids = st.get("_local_synced_jobs") or []
             local_res = st.get("_local_results") or {}
@@ -541,10 +543,10 @@ class StudioUIState:
                 "checked_at_str": time.strftime("%H:%M:%S"),
                 "token_ok": tok,
                 "cu": cu_val,
-                "cu_raw": cu_raw,
+                "cu_raw": redact(cu_raw),
                 "sessions": sessions_detail,
                 "active_session_names": sess_names,
-                "sessions_raw": sess_raw,
+                "sessions_raw": redact(sess_raw),
                 "refreshing": False,
                 "local_keeps": list(keeps_by_name.values()),
             }
@@ -698,22 +700,29 @@ def api_login_url():
     try:
         url, state = L.get_login_url()
         return {"ok": True, "url": url, "state": state}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"產生 Google OAuth 登入網址失敗：{e}") from e
+    except L.LoginError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from None
+    except Exception:
+        raise HTTPException(status_code=500, detail="無法產生 Google OAuth 登入網址") from None
 
 
 @app.post("/api/colab/login/code")
-def api_login_code(payload: dict[str, Any]):
-    code = str(payload.get("code") or "").strip()
+def api_login_code(payload: Any = Body(None)):
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="登入請求格式錯誤")
+    code = payload.get("code")
     state = payload.get("state")
-    if not code:
+    if not isinstance(code, str) or not code.strip():
         raise HTTPException(status_code=400, detail="請貼上 Google 授權碼")
+    if not isinstance(state, str) or not state:
+        raise HTTPException(status_code=400, detail=L.STATE_INVALID)
     try:
-        tok_path = L.submit_login_code(code, state=str(state) if state else None)
-        colab_st = STATE.refresh_colab_cache(force=True)
-        return {"ok": True, "token_path": str(tok_path), "colab": colab_st}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Google OAuth 授權碼驗證失敗：{e}") from e
+        L.submit_login_code(code, state=state)
+    except L.LoginError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except Exception:
+        raise HTTPException(status_code=400, detail="Google OAuth 授權碼驗證失敗") from None
+    return {"ok": True}
 
 
 def _resolve_target_session(requested: str | None) -> str:
@@ -1181,7 +1190,7 @@ async def api_run_start(
                 elif res.get("error"):
                     STATE.stage = "error"
                     STATE.stage_label = STAGE_LABELS_ZH["error"]
-                    STATE.error = str(res["error"])
+                    STATE.error = redact(str(res["error"]))
                 else:
                     STATE.stage = "done"
                     STATE.stage_label = STAGE_LABELS_ZH["done"]
@@ -1205,8 +1214,8 @@ async def api_run_start(
                 else:
                     STATE.stage = "error"
                     STATE.stage_label = STAGE_LABELS_ZH["error"]
-                    STATE.error = str(exc)
-                STATE.logs.append(f"⚠️ {exc}")
+                    STATE.error = redact(str(exc))
+                STATE.logs.append(f"⚠️ {redact(str(exc))}")
                 STATE._bump()
         finally:
             with STATE.lock:
