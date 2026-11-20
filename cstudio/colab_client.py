@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import uuid
+from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
@@ -139,8 +140,8 @@ def parse_sessions(out: str) -> list[str]:
     return names
 
 
-def sessions() -> tuple[list[str], str]:
-    out = colab("sessions", timeout=120, check=False)
+def sessions(*, check: bool = False) -> tuple[list[str], str]:
+    out = colab("sessions", timeout=120, check=check)
     return parse_sessions(out), out.strip()
 
 
@@ -148,18 +149,43 @@ def listing_answered(names: list[str] | None, out: str) -> bool:
     return bool(names) or "No active sessions" in out or bool(re.search(r"^\[\?\]", out, re.M))
 
 
-def session_gone(session: str, names: list[str] | None, out: str) -> bool:
-    if names is None or not listing_answered(names, out) or re.search(r"^\[\?\]", out, re.M):
+def session_gone(session: str, names: list[str] | None, out: str, endpoint: str | None = None) -> bool:
+    if names is None:
         return False
-    return session not in names
+    rows = [
+        line for line in out.strip().splitlines() if line
+        and not re.fullmatch(r"\[colab\] Pruned \d+ stale local session\(s\)\.", line)
+        and not line.startswith((
+            "[colab] A new version of Colab CLI is available: ",
+            "[colab] You can run 'colab update --install'",
+            "[colab] Run 'colab update' to update.",
+            '[colab] To silence this check, set "enable_update_check":',
+        ))
+    ]
+    if rows == ["[colab] No active sessions found on server."]:
+        return True
+    assignments = []
+    for row in rows:
+        match = re.fullmatch(r"\[([^\]]+)\] (\S+) \| Hardware: .+", row)
+        if not match:
+            return False
+        assignments.append(match.groups())
+    if not assignments:
+        return False
+    if endpoint:
+        return all(active_endpoint != endpoint for _, active_endpoint in assignments)
+    return all(name not in (session, "?") for name, _ in assignments)
 
 
 def sessions_checked(tries: int = 2) -> tuple[list[str] | None, str]:
     out = ""
     for i in range(max(1, tries)):
-        names, out = sessions()
-        if listing_answered(names, out):
-            return names, out
+        try:
+            names, out = sessions(check=True)
+            if listing_answered(names, out):
+                return names, out
+        except (OSError, RuntimeError, SystemExit):
+            out = ""
         if i + 1 < tries:
             time.sleep(2)
     return None, out
@@ -198,19 +224,23 @@ def is_owned_session(name: str) -> bool:
     except ValueError:
         return False
     info = keep_info(name) or {}
-    if info.get("created_by") in ("external", "pending"):
+    if info.get("created_by") != "owned":
         return False
     if endpoint := info.get("runtime_endpoint"):
-        return runtime_endpoint(name) == endpoint
-    if name.startswith(PREFIX):
-        return True
-    if not keep_file(name).exists():
-        return False
+        try:
+            return runtime_endpoint(name) == endpoint
+        except OSError:
+            return False
     return True
 
 
 def owned_sessions() -> list[str]:
-    return [n for n in sessions()[0] if is_owned_session(n)]
+    """Return locally registered Studio runtimes, including releases awaiting verification."""
+    return [
+        path.stem for path in sorted(KEEP.glob("*.json"))
+        if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", path.stem) and path.stem not in (".", "..")
+        and (keep_info(path.stem) or {}).get("created_by") == "owned"
+    ]
 
 
 def set_keep(
@@ -224,8 +254,11 @@ def set_keep(
     KEEP.mkdir(parents=True, exist_ok=True)
     old = keep_info(session) or {}
     owner = owner or old.get("created_by")
+    if old.get("release_pending") and not (extra and "release_pending" in extra):
+        # A late runner update or watchdog PID write must not postpone a queued shutdown.
+        expires = old.get("expires")
     if owner is None and not keep_file(session).exists():
-        owner = "owned" if session.startswith(PREFIX) else "external"
+        owner = "external"
     data = dict(old, session=session, expires=expires, watchdog_pid=pid or old.get("watchdog_pid"))
     if owner:
         data["created_by"] = owner
@@ -246,35 +279,86 @@ def drop_keep(session: str):
     keep_file(session).unlink(missing_ok=True)
 
 
-def release_runtime(session: str, owner: str, endpoint: str | None = None) -> bool:
-    """Persist a retryable release request before stopping a runner's runtime."""
-    try:
-        set_keep(
-            session,
-            time.time() + 30,
-            owner=owner,
-            extra={"busy_until": None, "release_pending": True, "runtime_endpoint": endpoint},
-        )
-        start_watchdog(session)
-    except Exception as exc:
-        print(f"⚠️ 無法登記 {session} 的關機重試（{type(exc).__name__}）", flush=True)
+class ReleaseState(StrEnum):
+    CONFIRMED = "confirmed"
+    PENDING = "pending"
+    FAILED = "failed"
+
+
+def release_runtime(
+    session: str,
+    owner: str | None = None,
+    endpoint: str | None = None,
+    *,
+    owned_only: bool = False,
+    watchdog_keep: dict | None = None,
+) -> ReleaseState:
+    """Request release and verify the assignment independently of the command reply."""
+    session = sanitize_session_name(session)
+    keep = keep_info(session)
+    if watchdog_keep is not None and keep != watchdog_keep:
+        return ReleaseState.PENDING
+    info = keep or {}
+    if (owned_only or watchdog_keep is not None) and info.get("created_by") != "owned":
+        return ReleaseState.FAILED
+    if info.get("created_by") == "pending" and not (owner == "owned" and endpoint):
+        return ReleaseState.FAILED
+    explicit_name = owner is None and endpoint is None and not (owned_only or watchdog_keep is not None)
+    owner = owner or info.get("created_by", "external")
+    registered = info.get("runtime_endpoint")
+    endpoint = endpoint or registered
+    same_record = not (registered and registered != endpoint)
+    retrying = watchdog_keep is not None
+    scheduled = retrying
+    already_requested = (
+        owner == "owned" and not retrying and same_record and info.get("release_pending")
+        and isinstance(info.get("expires"), (int, float)) and time.time() < info["expires"]
+    )
 
     try:
-        if endpoint and runtime_endpoint(session) != endpoint:
-            print(f"⚠️ {session} 的遠端識別已變更，將僅查詢關機狀態", flush=True)
-        else:
-            colab("stop", "-s", session, timeout=300, check=False)
+        current_endpoint = runtime_endpoint(session)
     except Exception as exc:
+        current_endpoint = None
+        print(f"⚠️ 無法讀取 {session} 的遠端識別（{type(exc).__name__}）", flush=True)
+    if explicit_name and registered and current_endpoint and current_endpoint != registered:
+        print(f"⚠️ {session} 的遠端識別已變更，請先確認關機目標", flush=True)
+        return ReleaseState.FAILED
+    if not info.get("release_pending"):
+        endpoint = endpoint or current_endpoint
+
+    if retrying and endpoint and not registered:
+        if keep_info(session) != keep:
+            return ReleaseState.PENDING
+        set_keep(session, info.get("expires"), extra={"runtime_endpoint": endpoint})
+        keep = keep_info(session)
+    elif owner == "owned" and same_record and endpoint and not retrying:
+        try:
+            if not already_requested:
+                set_keep(
+                    session, time.time() + 30, owner=owner,
+                    extra={"busy_until": None, "release_pending": True, "runtime_endpoint": endpoint},
+                )
+            start_watchdog(session)
+            scheduled = True
+        except Exception as exc:
+            print(f"⚠️ 無法登記 {session} 的關機重試（{type(exc).__name__}）", flush=True)
+        keep = keep_info(session)
+    try:
+        if not already_requested and same_record and endpoint and runtime_endpoint(session) == endpoint:
+            if keep_info(session) == keep:
+                colab("stop", "-s", session, timeout=300)
+    except (OSError, RuntimeError, SystemExit) as exc:
         print(f"⚠️ 無法送出 {session} 的關機請求（{type(exc).__name__}）", flush=True)
 
     try:
         names, out = sessions_checked()
-        if session_gone(session, names, out):
-            drop_keep(session)
-            return True
+        if session_gone(session, names, out, endpoint):
+            if same_record and keep_info(session) == keep:
+                drop_keep(session)
+            return ReleaseState.CONFIRMED
     except Exception as exc:
         print(f"⚠️ 無法確認 {session} 的關機狀態（{type(exc).__name__}）", flush=True)
-    return False
+    return ReleaseState.PENDING if scheduled else ReleaseState.FAILED
 
 
 def pid_alive(pid: int | None) -> bool:
@@ -395,7 +479,7 @@ def watchdog_loop(session: str):
                 continue
             if loops % 10 == 0:
                 names, lout = sessions_checked()
-                if session_gone(session, names, lout) and keep_info(session) == info:
+                if session_gone(session, names, lout, (info or {}).get("runtime_endpoint")) and keep_info(session) == info:
                     say("session already gone: dropping keep file")
                     drop_keep(session)
                     return
@@ -422,10 +506,7 @@ def watchdog_loop(session: str):
                 if not hard_expired and (exp is None or time.time() < exp):
                     continue
 
-            if not is_owned_session(session):
-                if info.get("runtime_endpoint"):
-                    say("runtime identity cannot be verified; retaining release record")
-                    continue
+            if info.get("created_by") != "owned":
                 say("external session expired: dropping keep file without stopping VM")
                 drop_keep(session)
                 return
@@ -439,10 +520,7 @@ def watchdog_loop(session: str):
                 continue
 
             say("time is up: releasing GPU")
-            colab("stop", "-s", session, timeout=300, check=False)
-            names, lout = sessions_checked()
-            if session_gone(session, names, lout):
-                drop_keep(session)
+            if release_runtime(session, watchdog_keep=info) == ReleaseState.CONFIRMED:
                 say("confirmed released")
                 return
             say("stop issued; will verify on next tick")

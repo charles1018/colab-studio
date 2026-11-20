@@ -62,6 +62,8 @@ def cmd_keep(args):
             sys.exit(f"請用 --session 指定名稱（目前開啟中：{names}）")
     if session not in names:
         sys.exit(f"找不到開啟中的 session：{session}（目前開啟中：{names}）")
+    if (C.keep_info(session) or {}).get("release_pending"):
+        sys.exit(f"{session} 正在關機，無法延長待命")
     mins = max(1.0, min(240.0, float(args.minutes)))
     C.set_keep(session, time.time() + mins * 60)
     C.start_watchdog(session)
@@ -69,30 +71,33 @@ def cmd_keep(args):
 
 
 def cmd_stop(args):
-    names, _ = C.sessions()
-    if args.all:
-        targets = [n for n in names if C.is_owned_session(n)]
-        if not targets:
-            print("⚪ 沒有由本工具開啟的 Colab Session 需要關閉", flush=True)
-            return
-        for t in targets:
-            print(f"🛑 正在關閉 {t}...", flush=True)
-            C.colab("stop", "-s", t, timeout=300, check=False)
-            C.drop_keep(t)
-        print("✅ 已全部關閉", flush=True)
+    if args.session:
+        try:
+            targets = [C.sanitize_session_name(args.session)]
+        except ValueError as exc:
+            sys.exit(str(exc))
+    else:
+        targets = C.owned_sessions()
+        if not args.all and len(targets) != 1:
+            sys.exit("請用 --session <NAME> 或 --all 指定要關閉的機器")
+    if not targets:
+        print("⚪ 目前沒有已登記的 Colab Studio Session 需要關閉", flush=True)
         return
 
-    session = args.session
-    if not session:
-        owned = [n for n in names if C.is_owned_session(n)]
-        if len(owned) == 1:
-            session = owned[0]
+    all_confirmed = True
+    for session in targets:
+        print(f"🛑 正在關閉 {session}...", flush=True)
+        outcome = C.release_runtime(session, owned_only=args.session is None)
+        if outcome == C.ReleaseState.CONFIRMED:
+            print(f"✅ 已確認 {session} 關閉", flush=True)
         else:
-            sys.exit(f"請用 --session <NAME> 或 --all 指定要關閉的機器（目前開啟中：{names}）")
-    print(f"🛑 正在關閉 {session}...", flush=True)
-    C.colab("stop", "-s", session, timeout=300, check=False)
-    C.drop_keep(session)
-    print(f"✅ 已關閉 {session}", flush=True)
+            all_confirmed = False
+            if outcome == C.ReleaseState.PENDING:
+                print(f"⏳ {session} 尚待確認，watchdog 將重試", flush=True)
+            else:
+                print(f"⚠️ 無法確認 {session} 關閉，請檢查遠端狀態", flush=True)
+    if not all_confirmed:
+        sys.exit(1)
 
 
 def cmd_cancel(args):
@@ -163,8 +168,9 @@ def main():
     p_keep.add_argument("--minutes", type=float, default=60.0, help="保留分鐘數 (1～240)")
 
     p_stop = sub.add_parser("stop", help="立即關閉 Colab GPU 釋放資源")
-    p_stop.add_argument("--session", default=None)
-    p_stop.add_argument("--all", action="store_true", help="關閉所有由本工具開啟的 session")
+    stop_target = p_stop.add_mutually_exclusive_group()
+    stop_target.add_argument("--session", default=None)
+    stop_target.add_argument("--all", action="store_true", help="關閉所有由本工具開啟的 session")
 
     p_cancel = sub.add_parser("cancel", help="中斷正在執行的雲端任務，但保留 Colab GPU 與已載入的模型")
     p_cancel.add_argument("--session", default=None)

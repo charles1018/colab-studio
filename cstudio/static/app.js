@@ -594,7 +594,13 @@ function applySessionKeepUI(sessionName, keepObj, isRunning) {
     return;
   }
   el.activeSessionLabel.textContent = sessionName;
-  if (isRunning || (keepObj && keepObj.busy)) {
+  if (keepObj?.release_pending) {
+    ui.sessionBusy = false;
+    ui.remainingSec = null;
+    el.countdownBadge.hidden = false;
+    el.countdownBadge.className = "countdown-badge warn";
+    el.countdownBadge.textContent = "⏳ 關機待確認";
+  } else if (isRunning || (keepObj && keepObj.busy)) {
     ui.sessionBusy = true;
     ui.remainingSec = null;
     el.countdownBadge.hidden = false;
@@ -669,6 +675,8 @@ async function pollFastRunStatus() {
           showToast(`❌ 生成失敗：${st.error || "未知錯誤"}`);
         } else if (st.stage === "cancelled") {
           showToast("⏹️ 已確認任務取消", true);
+        } else if (st.stage === "stopped" || st.stage === "stopped_local" || st.stage === "shutdown_pending") {
+          showToast(st.stage_label, true);
         } else if (st.stage === "done") {
           showToast("✅ 雲端生成與 SHA256 校驗下載完成！", true);
         }
@@ -739,6 +747,7 @@ async function refreshSlowColabStatus(force = false) {
         {
           remaining_sec: primary.remaining_sec,
           busy: primary.busy,
+          release_pending: primary.release_pending,
         },
         false
       );
@@ -955,9 +964,13 @@ async function initStudio() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ all: true }),
       });
-      const list = (res.stopped || []).join(", ");
-      showToast(list ? `✅ 已立即關閉 Colab Session：${list}` : "⚪ 目前沒有運行中的 Colab Session", true);
+      const summary = [];
+      if (res.verified_gone?.length) summary.push(`✅ 已確認關閉 ${res.verified_gone.join(", ")}`);
+      if (res.pending?.length) summary.push(`⏳ 尚待確認 ${res.pending.join(", ")}`);
+      if (res.failed?.length) summary.push(`⚠️ 無法確認 ${res.failed.join(", ")}`);
+      showToast(summary.join(" · ") || "⚪ 目前沒有已登記的 Colab Studio Session 需要關閉", !res.failed?.length);
       await pollFastRunStatus();
+      refreshSlowColabStatus(true);
     } catch (err) {
       showToast(`關機失敗：${err.message}`);
     }

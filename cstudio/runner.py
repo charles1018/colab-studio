@@ -365,6 +365,12 @@ class RunCancelled(RuntimeError):
     """The batch was cancelled locally or confirmed cancelled on the VM."""
 
 
+class RunStopped(RuntimeError):
+    """The local batch accepted a shutdown request."""
+
+    outcome: C.ReleaseState | None = None
+
+
 def run_manifest(
     manifest_path: str | Path,
     gpu: str = "L4",
@@ -471,13 +477,14 @@ def run_manifest(
             pass
 
     abort_reason: str | None = None
+    stopped: RunStopped | None = None
     remote_attempted = False
     cancel_pending = False
     cancel_sent = False
     cancel_failed = False
 
     def _check_abort():
-        nonlocal abort_reason, cancel_pending
+        nonlocal abort_reason, cancel_pending, stopped
         if not should_abort:
             return
         sig = should_abort()
@@ -485,7 +492,8 @@ def run_manifest(
             return
         if sig == "stop":
             abort_reason = "stop"
-            raise RuntimeError("使用者要求中斷任務並關閉 Colab GPU (stopped by user)")
+            stopped = RunStopped("使用者要求中斷任務並關閉 Colab GPU (stopped by user)")
+            raise stopped
         if remote_attempted:
             cancel_pending = True
             return
@@ -535,8 +543,8 @@ def run_manifest(
 
         if reuse:
             owned = keep.get("created_by") == "owned" and C.is_owned_session(session)
-            endpoint = keep.get("runtime_endpoint") if owned else None
-            if keep.get("runtime_endpoint") and not owned:
+            endpoint = C.runtime_endpoint(session)
+            if keep.get("runtime_endpoint") and keep["runtime_endpoint"] != endpoint:
                 _fail(f"Session {session} 的遠端識別已變更，請先確認目標", exit_on_error)
             st_check = C.poll_remote_status(session)
             if st_check and st_check.get("stage") == "cancel_failed":
@@ -551,10 +559,10 @@ def run_manifest(
             _check_active()
             C.set_keep(
                 session, None, owner="owned" if owned else "external",
-                extra={"busy_until": deadline if endpoint else None, "runtime_endpoint": endpoint},
+                extra={"busy_until": deadline if owned and endpoint else None, "runtime_endpoint": endpoint},
             )
             attached = True
-            if endpoint:
+            if owned and endpoint:
                 C.start_watchdog(session)
         else:
             print(f"🚀 在 Google Colab 開啟 {gpu}：{session}", flush=True)
@@ -752,6 +760,7 @@ def run_manifest(
                 _emit(st_for_ui)
 
             if st.get("done"):
+                _check_abort()
                 stage = st.get("stage")
                 if stage == "cancelled":
                     abort_reason = "cancel"
@@ -778,8 +787,12 @@ def run_manifest(
                 )
                 if release:
                     print(f"🛑 關閉 Colab GPU：{session}", flush=True)
-                    if not C.release_runtime(session, owner, endpoint):
-                        results["shutdown_pending"] = True
+                    outcome = C.release_runtime(session, owner, endpoint)
+                    results["shutdown_state"] = outcome
+                    if stopped is not None:
+                        stopped.outcome = outcome
+                    if outcome != C.ReleaseState.CONFIRMED:
+                        results["shutdown_pending"] = outcome == C.ReleaseState.PENDING
                         results.setdefault("error", f"尚未確認 {session} 已關閉，請檢查 Colab runtime 狀態")
                         print(f"⚠️ 尚未確認 {session} 已關閉", flush=True)
                 elif cancel_failed or (cancel_pending and not finished and abort_reason != "cancel"):
@@ -791,7 +804,9 @@ def run_manifest(
                         C.start_watchdog(session)
                     except OSError:
                         if created:
-                            results["shutdown_pending"] = not C.release_runtime(session, owner, endpoint)
+                            outcome = C.release_runtime(session, owner, endpoint)
+                            results["shutdown_state"] = outcome
+                            results["shutdown_pending"] = outcome == C.ReleaseState.PENDING
                         raise
                     print(f"⏸️ {session} 保留待命 {keep_mins:g} 分鐘", flush=True)
                     if owned:

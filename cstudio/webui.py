@@ -50,6 +50,10 @@ STAGE_LABELS_ZH: dict[str, str] = {
     "cancelling": "⏳ 已要求取消，等待遠端確認",
     "cancelled": "⏹️ 已確認任務取消",
     "cancel_failed": "⚠️ 無法確認遠端任務已停止",
+    "stopping": "🛑 正在關閉 Colab GPU",
+    "stopped": "✅ 已確認 Colab Session 關閉",
+    "stopped_local": "⏹️ 已停止本地批次",
+    "shutdown_pending": "⏳ Colab Session 關機待確認",
     "error": "❌ 執行發生錯誤",
     "crashed": "❌ 遠端程序異常中止",
 }
@@ -120,7 +124,8 @@ def read_local_keeps() -> list[dict[str, Any]]:
                 continue
             sess = str(d.get("session") or p.stem)
             exp = d.get("expires")
-            owner = d.get("created_by", "owned" if sess.startswith(C.PREFIX) else "external")
+            owner = d.get("created_by", "external")
+            release_pending = bool(d.get("release_pending"))
             rem_sec = max(0, int(round(exp - now))) if isinstance(exp, (int, float)) else None
             out.append(
                 {
@@ -129,6 +134,7 @@ def read_local_keeps() -> list[dict[str, Any]]:
                     "expires": exp,
                     "remaining_sec": rem_sec,
                     "busy": exp is None and owner != "pending",
+                    "release_pending": release_pending,
                     "watchdog_alive": C.pid_alive(d.get("watchdog_pid")),
                 }
             )
@@ -329,6 +335,7 @@ class StudioUIState:
         self.colab_query_lock = threading.Lock()
         self.revision: int = 0
         self.running: bool = False
+        self.provisioning: bool = False
         self.cancel_requested: bool = False
         self.abort_action: str | None = None
         self.run_id: str | None = None
@@ -378,8 +385,13 @@ class StudioUIState:
             if st.get("gpu"):
                 self.gpu = str(st["gpu"])
             raw_stage = str(st.get("stage") or self.stage or "starting")
-            self.stage = raw_stage
-            self.stage_label = STAGE_LABELS_ZH.get(raw_stage, f"🔄 執行中 ({raw_stage})...")
+            if raw_stage == "booting_vm":
+                self.provisioning = True
+            elif raw_stage in ("reusing_vm", "syncing_code"):
+                self.provisioning = False
+            if self.abort_action != "stop":
+                self.stage = raw_stage
+                self.stage_label = STAGE_LABELS_ZH.get(raw_stage, f"🔄 執行中 ({raw_stage})...")
 
             for line in st.get("log") or []:
                 s_line = str(line).strip()
@@ -480,7 +492,10 @@ class StudioUIState:
             sess_raw = ""
             if tok:
                 cu_val, cu_raw = C.usage()
-                sess_names, sess_raw = C.sessions()
+                try:
+                    sess_names, sess_raw = C.sessions(check=True)
+                except (OSError, RuntimeError, SystemExit):
+                    sess_raw = "無法確認 Colab Session 清單"
 
             keeps_by_name = {k["session"]: k for k in read_local_keeps()}
             sessions_detail: list[dict[str, Any]] = []
@@ -495,6 +510,7 @@ class StudioUIState:
                         "owned": C.is_owned_session(n),
                         "remaining_sec": k["remaining_sec"] if k else None,
                         "busy": k["busy"] if k else False,
+                        "release_pending": k["release_pending"] if k else False,
                     }
                 )
             for k_name, k in keeps_by_name.items():
@@ -506,6 +522,7 @@ class StudioUIState:
                             "owned": k["owner"] == "owned",
                             "remaining_sec": k["remaining_sec"],
                             "busy": k["busy"],
+                            "release_pending": k["release_pending"],
                         }
                     )
 
@@ -523,6 +540,14 @@ class StudioUIState:
             }
             with self.lock:
                 self.colab_cache = updated
+                if (
+                    not self.running and self.session and self.stage == "shutdown_pending"
+                    and not C.keep_file(self.session).exists()
+                    and C.session_gone(self.session, sess_names, sess_raw)
+                ):
+                    self.session = None
+                    self.stage = "stopped"
+                    self.stage_label = STAGE_LABELS_ZH["stopped"]
                 self._bump()
             return dict(updated)
 
@@ -649,6 +674,8 @@ def api_colab_keep(payload: dict[str, Any]):
     session = _resolve_target_session(payload.get("session"))
     now = time.time()
     cur_info = C.keep_info(session) or {}
+    if cur_info.get("release_pending"):
+        raise HTTPException(status_code=409, detail="此 Session 正在關機，無法延長待命")
     cur_exp = cur_info.get("expires")
     base_time = max(now, float(cur_exp)) if isinstance(cur_exp, (int, float)) else now
     new_exp = min(now + 240.0 * 60.0, base_time + minutes * 60.0)
@@ -705,57 +732,76 @@ def api_colab_cancel(payload: dict[str, Any] | None = None):
     )
 
 
-def _stop_and_verify_session(sess: str) -> bool:
-    """Issue colab stop and verify session is gone before dropping keep file."""
-    C.colab("stop", "-s", sess, timeout=300, check=False)
-    names, lout = C.sessions_checked()
-    if C.session_gone(sess, names, lout):
-        C.drop_keep(sess)
-        return True
-    # If colab stop didn't confirm immediately, schedule watchdog for immediate expiration cleanup
-    C.set_keep(sess, time.time() - 1)
-    C.start_watchdog(sess)
-    return False
-
-
 @app.post("/api/colab/stop")
 def api_colab_stop(payload: dict[str, Any] | None = None):
     payload = payload or {}
-    stop_all = bool(payload.get("all", False))
+    stop_all = payload.get("all", False)
+    requested = payload.get("session")
+    if type(stop_all) is not bool or (requested is not None and not isinstance(requested, str)):
+        raise HTTPException(status_code=400, detail="all 必須為布林值，session 必須為字串")
+    if stop_all and requested is not None:
+        raise HTTPException(status_code=400, detail="請擇一指定 all 或 session")
+    if requested is not None:
+        try:
+            requested = C.sanitize_session_name(requested)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    owned = set(C.owned_sessions()) if requested is None else set()
     with STATE.lock:
-        if STATE.running:
+        active = STATE.session if STATE.running else None
+        if active and STATE.provisioning:
+            owned.add(active)
+        if stop_all:
+            targets = sorted(owned)
+        elif requested is not None:
+            targets = [requested]
+        elif active in owned:
+            targets = [active]
+        elif len(owned) == 1:
+            targets = sorted(owned)
+        else:
+            raise HTTPException(status_code=400, detail="請指定要關閉的 Colab Session")
+        deferred = None
+        if active in targets and (requested is not None or STATE.provisioning or C.is_owned_session(active)):
             STATE.cancel_requested = True
             STATE.abort_action = "stop"
+            STATE.stage = "stopping"
+            STATE.stage_label = STAGE_LABELS_ZH["stopping"]
             STATE._bump()
+            if STATE.provisioning and (C.keep_info(active) or {}).get("created_by") != "owned":
+                deferred = active
 
-    if stop_all:
-        names, _ = C.sessions()
-        keeps = [k["session"] for k in read_local_keeps()]
-        targets = sorted({n for n in (names + keeps) if C.is_owned_session(n)})
-        if not targets:
-            return {"ok": True, "stopped": [], "message": "目前沒有由本工具開啟的 Colab Session"}
-        stopped_ok = []
-        for t in targets:
-            STATE.append_log(f"🛑 正在關閉 Colab GPU：{t}...")
-            if _stop_and_verify_session(t):
-                stopped_ok.append(t)
-        with STATE.lock:
-            if STATE.session in targets:
-                STATE.session = None
-            STATE._bump()
-        colab_st = STATE.refresh_colab_cache(force=True)
-        return {"ok": True, "stopped": targets, "verified_gone": stopped_ok, "colab": colab_st}
-
-    target_session = _resolve_target_session(payload.get("session"))
-    STATE.append_log(f"🛑 正在立即關閉 Colab GPU：{target_session}...")
-    gone = _stop_and_verify_session(target_session)
+    stopped = []
+    pending = []
+    failed = []
+    for session in targets:
+        if session == deferred:
+            pending.append(session)
+            continue
+        outcome = C.release_runtime(session, owned_only=requested is None)
+        if outcome == C.ReleaseState.CONFIRMED:
+            stopped.append(session)
+        elif outcome == C.ReleaseState.PENDING:
+            pending.append(session)
+        else:
+            failed.append(session)
     with STATE.lock:
-        if STATE.session == target_session:
+        if not STATE.running and STATE.session in stopped:
             STATE.session = None
+            STATE.stage = "stopped"
+            STATE.stage_label = STAGE_LABELS_ZH["stopped"]
+        elif not STATE.running and STATE.session in pending:
+            STATE.stage = "shutdown_pending"
+            STATE.stage_label = STAGE_LABELS_ZH["shutdown_pending"]
         STATE._bump()
-    colab_st = STATE.refresh_colab_cache(force=True)
-    STATE.append_log(f"✅ 已關閉 {target_session} 並釋放運算單元")
-    return {"ok": True, "stopped": [target_session], "verified_gone": [target_session] if gone else [], "colab": colab_st}
+    result = {
+        "ok": not pending and not failed, "requested": targets, "stopped": stopped,
+        "verified_gone": stopped, "pending": pending, "failed": failed,
+    }
+    if failed and not (stopped or pending):
+        result["detail"] = f"無法確認關機：{', '.join(failed)}"
+        return JSONResponse(status_code=502, content=result)
+    return JSONResponse(status_code=207 if failed else 202 if pending else 200, content=result)
 
 
 @app.get("/api/run/status")
@@ -971,6 +1017,7 @@ async def api_run_start(
 
     # Determine target session name upfront (Pitfall C fix) so cancel/stop always knows the target session immediately
     req_sess = str(session or "").strip()
+    provisioning = False
     if req_sess and req_sess != "__new__":
         try:
             target_session = C.sanitize_session_name(req_sess)
@@ -979,6 +1026,7 @@ async def api_run_start(
             raise HTTPException(status_code=400, detail=str(e)) from e
     elif req_sess == "__new__":
         target_session = C.new_session_name()
+        provisioning = True
     else:
         keeps = read_local_keeps()
         owned_keeps = [k["session"] for k in keeps if k["owner"] == "owned"]
@@ -986,11 +1034,13 @@ async def api_run_start(
             target_session = owned_keeps[0]
         else:
             target_session = C.new_session_name()
+            provisioning = True
 
     with STATE.lock:
         if STATE.running:
             raise HTTPException(status_code=409, detail="另一個生成任務剛啟動，請稍候")
         STATE.running = True
+        STATE.provisioning = provisioning
         STATE.cancel_requested = False
         STATE.abort_action = None
         STATE.run_id = None
@@ -1041,19 +1091,32 @@ async def api_run_start(
                 should_abort=lambda: (STATE.abort_action or ("cancel" if STATE.cancel_requested else None)),
             )
             with STATE.lock:
-                if res.get("error"):
+                if res.get("shutdown_state") == C.ReleaseState.PENDING:
+                    STATE.stage = "shutdown_pending"
+                    STATE.stage_label = STAGE_LABELS_ZH["shutdown_pending"]
+                elif res.get("error"):
                     STATE.stage = "error"
                     STATE.stage_label = STAGE_LABELS_ZH["error"]
                     STATE.error = str(res["error"])
                 else:
                     STATE.stage = "done"
                     STATE.stage_label = STAGE_LABELS_ZH["done"]
+                    if res.get("shutdown_state") == C.ReleaseState.CONFIRMED:
+                        STATE.session = None
                 STATE._bump()
         except BaseException as exc:
             with STATE.lock:
                 if isinstance(exc, R.RunCancelled):
                     STATE.stage = "cancelled"
                     STATE.stage_label = STAGE_LABELS_ZH["cancelled"]
+                    STATE.error = None
+                elif isinstance(exc, R.RunStopped) and exc.outcome != C.ReleaseState.FAILED:
+                    if exc.outcome == C.ReleaseState.CONFIRMED:
+                        STATE.stage = "stopped"
+                        STATE.session = None
+                    else:
+                        STATE.stage = "shutdown_pending" if exc.outcome == C.ReleaseState.PENDING else "stopped_local"
+                    STATE.stage_label = STAGE_LABELS_ZH[STATE.stage]
                     STATE.error = None
                 else:
                     STATE.stage = "error"
@@ -1064,6 +1127,7 @@ async def api_run_start(
         finally:
             with STATE.lock:
                 STATE.running = False
+                STATE.provisioning = False
                 STATE.finished_at = time.time()
                 STATE._bump()
             try:

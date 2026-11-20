@@ -301,9 +301,12 @@ class RuntimeAllocationTests(unittest.TestCase):
 
     def test_release_does_not_stop_a_different_runtime_with_same_name(self):
         self.runtimes[self.session] = "replacement-runtime"
-        self.assertFalse(C.release_runtime(self.session, "owned", self.endpoint))
+        C.set_keep(self.session, self.now + 60, owner="external", extra={
+            "runtime_endpoint": "replacement-runtime",
+        })
+        self.assertEqual(C.release_runtime(self.session, "owned", self.endpoint), C.ReleaseState.CONFIRMED)
         self.assertEqual(self.commands, ["sessions"])
-        self.assertEqual(C.keep_info(self.session)["runtime_endpoint"], self.endpoint)
+        self.assertEqual(C.keep_info(self.session)["runtime_endpoint"], "replacement-runtime")
 
     def test_cancel_during_retry_backoff_prevents_second_allocation(self):
         abort = Mock(side_effect=[None, None, RuntimeError("fixture cancelled")])
