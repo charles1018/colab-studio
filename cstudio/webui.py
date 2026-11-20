@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import random
 import re
 import secrets
-import shutil
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -18,7 +17,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
@@ -27,6 +26,7 @@ from remote.job_paths import confined_path, relative_parts
 from . import colab_client as C
 from . import colab_login as L
 from . import runner as R
+from .web_inputs import MAX_REFERENCES, GenerationRoute, prepare_reference_images
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -916,7 +916,10 @@ def api_serve_job_file(job_dir: str, subfolder: str, filename: str):
     return FileResponse(target, media_type="image/png", filename=filename)
 
 
-@app.post("/api/run/start")
+generation = APIRouter(route_class=GenerationRoute)
+
+
+@generation.post("/api/run/start")
 async def api_run_start(
     mode: str = Form("t2i"),
     prompt: str = Form(""),
@@ -1003,7 +1006,7 @@ async def api_run_start(
     custom_slug = re.sub(r"[^A-Za-z0-9_-]+", "_", str(batch_name or "").strip()).strip("_")[:32]
     folder_name = f"webui_{ts_str}_{custom_slug}_{short_uid}" if custom_slug else f"webui_{ts_str}_{short_uid}"
 
-    resolved_sources: list[tuple[str, Any]] = []
+    resolved_sources: list[UploadFile | Path] = []
     if mode_clean == "edit":
         try:
             order_spec = json.loads(ref_order or "[]")
@@ -1015,62 +1018,25 @@ async def api_run_start(
         # Map uploaded files by their client-side key or index
         upload_idx = 0
         if order_spec:
+            if len(order_spec) > MAX_REFERENCES:
+                raise HTTPException(status_code=400, detail=f"改圖最多接受 {MAX_REFERENCES} 張參考圖片")
             for item in order_spec:
                 if not isinstance(item, dict):
                     continue
                 kind = item.get("kind")
                 if kind == "upload" and upload_idx < len(ref_files):
-                    resolved_sources.append(("upload", ref_files[upload_idx]))
+                    resolved_sources.append(ref_files[upload_idx])
                     upload_idx += 1
                 elif kind == "artifact" and item.get("artifact_id"):
-                    src_path = resolve_artifact_to_path(item["artifact_id"])
-                    resolved_sources.append(("artifact", src_path))
+                    resolved_sources.append(resolve_artifact_to_path(item["artifact_id"]))
         else:
-            for uf in ref_files:
-                resolved_sources.append(("upload", uf))
+            resolved_sources.extend(ref_files)
 
-        if not (1 <= len(resolved_sources) <= 10):
+        if not (1 <= len(resolved_sources) <= MAX_REFERENCES):
             raise HTTPException(
                 status_code=400,
-                detail=f"圖片編輯（Edit）模式需要 1～10 張參考圖片（目前收到 {len(resolved_sources)} 張）",
+                detail=f"圖片編輯（Edit）模式需要 1～{MAX_REFERENCES} 張參考圖片（目前收到 {len(resolved_sources)} 張）",
             )
-
-    try:
-        JOBS_DIR.mkdir(parents=True, exist_ok=True)
-        job_folder = confined_path(JOBS_DIR, folder_name, directory=True, missing_ok=True)
-        job_folder.mkdir()
-    except FileExistsError as exc:
-        raise HTTPException(status_code=409, detail="任務資料夾已經存在") from exc
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="無法使用任務資料夾") from exc
-    inputs_folder = job_folder / "inputs"
-    out_folder = job_folder / "out"
-    inputs_folder.mkdir()
-    out_folder.mkdir()
-
-    saved_inputs_rel: list[str] = []
-    if mode_clean == "edit":
-        for idx, (src_kind, src_obj) in enumerate(resolved_sources, start=1):
-            dst_name = f"ref_{idx}.png"
-            dst_path = inputs_folder / dst_name
-            try:
-                if src_kind == "upload":
-                    raw_bytes = await src_obj.read()
-                    if len(raw_bytes) > 35 * 1024 * 1024:
-                        raise ValueError(f"參考圖片 <image{idx}> 超過 35MB 上限")
-                    with Image.open(io.BytesIO(raw_bytes)) as im:
-                        im.load()
-                        norm_im = im.convert("RGBA") if (im.mode in ("RGBA", "LA") or "transparency" in im.info) else im.convert("RGB")
-                        norm_im.save(dst_path, format="PNG")
-                else:
-                    with Image.open(src_obj) as im:
-                        im.load()
-                        norm_im = im.convert("RGBA") if (im.mode in ("RGBA", "LA") or "transparency" in im.info) else im.convert("RGB")
-                        norm_im.save(dst_path, format="PNG")
-            except Exception as e:
-                shutil.rmtree(job_folder, ignore_errors=True)
-                raise HTTPException(status_code=400, detail=f"參考圖片 <image{idx}> 讀取或轉檔失敗：{e}") from e
-            saved_inputs_rel.append(f"inputs/{dst_name}")
 
     # Build job spec
     job_id = custom_slug if (custom_slug and re.fullmatch(r"[A-Za-z0-9_-]{1,60}", custom_slug)) else f"img_{ts_str}"
@@ -1089,7 +1055,7 @@ async def api_run_start(
         job_spec["aspect_ratio"] = ar_clean
         job_spec["resolution"] = res_clean
     else:
-        job_spec["inputs"] = saved_inputs_rel
+        job_spec["inputs"] = [f"inputs/ref_{index}.png" for index in range(1, len(resolved_sources) + 1)]
         sizing = str(edit_sizing or "match_1k").strip().lower()
         if sizing == "match_2k":
             job_spec["edit_resolution"] = 2048
@@ -1113,14 +1079,6 @@ async def api_run_start(
         "jobs": [job_spec],
     }
 
-    problems = R.validate_manifest(manifest_data, job_folder)
-    if problems:
-        shutil.rmtree(job_folder, ignore_errors=True)
-        raise HTTPException(status_code=400, detail="任務設定驗證未通過：\n- " + "\n- ".join(problems))
-
-    manifest_path = job_folder / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8")
-
     # The runner selects automatic reuse from the authenticated assignment listing.
     req_sess = str(session or "").strip()
     target_session = None
@@ -1128,8 +1086,34 @@ async def api_run_start(
         try:
             target_session = C.sanitize_session_name(req_sess)
         except ValueError as e:
-            shutil.rmtree(job_folder, ignore_errors=True)
             raise HTTPException(status_code=400, detail=str(e)) from e
+
+    try:
+        JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        job_folder = confined_path(JOBS_DIR, folder_name, directory=True, missing_ok=True)
+        if job_folder.exists():
+            raise FileExistsError(job_folder)
+        with tempfile.TemporaryDirectory(prefix=".webui-", dir=JOBS_DIR) as scratch:
+            staged_job = Path(scratch) / "job"
+            inputs_folder = staged_job / "inputs"
+            inputs_folder.mkdir(parents=True)
+            (staged_job / "out").mkdir()
+            if resolved_sources:
+                await prepare_reference_images(resolved_sources, inputs_folder)
+            problems = R.validate_manifest(manifest_data, staged_job)
+            if problems:
+                raise HTTPException(status_code=400, detail="任務設定驗證未通過：\n- " + "\n- ".join(problems))
+            (staged_job / "manifest.json").write_text(
+                json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            if job_folder.exists():
+                raise FileExistsError(job_folder)
+            staged_job.rename(job_folder)
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail="任務資料夾已經存在") from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="無法使用任務資料夾") from exc
+    manifest_path = job_folder / "manifest.json"
 
     with STATE.lock:
         if STATE.running:
@@ -1251,6 +1235,9 @@ async def api_run_start(
             "status": STATE.fast_status(),
         },
     )
+
+
+app.include_router(generation)
 
 
 def launch_ui(host: str = "127.0.0.1", port: int = 7860, open_browser: bool = False):

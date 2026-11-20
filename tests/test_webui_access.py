@@ -1,7 +1,9 @@
 """Exercise the local browser boundary without sockets or live credentials."""
 import asyncio
+import io
 import json
 import tempfile
+import threading
 import unittest
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -10,6 +12,7 @@ from unittest.mock import Mock, patch
 
 from PIL import Image
 
+from cstudio import web_inputs as U
 from cstudio import webui as W
 
 
@@ -31,6 +34,26 @@ CONTROLS = (
     ("/api/colab/stop", (JSON_HEADER,), b'{"session":"fixture"}'),
     ("/api/run/start", (MULTIPART_HEADER,), MULTIPART),
 )
+
+
+def image_bytes(mode="RGB", size=(3, 4), color=None, format="PNG"):
+    with io.BytesIO() as output, Image.new(mode, size, color) as image:
+        image.save(output, format=format)
+        return output.getvalue()
+
+
+def edit_form(files=(), *, fields=()):
+    parts = [("mode", "edit"), ("prompt", "Synthetic edit"), *fields]
+    body = b"".join(
+        f'--fixture\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+        for key, value in parts
+    )
+    for index, file in enumerate(files):
+        body += (
+            f'--fixture\r\nContent-Disposition: form-data; name="ref_files"; filename="ref{index}.png"\r\n\r\n'.encode()
+            + file + b"\r\n"
+        )
+    return body + b"--fixture--\r\n"
 
 
 class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
@@ -78,7 +101,9 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
         self.pending.unlink()
         return self.token
 
-    async def request(self, target, *, method="GET", host=HOST, headers=(), body=b"", peer="127.0.0.1", root_path=""):
+    async def request(
+        self, target, *, method="GET", host=HOST, headers=(), body=b"", peer="127.0.0.1", root_path="",
+    ):
         path, _, query = target.partition("?")
         fields = ([("host", host)] if host is not None else []) + list(headers)
         scope = {
@@ -95,14 +120,18 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
             "server": ("127.0.0.1", 7860),
         }
         messages = []
-        body_read = False
+        incoming = (body,) if isinstance(body, bytes) else body
+        reads = 0
 
         async def receive():
-            nonlocal body_read
-            if body_read:
+            nonlocal reads
+            if reads == len(incoming):
                 await asyncio.Future()
-            body_read = True
-            return {"type": "http.request", "body": body}
+            data = incoming[reads]
+            reads += 1
+            if data is None:
+                return {"type": "http.disconnect"}
+            return {"type": "http.request", "body": data, "more_body": reads < len(incoming)}
 
         async def send(message):
             messages.append(message)
@@ -111,7 +140,7 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
         start, *chunks = messages
         return SimpleNamespace(
             status=start["status"], headers=dict(start["headers"]),
-            body=b"".join(chunk.get("body", b"") for chunk in chunks), body_read=body_read,
+            body=b"".join(chunk.get("body", b"") for chunk in chunks), body_read=bool(reads), reads=reads,
         )
 
     async def open_ui(self, host=HOST, peer="127.0.0.1"):
@@ -251,16 +280,208 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 403)
         self.assert_no_effects()
 
+    async def submit_form(self, cookie, body, *, headers=()):
+        return await self.request("/api/run/start", method="POST", body=body, headers=(
+            cookie, ("origin", ORIGIN), UI_HEADER, MULTIPART_HEADER, *headers,
+        ))
+
     async def start_edit(self, cookie, artifact_ids):
         order = json.dumps([{"kind": "artifact", "artifact_id": item} for item in artifact_ids])
-        body = (
-            '--fixture\r\nContent-Disposition: form-data; name="mode"\r\n\r\nedit\r\n'
-            '--fixture\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nSynthetic edit\r\n'
-            f'--fixture\r\nContent-Disposition: form-data; name="ref_order"\r\n\r\n{order}\r\n--fixture--\r\n'
-        ).encode()
-        return await self.request("/api/run/start", method="POST", body=body, headers=(
-            cookie, ("origin", ORIGIN), UI_HEADER, MULTIPART_HEADER,
+        return await self.submit_form(cookie, edit_form(fields=(("ref_order", order),)))
+
+    async def test_upload_content_length_over_limit_is_rejected_before_reading_body(self):
+        cookie = await self.open_ui()
+        headers = (("content-length", str(U.MAX_REQUEST_BYTES + 1)),)
+        denied = await self.request("/api/run/start", method="POST", body=MULTIPART, headers=(
+            ("origin", ORIGIN), UI_HEADER, MULTIPART_HEADER, *headers,
         ))
+        self.assertEqual(denied.status, 401)
+        self.assertFalse(denied.body_read)
+        rejected = await self.submit_form(cookie, MULTIPART, headers=headers)
+        self.assertEqual(rejected.status, 413)
+        self.assertFalse(rejected.body_read)
+        self.assert_no_effects()
+
+    async def test_stream_counts_full_body_and_ignores_understated_length(self):
+        cookie = await self.open_ui()
+        material = edit_form((b"A" * 100, b"B" * 100))
+        chunks = tuple(material[start:start + 128] for start in range(0, len(material), 128))
+        self.assertGreater(len(chunks), 3)
+        with patch.object(U, "MAX_REQUEST_BYTES", 300):
+            for headers in ((), (("content-length", "1"),)):
+                with self.subTest(headers=headers):
+                    response = await self.submit_form(cookie, chunks, headers=headers)
+                    self.assertEqual(response.status, 413)
+                    self.assertEqual(response.reads, 3)
+        self.assert_no_effects()
+
+    async def test_per_file_and_field_limits_apply_during_multipart_stream(self):
+        cookie = await self.open_ui()
+        payload = b"A" * 64
+        body = edit_form((payload,))
+        start = body.index(payload)
+        chunks = (body[:start + 8], body[start + 8:start + 48], body[start + 48:])
+        with patch.object(U, "MAX_REFERENCE_BYTES", 32), patch.object(U.Image, "open") as decoder:
+            rejected = await self.submit_form(cookie, chunks)
+            self.assertEqual(rejected.status, 413)
+            self.assertEqual(rejected.reads, 2)
+            decoder.assert_not_called()
+        file_count = await self.submit_form(cookie, edit_form((b"fixture",) * (U.MAX_REFERENCES + 1)))
+        self.assertEqual(file_count.status, 400)
+        field_count = await self.submit_form(cookie, edit_form(fields=(("extra", "x"),) * U.MAX_FORM_FIELDS))
+        self.assertEqual(field_count.status, 400)
+        large_field = await self.submit_form(cookie, edit_form(fields=(("extra", "x" * (U.MAX_FIELD_BYTES + 1)),)))
+        self.assertEqual(large_field.status, 413)
+        self.assert_no_effects()
+
+    async def test_incomplete_multipart_and_disconnected_upload_close_spools(self):
+        cookie = await self.open_ui()
+        partial = edit_form((image_bytes(),)).removesuffix(b"--fixture--\r\n")
+        spools = []
+
+        def track_spool(*args, **kwargs):
+            file = tempfile.SpooledTemporaryFile(*args, **kwargs)
+            spools.append(file)
+            return file
+
+        with (
+            patch.object(U.ReferenceMultipartParser, "spool_max_size", 1),
+            patch("starlette.formparsers.SpooledTemporaryFile", side_effect=track_spool),
+        ):
+            truncated = await self.submit_form(cookie, partial)
+            disconnected = await self.submit_form(cookie, (partial, None))
+        self.assertEqual(truncated.status, 400)
+        self.assertEqual(disconnected.status, 400)
+        self.assertEqual(len(spools), 2)
+        self.assertTrue(all(file.closed for file in spools))
+        self.assert_no_effects()
+
+    async def test_ten_uploaded_references_keep_order_and_alpha(self):
+        cookie = await self.open_ui()
+        colors = [(value, 20, 30) if value % 2 else (value, 30, 40, 51) for value in range(10)]
+        pictures = [image_bytes("RGBA" if len(color) == 4 else "RGB", color=color) for color in colors]
+        self.enterContext(patch.object(W, "threading", SimpleNamespace(
+            Thread=lambda *, target, **_: SimpleNamespace(start=target),
+        )))
+        body = edit_form(pictures)
+        with patch.multiple(U, MAX_REQUEST_BYTES=len(body), MAX_REFERENCE_BYTES=max(map(len, pictures))):
+            response = await self.submit_form(cookie, (body[:300], body[300:]), headers=(
+                ("content-length", str(len(body))),
+            ))
+        self.assertEqual(response.status, 202, response.body)
+        folder = self.jobs / json.loads(response.body)["job_dir"]
+        inputs = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))["jobs"][0]["inputs"]
+        self.assertEqual(inputs, [f"inputs/ref_{index}.png" for index in range(1, 11)])
+        for name, color in zip(inputs, colors, strict=True):
+            with Image.open(folder / name) as png:
+                self.assertEqual(png.getpixel((0, 0)), color)
+        self.run_manifest.assert_called_once()
+
+    async def test_urlencoded_t2i_keeps_form_compatibility_under_smaller_body_cap(self):
+        cookie = await self.open_ui()
+        self.enterContext(patch.object(W, "threading", SimpleNamespace(
+            Thread=lambda *, target, **_: SimpleNamespace(start=target),
+        )))
+        headers = (cookie, ("origin", ORIGIN), UI_HEADER, ("content-type", "application/x-www-form-urlencoded"))
+        with patch.object(U, "MAX_FORM_BYTES", 32):
+            rejected = await self.request("/api/run/start", method="POST", headers=headers, body=b"prompt=" + b"a" * 32)
+            self.assertEqual(rejected.status, 413)
+            self.assert_no_effects()
+            reply = await self.request("/api/run/start", method="POST", headers=headers, body=b"prompt=Synthetic+scene")
+        self.assertEqual(reply.status, 202, reply.body)
+        self.run_manifest.assert_called_once()
+
+    async def test_empty_truncated_and_unsupported_images_leave_no_job(self):
+        cookie = await self.open_ui()
+        png = image_bytes(size=(64, 64), color=(12, 34, 56))
+        for bad in (b"", png[:png.index(b"IDAT") + 7], image_bytes(format="PPM")):
+            with self.subTest(size=len(bad)):
+                response = await self.submit_form(cookie, edit_form((png, bad)))
+                self.assertEqual(response.status, 400, response.body)
+                self.assertIn("<image2>", json.loads(response.body)["detail"])
+        self.assert_no_effects()
+
+    async def test_dimensions_pixels_and_artifact_bytes_are_checked_before_pixels_load(self):
+        cookie = await self.open_ui()
+        cases = (
+            ({"MAX_IMAGE_SIDE": 3}, image_bytes(size=(4, 1))),
+            ({"MAX_IMAGE_PIXELS": 5}, image_bytes(size=(3, 2))),
+        )
+        for limits, png in cases:
+            with self.subTest(limits=limits), patch.multiple(U, **limits), patch.object(Image.Image, "convert") as load:
+                response = await self.submit_form(cookie, edit_form((png,)))
+                self.assertEqual(response.status, 413)
+                load.assert_not_called()
+        for limits in ({"MAX_REFERENCE_BYTES": self.image.stat().st_size - 1}, {"MAX_IMAGE_PIXELS": 3}):
+            with self.subTest(limits=limits), patch.multiple(U, **limits), patch.object(Image.Image, "convert") as load:
+                response = await self.start_edit(cookie, ["fixture/out/sample.png"])
+                self.assertEqual(response.status, 413)
+                load.assert_not_called()
+        self.assert_no_effects()
+
+    async def test_only_one_upload_prepares_images_and_status_remains_responsive(self):
+        cookie = await self.open_ui()
+        body = edit_form((image_bytes(),))
+        started = threading.Event()
+        release = threading.Event()
+        encode = U.write_reference_images
+
+        def wait_and_encode(*args):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("encoder fixture timed out")
+            encode(*args)
+
+        self.enterContext(patch.object(W, "threading", SimpleNamespace(
+            Thread=lambda *, target, **_: SimpleNamespace(start=target),
+        )))
+        with patch.object(U, "write_reference_images", side_effect=wait_and_encode):
+            pending = asyncio.create_task(self.submit_form(cookie, body))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 3))
+                status = await asyncio.wait_for(self.request("/api/run/status", headers=(cookie,)), timeout=2)
+                self.assertEqual(status.status, 200)
+                self.assertFalse(json.loads(status.body)["running"])
+                self.assertFalse(pending.done())
+                second = await self.submit_form(cookie, body)
+                self.assertEqual(second.status, 409)
+                self.assertFalse(second.body_read)
+            finally:
+                release.set()
+                first = await pending
+        self.assertEqual(first.status, 202, first.body)
+        self.run_manifest.assert_called_once()
+
+    async def test_cancelled_preparation_joins_encoder_and_removes_staging(self):
+        cookie = await self.open_ui()
+        body = edit_form((image_bytes(),))
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        encode = U.write_reference_images
+
+        def wait_and_encode(*args):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("encoder fixture timed out")
+            encode(*args)
+            finished.set()
+
+        with patch.object(U, "write_reference_images", side_effect=wait_and_encode) as encoder:
+            pending = asyncio.create_task(self.submit_form(cookie, body))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 3))
+                pending.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(pending.done())
+            finally:
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await pending
+        encoder.assert_called_once()
+        self.assertTrue(finished.is_set())
+        self.assertFalse(U.GENERATION_SLOT.locked())
+        self.assert_no_effects()
 
     async def test_gallery_and_edit_reject_symlink_aliases_without_creating_a_job(self):
         cookie = await self.open_ui()
