@@ -83,6 +83,8 @@ class RuntimeAllocationTests(unittest.TestCase):
         if command == "download":
             Path(args[-1]).write_bytes(self.image_bytes)
             return ""
+        if command == "upload":
+            return ""
         raise AssertionError(f"Unexpected Colab operation: {command}")
 
     def done_status(self):
@@ -339,6 +341,54 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.assertIsNone(C.keep_info(self.session)["busy_until"])
         self.assertEqual(self.commands.count("new"), 1)
         self.assertNotIn("stop", self.commands)
+
+    def edit_reference(self):
+        ref = self.directory / "inputs" / "style" / "ref.png"
+        ref.parent.mkdir(parents=True)
+        ref.write_bytes(b"fixture")
+        self.manifest.write_text(json.dumps({
+            "jobs": [{"id": "test", "mode": "edit", "prompt": "fixture", "inputs": ["inputs/style/ref.png"]}],
+        }), encoding="utf-8")
+        return ref
+
+    def test_upload_is_limited_to_the_declared_nested_input(self):
+        ref = self.edit_reference()
+        C.remote_exec.side_effect = [
+            'CSTUDIO_PREP {"launched": false, "missing_inputs": ["inputs/style/ref.png"]}',
+            '{"started": true}',
+        ]
+        self.assertEqual(self.run_manifest()["jobs"]["test"]["status"], "done")
+        args, = [call.args for call in C.colab.call_args_list if call.args[0] == "upload"]
+        self.assertEqual(args, ("upload", "-s", self.session, ref, "/content/cstudio/inputs/inputs/style/ref.png"))
+
+    def test_unexpected_remote_upload_path_stops_before_upload_or_worker_launch(self):
+        self.edit_reference()
+        C.remote_exec.return_value = 'CSTUDIO_PREP {"launched": false, "missing_inputs": ["unlisted.png"]}'
+        with self.assertRaisesRegex(RuntimeError, "待上傳清單"):
+            self.run_manifest()
+        C.remote_exec.assert_called_once()
+        self.assertNotIn("upload", self.commands)
+
+    def test_symlinked_output_root_stops_before_any_colab_command(self):
+        other_job = self.directory / "other"
+        other_job.mkdir()
+        try:
+            self.result_path.parent.symlink_to(other_job, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symbolic links unavailable")
+        with self.assertRaisesRegex(RuntimeError, "符號連結"):
+            self.run_manifest()
+        C.colab.assert_not_called()
+        self.assertEqual(list(other_job.iterdir()), [])
+
+    def test_unexpected_remote_result_filename_is_never_downloaded(self):
+        status = self.done_status()
+        status["jobs"]["test"]["file"] = "out/other.png"
+        C.poll_remote_status.return_value = status
+        result = self.run_manifest()
+        self.assertEqual(result["jobs"]["test"]["status"], "sync_error")
+        self.assertNotIn("download", self.commands)
+        self.assertFalse((self.result_path.parent / "test.png").exists())
 
     def test_reuse_owned_runtime_keeps_its_bundle_cache(self):
         self.runtimes[self.session] = self.endpoint

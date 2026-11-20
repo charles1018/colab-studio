@@ -107,6 +107,7 @@ uv run cstudio sheet jobs/demo_qwen21/out/*.png
 }
 ```
 - **改圖 (`mode: "edit"`) 提示詞規則**：
+  - `inputs` 每項使用相對於 manifest 資料夾的路徑，以 `/` 分隔。可用同一資料夾的檔案與巢狀子目錄。跨 Job 沿用圖片時，可從網頁畫廊選取作品，工作台會複製到新 Job 的 `inputs/`。
   - 單張參考圖時直接描述如何修改該圖（或使用 `<image1>`）。
   - 多張參考圖（最多 10 張）時，在提示詞中明確以 `<image1>`, `<image2>`... 指定每張圖的角色（通常 `<image1>` 為要修改的主畫布）。
   - 預設畫布尺寸會自動跟隨第 1 張輸入圖片的比例（由 `TextEncodeQwenImage21` 的 `edit_resolution` 控制，預設 `1024`，設 `0` 則維持原圖尺寸並對齊 32 倍數）；若想強制指定輸出尺寸可加上 `"custom_size": true` 與 `"aspect_ratio"` / `"width"` / `"height"`。

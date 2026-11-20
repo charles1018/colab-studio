@@ -5,14 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import posixpath
-import re
 import shutil
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
+
+from remote.job_paths import JOB_ID, confined_path
 
 from . import colab_client as C
 
@@ -23,26 +24,13 @@ from models import DEFAULT_MODEL, SUPPORTED_MODELS, get_model_plugin  # noqa: E4
 
 
 def check_ref(base: Path, f: str, jid: str = "") -> str | None:
-    s = str(f).replace("\\", "/")
     who = f"{jid}：" if jid else ""
-    if any(ord(c) < 32 or ord(c) == 127 for c in s):
-        return f"{who}檔案路徑含有控制字元或換行：{s!r}"
-    if s.startswith(("/", "~")) or re.match(r"[A-Za-z]:", s):
-        return f"{who}不允許絕對路徑或 ~ 開頭的路徑：{s}（請用相對於 manifest 的路徑）"
-    base = Path(base)
-    parent = base.parent.as_posix().rstrip("/")
-    norm = posixpath.normpath(posixpath.join(base.as_posix(), s))
-    if norm != parent and not norm.startswith(parent + "/"):
-        return f"{who}路徑跑出 manifest 上一層資料夾之外：{s}"
-    if not posixpath.normpath("/content/cstudio/inputs/" + s).startswith("/content/cstudio/"):
-        return f"{who}路徑上傳後會跑出 /content/cstudio/ 之外：{s}"
     try:
-        real = (base / s).resolve()
-        real_parent = base.parent.resolve()
-        if real != real_parent and real_parent not in real.parents:
-            return f"{who}不允許指向專案目錄外的符號連結：{s} -> {real}"
-    except OSError:
-        pass
+        confined_path(base, f)
+    except FileNotFoundError:
+        return f"{who}找不到輸入圖片 {f!r}（相對於 {base}）"
+    except (OSError, ValueError) as exc:
+        return f"{who}無法使用輸入圖片 {f!r}：{exc}"
     return None
 
 
@@ -67,7 +55,7 @@ def validate_manifest(manifest: dict[str, Any], base_dir: Path, cli_quant: str |
             problems.append("jobs 內每個項目都必須是 JSON object")
             continue
         raw_id = j.get("id")
-        if not isinstance(raw_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,60}", raw_id):
+        if not isinstance(raw_id, str) or not JOB_ID.fullmatch(raw_id):
             problems.append(f"id 必須是字串且只能用英數、- 和 _（1～60 字元）：{raw_id!r}")
             continue
         jid = raw_id
@@ -92,11 +80,9 @@ def validate_manifest(manifest: dict[str, Any], base_dir: Path, cli_quant: str |
             problems.append(f"{jid}：t2i 模式不可提供 inputs（若要改圖請設 mode='edit'）")
 
         for f in inputs:
-            bad = check_ref(base_dir, str(f), jid)
+            bad = check_ref(base_dir, f, jid)
             if bad:
                 problems.append(bad)
-            elif not (base_dir / str(f)).is_file():
-                problems.append(f"{jid}：找不到輸入圖片 {f}（相對於 {base_dir}）")
 
         # Test graph building offline to catch invalid quant, aspect_ratio, resolution, or PE variant early
         try:
@@ -118,14 +104,18 @@ def load_manifest(
     cli_quant: str | None = None,
     exit_on_error: bool = True,
 ) -> tuple[dict[str, Any], Path]:
-    p = Path(path).resolve()
-    if not p.is_file():
+    p = Path(path).absolute()
+    try:
+        base = p.parent.resolve()
+        p = confined_path(base, p.name)
+    except FileNotFoundError:
         _fail(f"找不到 manifest 檔案：{p}", exit_on_error)
+    except (OSError, RuntimeError, ValueError) as exc:
+        _fail(f"無法使用 manifest 檔案 {p}：{exc}", exit_on_error)
     try:
         m = json.loads(p.read_text(encoding="utf-8"))
     except Exception as e:
         _fail(f"manifest JSON 格式錯誤（{p}）：{e}", exit_on_error)
-    base = p.parent
     problems = validate_manifest(m, base, cli_quant=cli_quant)
     if problems:
         _fail("manifest 驗證未通過，沒有開機：\n- " + "\n- ".join(problems), exit_on_error)
@@ -149,9 +139,9 @@ def compute_job_fingerprint(
 
     input_hashes = []
     for rel in job.get("inputs") or []:
-        fp = base_dir / str(rel)
+        fp = confined_path(base_dir, rel, missing_ok=True)
         h = hashlib.sha256(fp.read_bytes()).hexdigest() if fp.is_file() else "missing"
-        input_hashes.append({"path": str(rel).replace("\\", "/"), "sha256": h})
+        input_hashes.append({"path": rel, "sha256": h})
 
     v_commits = {}
     if isinstance(versions, dict):
@@ -178,8 +168,7 @@ def classify_jobs(
     use_fingerprint: bool = True,
 ) -> tuple[dict[str, str], list[dict[str, Any]], list[str], list[tuple[str, str]]]:
     """Return (fps, todo_jobs, done_ids, stale_list[(jid, reason)])."""
-    out_dir = base_dir / "out"
-    res_file = out_dir / "results.json"
+    res_file = confined_path(base_dir, "out/results.json", missing_ok=True)
     old_results = {}
     if res_file.is_file():
         try:
@@ -197,7 +186,7 @@ def classify_jobs(
         jid = j["id"]
         fp = compute_job_fingerprint(j, manifest, base_dir, cli_quant=cli_quant, versions=versions)
         fps[jid] = fp
-        out_img = out_dir / f"{jid}.png"
+        out_img = confined_path(base_dir, f"out/{jid}.png", missing_ok=True)
         if not out_img.is_file() or out_img.stat().st_size == 0:
             todo.append(j)
             continue
@@ -221,7 +210,10 @@ def classify_jobs(
 def plan_batch(manifest_path: str | Path, gpu: str = "L4", cli_quant: str | None = None) -> dict[str, Any]:
     m, base = load_manifest(manifest_path, cli_quant=cli_quant)
     plugin = get_model_plugin(m.get("model"))
-    fps, todo, done_ids, stale = classify_jobs(m, base, cli_quant=cli_quant)
+    try:
+        fps, todo, done_ids, stale = classify_jobs(m, base, cli_quant=cli_quant)
+    except (OSError, ValueError) as exc:
+        _fail(f"無法使用任務檔案：{exc}")
     req_models = plugin.required_models_for_batch(m, cli_quant=cli_quant)
     versions = load_versions()
     pin_idx = {(e["repo"], e["file"]): e for e in (versions.get("models") or []) if "repo" in e and "file" in e}
@@ -260,24 +252,23 @@ def plan_batch(manifest_path: str | Path, gpu: str = "L4", cli_quant: str | None
     }
 
 
-def makedirs_code(dirs: list[str]) -> str:
-    return (
-        "import os, json\n"
-        "for d in json.loads(" + repr(json.dumps(dirs)) + "):\n"
-        "    os.makedirs('/content/cstudio/inputs/' + d, exist_ok=True)\n"
-    )
-
-
 def save_results(path: Path, data: dict[str, Any]):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    confined_path(path.parent, path.name, missing_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as fp:
+            tmp = Path(fp.name)
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+        tmp.replace(path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 REMOTE_CODE_FILES = (
     "__init__.py",
     "cancel.py",
+    "job_paths.py",
     "remote_runner.py",
     "start.py",
     "status.py",
@@ -300,7 +291,6 @@ def bundle_and_launch_code(
     code_files: dict[str, str] | None,
     bundle_hash: str,
     manifest_json: str,
-    input_dirs: list[str],
     input_shas: dict[str, str],
 ) -> str:
     """Single-roundtrip Python code executed on Colab VM:
@@ -314,47 +304,51 @@ def bundle_and_launch_code(
         "code_files": code_files,
         "bundle_hash": bundle_hash,
         "manifest_json": manifest_json,
-        "input_dirs": input_dirs,
         "input_shas": input_shas,
     }
-    return (
-        "import hashlib, json, os, shutil, subprocess, sys, time\n"
-        "from pathlib import Path\n"
+    return (REMOTE / "job_paths.py").read_text(encoding="utf-8") + "\n" + (
+        "import hashlib, json, shutil, subprocess, sys, time\n"
         f"P = json.loads({json.dumps(payload, ensure_ascii=False)!r})\n"
         "JOB = Path('/content/cstudio')\n"
-        "(JOB / 'models').mkdir(parents=True, exist_ok=True)\n"
-        "(JOB / 'inputs').mkdir(parents=True, exist_ok=True)\n"
-        "for d in P['input_dirs']:\n"
-        "    (JOB / 'inputs' / d).mkdir(parents=True, exist_ok=True)\n"
+        "confined_path(JOB.parent, JOB.name, directory=True, missing_ok=True).mkdir(exist_ok=True)\n"
+        "input_root = confined_path(JOB, 'inputs', directory=True, missing_ok=True)\n"
+        "input_root.mkdir(exist_ok=True)\n"
+        "inputs = {rel: confined_path(input_root, rel, missing_ok=True) for rel in P['input_shas']}\n"
+        "for fp in inputs.values():\n"
+        "    fp.parent.mkdir(parents=True, exist_ok=True)\n"
+        "confined_path(JOB, 'models', directory=True, missing_ok=True).mkdir(exist_ok=True)\n"
         "if P['code_files']:\n"
         "    for rel, content in P['code_files'].items():\n"
-        "        dst = JOB / rel\n"
+        "        dst = confined_path(JOB, rel, missing_ok=True)\n"
         "        dst.parent.mkdir(parents=True, exist_ok=True)\n"
         "        dst.write_text(content, encoding='utf-8')\n"
-        "    (JOB / '.bundle_sha256').write_text(P['bundle_hash'], encoding='utf-8')\n"
-        "(JOB / 'manifest.json').write_text(P['manifest_json'], encoding='utf-8')\n"
+        "    confined_path(JOB, '.bundle_sha256', missing_ok=True).write_text(P['bundle_hash'], encoding='utf-8')\n"
+        "confined_path(JOB, 'manifest.json', missing_ok=True).write_text(P['manifest_json'], encoding='utf-8')\n"
         "missing = []\n"
         "for rel, exp_sha in P['input_shas'].items():\n"
-        "    fp = JOB / 'inputs' / rel\n"
+        "    fp = inputs[rel]\n"
         "    if not fp.is_file() or hashlib.sha256(fp.read_bytes()).hexdigest() != exp_sha:\n"
         "        missing.append(rel)\n"
         "res = {'missing_inputs': missing, 'launched': False}\n"
         "if not missing:\n"
         "    running = subprocess.run(['pgrep', '-f', 'cstudio/remote_runner.py'], capture_output=True, text=True).stdout.strip()\n"
-        "    out_dir = JOB / 'out'\n"
-        "    status = JOB / 'status.json'\n"
+        "    out_dir = confined_path(JOB, 'out', directory=True, missing_ok=True)\n"
+        "    status = confined_path(JOB, 'status.json', missing_ok=True)\n"
         "    if running:\n"
         "        res['launched'] = True\n"
         "        res['already_running'] = True\n"
         "        res['pid'] = running\n"
         "    else:\n"
+        "        worker = confined_path(JOB, 'remote_runner.py')\n"
+        "        log_path = confined_path(JOB, 'remote_runner.log', missing_ok=True)\n"
         "        if status.exists():\n"
-        "            status.rename(JOB / f'status_{int(time.time())}.json')\n"
+        "            status.rename(confined_path(JOB, f'status_{int(time.time())}.json', missing_ok=True))\n"
         "        if out_dir.exists():\n"
         "            shutil.rmtree(out_dir, ignore_errors=True)\n"
-        "        out_dir.mkdir(parents=True, exist_ok=True)\n"
-        "        p = subprocess.Popen([sys.executable, str(JOB / 'remote_runner.py')], cwd=str(JOB),\n"
-        "                             stdout=open(JOB / 'remote_runner.log', 'w'), stderr=subprocess.STDOUT, start_new_session=True)\n"
+        "        out_dir.mkdir(exist_ok=True)\n"
+        "        with log_path.open('w') as log:\n"
+        "            p = subprocess.Popen([sys.executable, str(worker)], cwd=str(JOB),\n"
+        "                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\n"
         "        res['launched'] = True\n"
         "        res['pid'] = p.pid\n"
         "print('CSTUDIO_PREP ' + json.dumps(res))\n"
@@ -411,9 +405,13 @@ def run_manifest(
         _fail("尚未登入 Google Colab：請先執行 `uv run cstudio login url`", exit_on_error)
 
     m, base = load_manifest(manifest_path, cli_quant=cli_quant, exit_on_error=exit_on_error)
-    out_dir = base / "out"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    res_file = out_dir / "results.json"
+    try:
+        fps, todo, done_ids, stale = classify_jobs(m, base, cli_quant=cli_quant, use_fingerprint=use_fingerprint)
+        out_dir = confined_path(base, "out", directory=True, missing_ok=True)
+        out_dir.mkdir(exist_ok=True)
+        res_file = confined_path(base, "out/results.json", missing_ok=True)
+    except (OSError, ValueError) as exc:
+        _fail(f"無法使用任務檔案：{exc}", exit_on_error)
     prev_results = {}
     if res_file.is_file():
         try:
@@ -421,7 +419,6 @@ def run_manifest(
         except Exception:
             prev_results = {}
 
-    fps, todo, done_ids, stale = classify_jobs(m, base, cli_quant=cli_quant, use_fingerprint=use_fingerprint)
     if force:
         todo = list(m["jobs"])
         done_ids = []
@@ -432,13 +429,17 @@ def run_manifest(
         _fail(msg, exit_on_error)
 
     if stale and remake_stale:
-        stale_dir = out_dir / "_stale"
-        stale_dir.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        for jid, _ in stale:
-            old_f = out_dir / f"{jid}.png"
-            if old_f.is_file():
-                shutil.move(str(old_f), str(stale_dir / f"{jid}_{ts}.png"))
+        try:
+            stale_dir = confined_path(base, "out/_stale", directory=True, missing_ok=True)
+            stale_dir.mkdir(exist_ok=True)
+            ts = int(time.time())
+            for jid, _ in stale:
+                old_f = confined_path(base, f"out/{jid}.png", missing_ok=True)
+                if old_f.is_file():
+                    backup = confined_path(base, f"out/_stale/{jid}_{ts}.png", missing_ok=True)
+                    shutil.move(old_f, backup)
+        except (OSError, ValueError) as exc:
+            _fail(f"無法備份舊成果：{exc}", exit_on_error)
 
     if not todo:
         print(f"✅ 全部 {len(m['jobs'])} 個任務皆已完成且指紋相符，無需啟動 Colab GPU！（輸出位於 {out_dir}）", flush=True)
@@ -659,18 +660,38 @@ def run_manifest(
             else None
         )
 
-        files = sorted({str(f).replace("\\", "/") for j in todo for f in (j.get("inputs") or [])})
-        dirs = sorted({str(Path(f).parent).replace("\\", "/") for f in files} - {"."})
-        input_shas = {f: hashlib.sha256((base / f).read_bytes()).hexdigest() for f in files}
+        files = sorted({f for j in todo for f in (j.get("inputs") or [])})
+        input_shas = {f: hashlib.sha256(confined_path(base, f).read_bytes()).hexdigest() for f in files}
 
         _emit({"stage": "syncing_code", "done": False, "log": [f"正在同步遠端程式與任務設定至 {session}..."]})
         _check_active()
         remote_attempted = True
         prep_out = C.remote_exec(
             session,
-            bundle_and_launch_code(code_files, bundle_hash, manifest_json, dirs, input_shas),
+            bundle_and_launch_code(code_files, bundle_hash, manifest_json, input_shas),
             **short,
         )
+        prep_info = None
+        for line in reversed(prep_out.splitlines()):
+            if "CSTUDIO_PREP " in line:
+                try:
+                    prep_info = json.loads(line.split("CSTUDIO_PREP ", 1)[1])
+                except ValueError:
+                    pass
+                break
+        if not isinstance(prep_info, dict) or type(prep_info.get("launched")) is not bool:
+            raise RuntimeError("收到無法驗證的遠端準備結果")
+        missing_inputs = prep_info.get("missing_inputs")
+        if (
+            not isinstance(missing_inputs, list)
+            or any(not isinstance(f, str) or f not in input_shas for f in missing_inputs)
+            or len(set(missing_inputs)) != len(missing_inputs)
+            or (prep_info["launched"] and missing_inputs)
+        ):
+            raise RuntimeError("遠端待上傳清單不符合當批參考圖片")
+        if not prep_info["launched"]:
+            remote_attempted = False
+
         if need_code:
             _check_active()
             current = C.keep_info(session) or {}
@@ -680,25 +701,13 @@ def run_manifest(
                 except C.KeepChanged:
                     pass  # The bundle cache can be rebuilt after a concurrent keep update.
 
-        prep_info = {}
-        for line in reversed(prep_out.splitlines()):
-            if "CSTUDIO_PREP " in line:
-                try:
-                    prep_info = json.loads(line.split("CSTUDIO_PREP ", 1)[1])
-                except Exception:
-                    pass
-                break
-
-        missing_inputs = prep_info.get("missing_inputs", files)
-        if prep_info.get("launched") is False:
-            remote_attempted = False
         for f in missing_inputs:
             _check_active()
             if cancel_pending:
                 break
             print(f"⬆️ 上傳參考圖：{f}", flush=True)
             _emit({"stage": "uploading_inputs", "done": False, "log": [f"正在上傳參考圖片：{f}"]})
-            C.colab("upload", "-s", session, base / f, f"/content/cstudio/inputs/{f}", timeout=600, **target)
+            C.colab("upload", "-s", session, confined_path(base, f), f"/content/cstudio/inputs/{f}", timeout=600, **target)
 
         _check_active()
         if not cancel_pending:
@@ -761,27 +770,37 @@ def run_manifest(
 
             # Pull newly completed images immediately via atomic temporary file + sha256 verification
             r_jobs = st.get("jobs") or {}
+            if not isinstance(r_jobs, dict):
+                raise RuntimeError("遠端成果清單格式錯誤")
             synced_any = False
             for jid, jinfo in r_jobs.items():
                 if jid not in expected_todo_ids or jid in got or not isinstance(jinfo, dict):
                     continue
-                if jinfo.get("status") == "done" and jinfo.get("file"):
-                    tmp_pull = out_dir / f".{jid}_{run_id}.png.tmp"
-                    final_dst = out_dir / f"{jid}.png"
+                if jinfo.get("status") == "done":
+                    expected_file = f"out/{jid}.png"
+                    if jinfo.get("file") != expected_file:
+                        if st.get("done"):
+                            results["jobs"][jid] = {"status": "sync_error", "error": "遠端成果路徑與當批任務不符"}
+                            save_results(res_file, results)
+                            got.add(jid)
+                        continue
+                    tmp_pull = confined_path(base, f"out/.{jid}_{run_id}.png.tmp", missing_ok=True)
+                    final_dst = confined_path(base, expected_file, missing_ok=True)
                     max_pull_tries = 3 if st.get("done") else 1
                     pull_err = None
                     for pull_try in range(max_pull_tries):
                         _check_active()
                         try:
-                            C.colab("download", "-s", session, f"/content/cstudio/{jinfo['file']}", tmp_pull,
+                            C.colab("download", "-s", session, f"/content/cstudio/{expected_file}", tmp_pull,
                                     timeout=600, **target)
-                            if not tmp_pull.is_file() or tmp_pull.stat().st_size == 0:
+                            pulled = confined_path(base, f"out/{tmp_pull.name}")
+                            if pulled.stat().st_size == 0:
                                 raise RuntimeError("下載的暫存檔為空")
                             exp_sha = jinfo.get("sha256")
-                            got_sha = hashlib.sha256(tmp_pull.read_bytes()).hexdigest()
+                            got_sha = hashlib.sha256(pulled.read_bytes()).hexdigest()
                             if exp_sha and got_sha != exp_sha:
                                 raise RuntimeError(f"SHA256 校驗不符 (expected {exp_sha[:10]}, got {got_sha[:10]})")
-                            tmp_pull.replace(final_dst)
+                            pulled.replace(final_dst)
                             rec = dict(jinfo, fingerprint=fps.get(jid), local_synced=True)
                             results["jobs"][jid] = rec
                             save_results(res_file, results)

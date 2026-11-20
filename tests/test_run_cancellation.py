@@ -203,7 +203,7 @@ class RemoteCancellationTests(unittest.TestCase):
         original["jobs"].append({"id": "b", "prompt": "test"})
         (self.job / "manifest.json").write_text(json.dumps(original), encoding="utf-8")
 
-        def collect(_history, dest):
+        def collect(_history, dest, **_save_image):
             dest.write_bytes(b"fixture")
             cancel.request_cancel(self.job, RUN)
 
@@ -218,7 +218,7 @@ class RemoteCancellationTests(unittest.TestCase):
         self.assertEqual(self.state["stage"], "cancelled")
 
     def test_cancel_after_last_output_was_saved_reports_completed_batch(self):
-        def collect(_history, dest):
+        def collect(_history, dest, **_save_image):
             dest.write_bytes(b"fixture")
             cancel.request_cancel(self.job, RUN)
 

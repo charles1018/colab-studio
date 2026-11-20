@@ -22,6 +22,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFi
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
+from remote.job_paths import confined_path, relative_parts
 
 from . import colab_client as C
 from . import colab_login as L
@@ -152,11 +153,12 @@ def read_local_keeps() -> list[dict[str, Any]]:
 def safe_job_dir(job_dir: str) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", job_dir) or job_dir in (".", ".."):
         raise HTTPException(status_code=400, detail=f"不合法的任務資料夾名稱：{job_dir!r}")
-    p = (JOBS_DIR / job_dir).resolve()
-    jobs_root = JOBS_DIR.resolve()
-    if p == jobs_root or jobs_root not in p.parents or p.is_symlink():
-        raise HTTPException(status_code=400, detail="不允許存取 jobs 目錄以外的路徑")
-    return p
+    try:
+        return confined_path(JOBS_DIR, job_dir, directory=True)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="找不到任務資料夾") from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="不允許存取此任務資料夾") from exc
 
 
 def safe_subfile(job_dir: str, subfolder: str, filename: str) -> Path:
@@ -164,11 +166,13 @@ def safe_subfile(job_dir: str, subfolder: str, filename: str) -> Path:
         raise HTTPException(status_code=400, detail="不支援的子資料夾")
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", filename) or filename in (".", ".."):
         raise HTTPException(status_code=400, detail=f"不合法的檔案名稱：{filename!r}")
+    if subfolder == "out" and not filename.lower().endswith(".png"):
+        raise HTTPException(status_code=400, detail="輸出作品必須是 PNG")
     base = safe_job_dir(job_dir)
-    target = (base / subfolder / filename).resolve()
-    if base not in target.parents or target.is_symlink() or not target.is_file():
-        raise HTTPException(status_code=404, detail=f"找不到圖片檔案：{job_dir}/{subfolder}/{filename}")
-    return target
+    try:
+        return confined_path(base, f"{subfolder}/{filename}")
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=f"找不到圖片檔案：{job_dir}/{subfolder}/{filename}") from exc
 
 
 def inspect_image_meta(img_path: Path) -> dict[str, Any]:
@@ -180,39 +184,28 @@ def inspect_image_meta(img_path: Path) -> dict[str, Any]:
         return {"width": None, "height": None, "mode": None, "has_alpha": False}
 
 
+def read_gallery_metadata(folder: Path, relative: str) -> dict[str, Any]:
+    try:
+        data = json.loads(confined_path(folder, relative).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def scan_gallery(limit: int = 120) -> list[dict[str, Any]]:
     """Scan local jobs/*/out/results.json and manifest.json to build rich gallery items."""
-    if not JOBS_DIR.is_dir():
+    if JOBS_DIR.is_symlink() or JOBS_DIR.is_junction() or not JOBS_DIR.is_dir():
         return []
     items: list[dict[str, Any]] = []
-    job_folders = [p for p in JOBS_DIR.iterdir() if p.is_dir() and not p.is_symlink()]
-    # Sort by directory modification time descending
-    job_folders.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-
-    for folder in job_folders:
-        job_dir_name = folder.name
+    for candidate in JOBS_DIR.iterdir():
+        job_dir_name = candidate.name
         try:
-            safe_job_dir(job_dir_name)
-        except Exception:
+            folder = safe_job_dir(job_dir_name)
+            out_dir = confined_path(folder, "out", directory=True)
+        except (HTTPException, OSError, ValueError):
             continue
-        manifest_file = folder / "manifest.json"
-        res_file = folder / "out" / "results.json"
-        manifest_data: dict[str, Any] = {}
-        results_data: dict[str, Any] = {}
-        if manifest_file.is_file():
-            try:
-                loaded_m = json.loads(manifest_file.read_text(encoding="utf-8"))
-                if isinstance(loaded_m, dict):
-                    manifest_data = loaded_m
-            except Exception:
-                manifest_data = {}
-        if res_file.is_file():
-            try:
-                loaded_r = json.loads(res_file.read_text(encoding="utf-8"))
-                if isinstance(loaded_r, dict):
-                    results_data = loaded_r
-            except Exception:
-                results_data = {}
+        manifest_data = read_gallery_metadata(folder, "manifest.json")
+        results_data = read_gallery_metadata(folder, "out/results.json")
 
         m_jobs_by_id: dict[str, dict[str, Any]] = {}
         raw_m_jobs = manifest_data.get("jobs")
@@ -221,25 +214,16 @@ def scan_gallery(limit: int = 120) -> list[dict[str, Any]]:
                 m_jobs_by_id[j["id"]] = j
 
         r_jobs = results_data.get("jobs") if isinstance(results_data.get("jobs"), dict) else {}
-        out_dir = folder / "out"
-        if not out_dir.is_dir():
-            continue
-
         # Collect PNG files in out/
-        for png in sorted(out_dir.glob("*.png"), key=lambda x: x.stat().st_mtime, reverse=True):
-            if (
-                png.name.startswith(".")
-                or png.name in ("contact_sheet.png", "comparison_sheet.png")
-                or png.name.endswith("_sheet.png")
-                or png.is_symlink()
-            ):
+        for candidate_png in out_dir.glob("*.png"):
+            if candidate_png.name.startswith(".") or candidate_png.name.endswith("_sheet.png"):
                 continue
             try:
-                st_size = png.stat().st_size
-                mtime = png.stat().st_mtime
-            except OSError:
+                png = safe_subfile(job_dir_name, "out", candidate_png.name)
+                info = png.stat()
+            except (HTTPException, OSError):
                 continue
-            if st_size == 0:
+            if info.st_size == 0:
                 continue
             jid = png.stem
             # If manifest has jobs defined and jid is not one of them (e.g. a user-created collage), skip
@@ -257,16 +241,20 @@ def scan_gallery(limit: int = 120) -> list[dict[str, Any]]:
             raw_inputs = m_info.get("inputs") if isinstance(m_info.get("inputs"), list) else []
             input_urls: list[dict[str, str]] = []
             for rel_in in raw_inputs:
-                rel_s = str(rel_in).replace("\\", "/")
-                fn = Path(rel_s).name
-                if (folder / "inputs" / fn).is_file():
-                    input_urls.append(
-                        {
-                            "filename": fn,
-                            "artifact_id": f"{job_dir_name}/inputs/{fn}",
-                            "url": f"/api/jobs/{job_dir_name}/inputs/{fn}",
-                        }
-                    )
+                try:
+                    parts = relative_parts(rel_in)
+                    if len(parts) != 2 or parts[0] != "inputs":
+                        continue
+                    fn = safe_subfile(job_dir_name, *parts).name
+                except (HTTPException, ValueError):
+                    continue
+                input_urls.append(
+                    {
+                        "filename": fn,
+                        "artifact_id": f"{job_dir_name}/inputs/{fn}",
+                        "url": f"/api/jobs/{job_dir_name}/inputs/{fn}",
+                    }
+                )
 
             seed_val = m_info.get("seed", r_info.get("seed", 42))
             quant_val = str(
@@ -285,7 +273,7 @@ def scan_gallery(limit: int = 120) -> list[dict[str, Any]]:
             custom_size_val = bool(m_info.get("custom_size", mode == "t2i"))
             edit_res_val = int(m_info.get("edit_resolution", 1024))
 
-            mtime = png.stat().st_mtime
+            mtime = info.st_mtime
             items.append(
                 {
                     "artifact_id": f"{job_dir_name}/out/{png.name}",
@@ -295,7 +283,7 @@ def scan_gallery(limit: int = 120) -> list[dict[str, Any]]:
                     "url": f"/api/jobs/{job_dir_name}/out/{png.name}?t={int(mtime)}",
                     "created_at": mtime,
                     "created_at_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
-                    "size_kb": round(png.stat().st_size / 1024.0, 1),
+                    "size_kb": round(info.st_size / 1024.0, 1),
                     "width": img_meta["width"] or r_info.get("width"),
                     "height": img_meta["height"] or r_info.get("height"),
                     "has_alpha": img_meta["has_alpha"],
@@ -326,7 +314,10 @@ def scan_gallery(limit: int = 120) -> list[dict[str, Any]]:
 
 def resolve_artifact_to_path(artifact_id: str) -> Path:
     """Safely resolve a server-issued artifact_id ('<job_dir>/out/<file>' or '<job_dir>/inputs/<file>') to a local file."""
-    parts = [p for p in str(artifact_id or "").strip().replace("\\", "/").split("/") if p]
+    try:
+        parts = relative_parts(artifact_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="不合法的圖片識別碼") from exc
     if len(parts) != 3:
         raise HTTPException(status_code=400, detail=f"不合法的圖片識別碼：{artifact_id!r}")
     job_dir, subfolder, filename = parts
@@ -416,13 +407,16 @@ class StudioUIState:
             local_res = st.get("_local_results") or {}
             r_jobs = local_res.get("jobs") if isinstance(local_res.get("jobs"), dict) else {}
             if self.job_dir and synced_ids:
-                folder = JOBS_DIR / self.job_dir
                 new_synced: list[dict[str, Any]] = []
                 for jid in synced_ids:
-                    png = folder / "out" / f"{jid}.png"
-                    if png.is_file() and png.stat().st_size > 0:
+                    try:
+                        png = safe_subfile(self.job_dir, "out", f"{jid}.png")
+                        info = png.stat()
+                    except (HTTPException, OSError):
+                        continue
+                    if info.st_size > 0:
                         jrec = r_jobs.get(jid) if isinstance(r_jobs.get(jid), dict) else {}
-                        mtime = png.stat().st_mtime
+                        mtime = info.st_mtime
                         img_meta = inspect_image_meta(png)
                         new_synced.append(
                             {
@@ -1008,14 +1002,8 @@ async def api_run_start(
     short_uid = uuid.uuid4().hex[:6]
     custom_slug = re.sub(r"[^A-Za-z0-9_-]+", "_", str(batch_name or "").strip()).strip("_")[:32]
     folder_name = f"webui_{ts_str}_{custom_slug}_{short_uid}" if custom_slug else f"webui_{ts_str}_{short_uid}"
-    job_folder = (JOBS_DIR / folder_name).resolve()
-    inputs_folder = job_folder / "inputs"
-    out_folder = job_folder / "out"
-    inputs_folder.mkdir(parents=True, exist_ok=True)
-    out_folder.mkdir(parents=True, exist_ok=True)
 
-    # Process reference images for edit mode
-    saved_inputs_rel: list[str] = []
+    resolved_sources: list[tuple[str, Any]] = []
     if mode_clean == "edit":
         try:
             order_spec = json.loads(ref_order or "[]")
@@ -1026,7 +1014,6 @@ async def api_run_start(
 
         # Map uploaded files by their client-side key or index
         upload_idx = 0
-        resolved_sources: list[tuple[str, Any]] = []
         if order_spec:
             for item in order_spec:
                 if not isinstance(item, dict):
@@ -1036,19 +1023,33 @@ async def api_run_start(
                     resolved_sources.append(("upload", ref_files[upload_idx]))
                     upload_idx += 1
                 elif kind == "artifact" and item.get("artifact_id"):
-                    src_path = resolve_artifact_to_path(str(item["artifact_id"]))
+                    src_path = resolve_artifact_to_path(item["artifact_id"])
                     resolved_sources.append(("artifact", src_path))
         else:
             for uf in ref_files:
                 resolved_sources.append(("upload", uf))
 
         if not (1 <= len(resolved_sources) <= 10):
-            shutil.rmtree(job_folder, ignore_errors=True)
             raise HTTPException(
                 status_code=400,
                 detail=f"圖片編輯（Edit）模式需要 1～10 張參考圖片（目前收到 {len(resolved_sources)} 張）",
             )
 
+    try:
+        JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        job_folder = confined_path(JOBS_DIR, folder_name, directory=True, missing_ok=True)
+        job_folder.mkdir()
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail="任務資料夾已經存在") from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="無法使用任務資料夾") from exc
+    inputs_folder = job_folder / "inputs"
+    out_folder = job_folder / "out"
+    inputs_folder.mkdir()
+    out_folder.mkdir()
+
+    saved_inputs_rel: list[str] = []
+    if mode_clean == "edit":
         for idx, (src_kind, src_obj) in enumerate(resolved_sources, start=1):
             dst_name = f"ref_{idx}.png"
             dst_path = inputs_folder / dst_name

@@ -251,6 +251,84 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 403)
         self.assert_no_effects()
 
+    async def start_edit(self, cookie, artifact_ids):
+        order = json.dumps([{"kind": "artifact", "artifact_id": item} for item in artifact_ids])
+        body = (
+            '--fixture\r\nContent-Disposition: form-data; name="mode"\r\n\r\nedit\r\n'
+            '--fixture\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nSynthetic edit\r\n'
+            f'--fixture\r\nContent-Disposition: form-data; name="ref_order"\r\n\r\n{order}\r\n--fixture--\r\n'
+        ).encode()
+        return await self.request("/api/run/start", method="POST", body=body, headers=(
+            cookie, ("origin", ORIGIN), UI_HEADER, MULTIPART_HEADER,
+        ))
+
+    async def test_gallery_and_edit_reject_symlink_aliases_without_creating_a_job(self):
+        cookie = await self.open_ui()
+        outside = self.jobs.parent / "other"
+        (outside / "out").mkdir(parents=True)
+        Image.new("RGB", (3, 3)).save(outside / "out" / "other.png")
+        metadata = outside / "manifest.json"
+        metadata.write_text(json.dumps({
+            "jobs": [{"id": "sample", "prompt": "private prompt"}],
+        }), encoding="utf-8")
+        (self.jobs / "other-out").mkdir()
+        try:
+            (self.jobs / "other-job").symlink_to(outside, target_is_directory=True)
+            (self.jobs / "other-out" / "out").symlink_to(outside / "out", target_is_directory=True)
+            (self.image.parent / "linked.png").symlink_to(self.image)
+            (self.image.parent / "dangling.png").symlink_to(outside / "missing.png")
+            (self.image.parents[1] / "manifest.json").symlink_to(metadata)
+            (self.image.parent / "results.json").symlink_to(metadata)
+        except (OSError, NotImplementedError):
+            self.skipTest("symbolic links unavailable")
+        before = sorted(path.name for path in self.jobs.iterdir())
+        response = await self.request("/api/gallery", headers=(cookie,))
+        self.assertEqual(response.status, 200)
+        items = json.loads(response.body)["items"]
+        self.assertEqual([item["artifact_id"] for item in items], ["fixture/out/sample.png"])
+        self.assertEqual(items[0]["prompt"], "")
+        for artifact in ("other-job/out/other.png", "other-out/out/other.png", "fixture/out/linked.png"):
+            with self.subTest(artifact=artifact):
+                reply = await self.request(f"/api/jobs/{artifact}", headers=(cookie,))
+                self.assertIn(reply.status, (400, 404))
+                reply = await self.start_edit(cookie, [artifact])
+                self.assertIn(reply.status, (400, 404))
+        for artifact in ("/fixture/out/sample.png", "fixture//out/sample.png", r"fixture\out\sample.png"):
+            with self.subTest(artifact=artifact):
+                self.assertEqual((await self.start_edit(cookie, [artifact])).status, 400)
+        reply = await self.request("/api/jobs/fixture/out/results.json", headers=(cookie,))
+        self.assertEqual(reply.status, 400)
+        self.assertEqual(sorted(path.name for path in self.jobs.iterdir()), before)
+        self.run_manifest.assert_not_called()
+        self.cloud["colab"].assert_not_called()
+
+    async def test_gallery_edit_copies_exact_artifacts_in_order_and_preserves_alpha(self):
+        cookie = await self.open_ui()
+        original_job = self.image.parents[1]
+        original_ref = original_job / "inputs" / "flat.png"
+        original_ref.parent.mkdir()
+        Image.new("RGBA", (2, 2), (250, 10, 20, 90)).save(original_ref)
+        (original_job / "manifest.json").write_text(json.dumps({"jobs": [{
+            "id": "sample", "mode": "edit", "inputs": ["inputs/nested/flat.png", "inputs/flat.png"],
+        }]}), encoding="utf-8")
+        response = await self.request("/api/gallery", headers=(cookie,))
+        item, = json.loads(response.body)["items"]
+        restored_ref, = item["inputs"]
+        self.assertEqual(restored_ref["artifact_id"], "fixture/inputs/flat.png")
+        self.enterContext(patch.object(W, "threading", SimpleNamespace(
+            Thread=lambda *, target, **_: SimpleNamespace(start=target),
+        )))
+        response = await self.start_edit(cookie, [restored_ref["artifact_id"], item["artifact_id"]])
+        self.assertEqual(response.status, 202, response.body)
+        new_job = self.jobs / json.loads(response.body)["job_dir"]
+        manifest = json.loads((new_job / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["jobs"][0]["inputs"], ["inputs/ref_1.png", "inputs/ref_2.png"])
+        with Image.open(new_job / "inputs" / "ref_1.png") as first:
+            self.assertEqual(first.getpixel((0, 0)), (250, 10, 20, 90))
+        with Image.open(new_job / "inputs" / "ref_2.png") as second:
+            self.assertEqual(second.getpixel((0, 0)), (0, 0, 0, 0))
+        self.run_manifest.assert_called_once()
+
     async def test_same_origin_login_controls_and_multipart_generation(self):
         cookie = await self.open_ui()
         self.enterContext(patch.object(W, "threading", SimpleNamespace(

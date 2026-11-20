@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -27,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cancel import CANCEL_PROTOCOL, cancel_marker  # noqa: E402
+from job_paths import JOB_ID, confined_path  # noqa: E402
 from models import get_model_plugin  # noqa: E402
 
 JOB = Path(os.environ.get("CSTUDIO_DIR", "/content/cstudio"))
@@ -65,7 +67,7 @@ class CancellationUnconfirmed(Exception):
 
 # ---------------------------------------------------------------- status & helpers
 def save():
-    tmp = STATUS.with_suffix(".tmp")
+    tmp = confined_path(JOB, STATUS.with_suffix(".tmp").name, missing_ok=True)
     tmp.write_text(json.dumps(STATE, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(STATUS)
 
@@ -539,13 +541,12 @@ def wait_history(pid: str, timeout: int, what: str) -> dict:
 
 def stage_input_image(rel_path: str, job_id: str, idx: int) -> str:
     """Copy an uploaded input image from /content/cstudio/inputs/<rel_path> into ComfyUI/input/."""
-    src = JOB / "inputs" / rel_path
-    if not src.is_file():
-        raise FileNotFoundError(f"找不到輸入圖片：{src}")
+    input_root = confined_path(JOB, "inputs", directory=True)
+    src = confined_path(input_root, rel_path)
     ext = src.suffix.lower() or ".png"
     safe_name = f"cstudio_{job_id}_in{idx}{ext}"
-    dest = COMFY / "input" / safe_name
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest = confined_path(COMFY, f"input/{safe_name}", missing_ok=True)
+    dest.parent.mkdir(exist_ok=True)
     shutil.copy2(src, dest)
     return safe_name
 
@@ -566,43 +567,42 @@ def extract_refined_prompt(history_entry: dict) -> str | None:
     return None
 
 
-def collect_output_image(history_entry: dict, dest_path: Path) -> Path:
-    """Locate the generated image in ComfyUI/output (or via /view) and copy it to dest_path."""
-    outputs = history_entry.get("outputs") or {}
-    for nid, out in outputs.items():
-        if not isinstance(out, dict):
-            continue
-        imgs = out.get("images") or []
-        if not imgs:
-            continue
-        info = imgs[0]
-        fn = info.get("filename")
-        sub = info.get("subfolder", "")
-        ftype = info.get("type", "output")
-        if not fn:
-            continue
-        local_candidate = COMFY / ftype / sub / fn if sub else COMFY / ftype / fn
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        if local_candidate.is_file():
-            shutil.copy2(local_candidate, dest_path)
-            return dest_path
-        # Fallback to /view HTTP download
-        qs = urllib.parse.urlencode({"filename": fn, "subfolder": sub, "type": ftype})
+def collect_output_image(history_entry: dict, dest_path: Path, *, save_node: str, prefix: str) -> Path:
+    """Copy only the PNG produced by the submitted SaveImage node."""
+    outputs = history_entry.get("outputs")
+    saved = outputs.get(save_node) if isinstance(outputs, dict) else None
+    imgs = saved.get("images") if isinstance(saved, dict) else None
+    if not isinstance(imgs, list) or not imgs or not isinstance(imgs[0], dict):
+        raise RuntimeError("ComfyUI 完成但未在指定 SaveImage 節點找到輸出圖片")
+    info = imgs[0]
+    fn = info.get("filename")
+    if (
+        info.get("type") != "output" or info.get("subfolder") != ""
+        or not isinstance(fn, str) or not re.fullmatch(rf"{re.escape(prefix)}_[0-9]+_\.png", fn)
+    ):
+        raise RuntimeError("ComfyUI 輸出路徑與提交的 SaveImage 設定不符")
+    candidate = confined_path(COMFY, f"output/{fn}", missing_ok=True)
+    if candidate.is_file():
+        shutil.copy2(candidate, dest_path)
+    else:
+        qs = urllib.parse.urlencode({"filename": fn, "subfolder": "", "type": "output"})
         with urllib.request.urlopen(f"{COMFY_URL}/view?{qs}", timeout=60) as r:
             dest_path.write_bytes(r.read())
-        return dest_path
-    raise RuntimeError("ComfyUI 完成但未在 history outputs 找到輸出圖片")
+    return dest_path
 
 
 # ---------------------------------------------------------------- 4 main batch execution
 def run_batch():
-    manifest_path = JOB / "manifest.json"
-    if not manifest_path.is_file():
-        raise RuntimeError(f"找不到 {manifest_path}")
+    manifest_path = confined_path(JOB, "manifest.json")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     STATE["run_id"] = manifest.get("_run_id")
     save()
     check_cancel()
+    jobs = manifest.get("jobs") or []
+    for job in jobs:
+        jid = job["id"]
+        if not isinstance(jid, str) or not JOB_ID.fullmatch(jid):
+            raise ValueError("遠端 manifest 含有不合法的任務 ID")
 
     pins = load_pins(manifest)
     plugin = get_model_plugin(manifest.get("model"))
@@ -621,10 +621,9 @@ def run_batch():
     has_pe = any(bool(j.get("refine_prompt", manifest.get("refine_prompt", False))) for j in (manifest.get("jobs") or []))
     start_comfy(has_pe=has_pe)
 
-    OUT.mkdir(parents=True, exist_ok=True)
-    WORK.mkdir(parents=True, exist_ok=True)
+    confined_path(JOB, OUT.name, directory=True, missing_ok=True).mkdir(exist_ok=True)
+    confined_path(JOB, WORK.name, directory=True, missing_ok=True).mkdir(exist_ok=True)
 
-    jobs = manifest.get("jobs") or []
     log(f"batch: starting {len(jobs)} job(s)", "running")
 
     for idx, job in enumerate(jobs, 1):
@@ -660,8 +659,9 @@ def run_batch():
                     )
                 log(f"job {jid}: prompt enhanced ({len(refined_text)} chars)")
 
-            out_file = OUT / f"{jid}.png"
-            collect_output_image(h, out_file)
+            out_file = confined_path(JOB, f"{OUT.name}/{jid}.png", missing_ok=True)
+            save_node = next(nid for nid, node in graph.items() if node["class_type"] == "SaveImage")
+            collect_output_image(h, out_file, save_node=save_node, prefix=graph[save_node]["inputs"]["filename_prefix"])
             sha256 = hashlib.sha256(out_file.read_bytes()).hexdigest()
             elapsed = round(time.time() - t_job, 2)
 
