@@ -57,7 +57,7 @@ class ModelDownloadTests(unittest.TestCase):
         return SimpleNamespace(stdout="download log\nCSTUDIO_MODEL " + json.dumps(str(candidate)))
 
     def download(self, pins):
-        remote.download_models([(REPO, FILE, FOLDER)], pins)
+        return remote.download_models([(REPO, FILE, FOLDER)], pins)
 
     def assert_no_staging_files(self):
         self.assertEqual(list(self.models.rglob(".cstudio-model-*")), [])
@@ -188,9 +188,13 @@ class ModelDownloadTests(unittest.TestCase):
         legacy = self.models / "unet" / self.dest.name
         legacy.parent.mkdir()
         legacy.write_bytes(BAD)
-        self.download(pins_for(NEW))
+        provenance = self.download(pins_for(NEW))
         self.transfer.assert_called_once()
         self.assertEqual(legacy.read_bytes(), NEW)
+        self.assertEqual(provenance[(REPO, FILE, FOLDER)], {
+            "repo": REPO, "file": FILE, "path": f"models/unet/{legacy.name}",
+            "bytes": len(NEW), "sha256": hashlib.sha256(NEW).hexdigest(), "revision": REVISION,
+        })
 
     def test_pinned_mode_requires_a_valid_digest_for_each_requested_file(self):
         pins = pins_for(OLD)

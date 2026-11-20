@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 
 if __package__:
-    from .job_paths import SHA256, bundle_digest, confined_path
+    from .job_paths import SHA256, bundle_digest, confined_path, file_sha256
     from .status import (
         _active_run, _cancel_unstarted, _file_lock, _legacy_status, _legacy_worker_alive,
         _mkdir, _read_object, _read_run_status, _run_dir, _write_object,
@@ -50,16 +50,11 @@ def _publish_bundle(root: Path, bundle_hash: str, names: list[str], files: dict[
     return bundle
 
 
-def _file_sha(path: Path) -> str:
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
-
-
 def _missing_inputs(job: Path, inputs: dict[str, str], folder: str) -> list[str]:
     missing = []
     for name, expected in inputs.items():
         path = confined_path(job, f"{folder}/{name}", missing_ok=True)
-        if not path.is_file() or _file_sha(path) != expected:
+        if not path.is_file() or file_sha256(path) != expected:
             missing.append(name)
     return missing
 
@@ -82,7 +77,7 @@ def _seal_inputs(job: Path, inputs: dict[str, str]) -> list[str]:
             dest = confined_path(staged, name, missing_ok=True)
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, dest)
-            if _file_sha(dest) != expected:
+            if file_sha256(dest) != expected:
                 missing.append(name)
         if not missing:
             staged.replace(sealed)
@@ -112,7 +107,7 @@ def _worker_conflict(root: Path, active: str | None, busy: bool) -> str | None:
 
 def _launch_worker(root: Path, job: Path, run_id: str, request: dict, bundle: Path, lease: int) -> dict:
     manifest = confined_path(job, "manifest.json")
-    if _file_sha(manifest) != request["manifest_sha256"]:
+    if file_sha256(manifest) != request["manifest_sha256"]:
         raise RuntimeError("遠端 manifest 與已登記的批次不符")
     missing = _seal_inputs(job, request["input_shas"])
     bundle_hash = request["bundle_hash"]

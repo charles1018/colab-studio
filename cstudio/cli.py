@@ -194,9 +194,10 @@ def main():
     p_run.add_argument("--stop-after", action="store_true", help="完成後立即關閉 Colab GPU")
     p_run.add_argument("--force", action="store_true", help="忽略指紋快取，強制重新生成所有項目")
     p_run.add_argument("--remake-stale", action="store_true", help="重新生成已變更/過期的項目（舊檔移至 out/_stale/）")
-    p_run.add_argument("--no-fingerprint", action="store_true", help="只檢查檔案是否存在，不比對指紋")
-    p_run.add_argument("--no-pin-versions", action="store_true", help="不釘選 ComfyUI 與節點 commit")
-    p_run.add_argument("--no-pin-models", action="store_true", help="略過 Hugging Face 模型的 revision、大小與 SHA-256 釘選")
+    p_run.add_argument("--no-fingerprint", action="store_true", help="略過生成指紋比對，仍驗證記有摘要的本機圖")
+    for parser in (p_plan, p_run):
+        parser.add_argument("--no-pin-versions", action="store_true", help="不釘選 ComfyUI 與節點 commit")
+        parser.add_argument("--no-pin-models", action="store_true", help="略過 Hugging Face 模型的 revision、大小與 SHA-256 釘選")
     p_run.add_argument("--assign-retries", type=int, default=5)
     p_run.add_argument("--assign-wait", type=int, default=120)
 
@@ -243,7 +244,8 @@ def main():
     elif args.cmd == "login":
         L.handle_login(args.action, args.auth_code)
     elif args.cmd == "plan":
-        R.plan_batch(args.manifest, gpu=args.gpu, cli_quant=args.quant)
+        R.plan_batch(args.manifest, gpu=args.gpu, cli_quant=args.quant,
+                     pin_versions=not args.no_pin_versions, pin_models=not args.no_pin_models)
     elif args.cmd == "run":
         try:
             R.run_manifest(

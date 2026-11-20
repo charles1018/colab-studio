@@ -196,10 +196,14 @@ class ServiceTests(unittest.TestCase):
         self.enterContext(patch.multiple(
             remote, COMFY=self.comfy, COMFY_PROCESS=self.marker, COMFY_LOG=self.log,
             STATE={"gpu_info": {"vram_gib": 24}}, COMFY_URL=remote.DEFAULT_COMFY_URL,
-            log=Mock(), call=self.call, _comfy_argv=self.probe, _owns_comfy_process=self.owns,
+            log=Mock(), call=self.call, _comfy_system=self.probe_system, _owns_comfy_process=self.owns,
             _comfy_listener_sockets=Mock(return_value={"fixture-socket"}), _process_has_listener=self.listener,
         ))
         self.spawn = self.enterContext(patch.object(remote.subprocess, "Popen"))
+
+    def probe_system(self):
+        args = self.probe()
+        return None if args is None else {"args": args, "versions": {}}
 
     def test_matching_owned_service_is_reused(self):
         remote._write_record(self.marker, self.record)
@@ -291,13 +295,13 @@ class ServiceTests(unittest.TestCase):
 class ServiceProbeTests(unittest.TestCase):
     def test_only_explicit_refusal_counts_as_absent(self):
         with patch.object(remote, "call", side_effect=urllib.error.URLError(ConnectionRefusedError())):
-            self.assertIsNone(remote._comfy_argv())
+            self.assertIsNone(remote._comfy_system())
         with patch.object(remote, "call", side_effect=urllib.error.URLError(TimeoutError())):
             with self.assertRaises(urllib.error.URLError):
-                remote._comfy_argv()
+                remote._comfy_system()
         with patch.object(remote, "call", return_value={"system": {}}):
             with self.assertRaisesRegex(RuntimeError, "啟動參數"):
-                remote._comfy_argv()
+                remote._comfy_system()
 
     @unittest.skipUnless(hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"), "requires Linux pidfds")
     def test_local_http_process_is_reused_then_restarted_with_verified_socket(self):
@@ -315,7 +319,9 @@ class ServiceProbeTests(unittest.TestCase):
             "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
             "class Handler(BaseHTTPRequestHandler):\n"
             "    def do_GET(self):\n"
-            "        data = {'system': {'argv': sys.argv}} if self.path == '/system_stats' else {\n"
+            "        system = {'argv': sys.argv, 'comfyui_version': 'fixture', 'python_version': sys.version,\n"
+            "                  'pytorch_version': 'fixture+cu', 'ram_free': 42}\n"
+            "        data = {'system': system} if self.path == '/system_stats' else {\n"
             "            'queue_running': [], 'queue_pending': []}\n"
             "        self.send_response(200)\n"
             "        self.end_headers()\n"
@@ -345,11 +351,15 @@ class ServiceProbeTests(unittest.TestCase):
             COMFY_URL=f"http://127.0.0.1:{port}", time=clock, log=Mock(), STATE={"gpu_info": {"vram_gib": 24}},
         ), patch.object(subprocess, "Popen", side_effect=launch), \
              patch.object(remote.urllib.request, "urlopen", side_effect=lambda req, **kw: opener.open(req, **kw)):
-            remote.start_comfy(environment="fixture")
+            running = remote.start_comfy(environment="fixture")
+            self.assertEqual(running["versions"], {
+                "comfyui_version": "fixture", "python_version": sys.version, "pytorch_version": "fixture+cu",
+            })
+            self.assertTrue(running["verified"])
             remote.start_comfy(environment="fixture")
             self.assertEqual(len(children), 1)
-            self.assertIn("--gpu-only", remote._comfy_argv())
+            self.assertIn("--gpu-only", running["args"])
             remote.start_comfy(True, environment="fixture")
             self.assertEqual(len(children), 2)
             self.assertEqual(children[0].wait(timeout=5), -signal.SIGTERM)
-            self.assertNotIn("--gpu-only", remote._comfy_argv())
+            self.assertNotIn("--gpu-only", remote._comfy_system()["args"])

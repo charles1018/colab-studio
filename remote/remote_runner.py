@@ -34,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cancel import CANCEL_PROTOCOL, cancel_marker  # noqa: E402
-from job_paths import JOB_ID, confined_path  # noqa: E402
+from job_paths import JOB_ID, SHA256, confined_path, file_sha256  # noqa: E402
 from models import get_model_plugin  # noqa: E402
 
 JOB = Path(os.environ.get("CSTUDIO_DIR", "/content/cstudio"))
@@ -331,8 +331,13 @@ def install(pins: dict | None = None) -> str:
         if packages is None:
             raise RuntimeError("安裝後的 Python 依賴仍未符合 versions.json 與 requirements.txt")
 
-    environment = {"python": [sys.executable, sys.version], "heads": heads, "packages": packages}
+    environment = {
+        "python": [sys.executable, sys.version], "heads": heads, "packages": packages,
+        "torch": getattr(torch, "__version__", None),
+        "torch_cuda": getattr(getattr(torch, "version", None), "cuda", None),
+    }
     signature = hashlib.sha256(json.dumps(environment, sort_keys=True).encode()).hexdigest()
+    STATE["environment"] = environment
     record = {"schema": 2, "environment": environment, "signature": signature}
     if _read_record(MARK) == record:
         log("install: verified cached environment")
@@ -451,7 +456,17 @@ def _publish_model(staged: Path, dest: Path, pin: dict | None):
     _save_model_verification(dest, pin, published)
 
 
-def download_models(files: list[tuple[str, str, str]], pins: dict | None = None):
+def _prepared_model(repo: str, name: str, dest: Path, pin: dict | None) -> dict:
+    info = dest.stat()
+    record = {"repo": repo, "file": name, "path": dest.relative_to(COMFY).as_posix(), "bytes": info.st_size}
+    if pin is None:
+        record["mtime_ns"] = info.st_mtime_ns
+    else:
+        record.update(revision=pin["revision"], sha256=pin["sha256"])
+    return record
+
+
+def download_models(files: list[tuple[str, str, str]], pins: dict | None = None) -> dict:
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
     pin_idx = _model_pin_index(pins)
@@ -465,6 +480,7 @@ def download_models(files: list[tuple[str, str, str]], pins: dict | None = None)
         "print('CSTUDIO_MODEL ' + json.dumps(path))\n"
     )
 
+    prepared = {}
     for i, (repo, name, folder) in enumerate(files, 1):
         check_cancel()
         dest = COMFY / "models" / folder / Path(name).name
@@ -485,7 +501,8 @@ def download_models(files: list[tuple[str, str, str]], pins: dict | None = None)
                 dest = legacy_unet
 
         if _model_cached(dest, pin):
-            log(f"models [{i}/{len(files)}]: cached {dest.name} ({dest.stat().st_size / 1e9:.2f} GB)")
+            record = prepared[(repo, name, folder)] = _prepared_model(repo, name, dest, pin)
+            log(f"models [{i}/{len(files)}]: cached {dest.name} ({record['bytes'] / 1e9:.2f} GB)")
             continue
 
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -525,8 +542,10 @@ def download_models(files: list[tuple[str, str, str]], pins: dict | None = None)
                 staged = Path(tmp) / "model.part"
                 _stage_model(got, staged, keep_source=pin is None)
                 _publish_model(staged, dest, pin)
-        log(f"models [{i}/{len(files)}]: ready {dest.name} ({dest.stat().st_size / 1e9:.2f} GB)")
+        record = prepared[(repo, name, folder)] = _prepared_model(repo, name, dest, pin)
+        log(f"models [{i}/{len(files)}]: ready {dest.name} ({record['bytes'] / 1e9:.2f} GB)")
         check_cancel()
+    return prepared
 
 
 # ---------------------------------------------------------------- 3 ComfyUI HTTP API
@@ -593,7 +612,7 @@ def cancel_prompts():
         raise CancellationUnconfirmed(f"無法確認 ComfyUI 已停止此批次的 prompt{detail}")
 
 
-def _comfy_argv() -> list[str] | None:
+def _comfy_system() -> dict | None:
     try:
         stats = call(COMFY_URL + "/system_stats", timeout=5)
     except urllib.error.URLError as exc:
@@ -604,7 +623,11 @@ def _comfy_argv() -> list[str] | None:
     argv = system.get("argv") if isinstance(system, dict) else None
     if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) for arg in argv):
         raise RuntimeError("無法確認正在執行的 ComfyUI 啟動參數")
-    return argv
+    versions = {
+        key: system[key] for key in ("comfyui_version", "python_version", "pytorch_version")
+        if isinstance(system.get(key), str) and system[key]
+    }
+    return {"args": argv, "versions": versions}
 
 
 def _owns_comfy_process(record: dict) -> bool:
@@ -692,14 +715,14 @@ def _stop_owned_comfy(record: dict):
             raise RuntimeError("未確認 ComfyUI 程序已停止")
     finally:
         os.close(pidfd)
-    if _comfy_argv() is not None:
+    if _comfy_system() is not None:
         raise RuntimeError("ComfyUI 端點已有其他服務，請確認後重試")
 
 
 def _stop_comfy_for_install():
     record = _read_record(COMFY_PROCESS) or {}
     owned = _owns_comfy_process(record)
-    if _comfy_argv() is None:
+    if _comfy_system() is None:
         if owned:
             raise RuntimeError("Studio 的 ComfyUI 程序尚未可用，請稍後重試安裝")
         return
@@ -708,7 +731,7 @@ def _stop_comfy_for_install():
     _stop_owned_comfy(record)
 
 
-def start_comfy(has_pe: bool = False, *, environment: str):
+def start_comfy(has_pe: bool = False, *, environment: str) -> dict:
     check_cancel()
     port = _comfy_loopback_port()
     if port is None:
@@ -717,20 +740,20 @@ def start_comfy(has_pe: bool = False, *, environment: str):
     vram_gib = (STATE.get("gpu_info") or {}).get("vram_gib") or 0
     vram_flags = ["--gpu-only"] if (vram_gib >= 20 and not has_pe) else []
     argv = [str(COMFY.resolve() / "main.py"), "--listen", "127.0.0.1", "--port", str(port), "--disable-auto-launch", *vram_flags]
-    running = _comfy_argv()
+    running = _comfy_system()
     record = _read_record(COMFY_PROCESS) or {}
     owned = _owns_comfy_process(record)
     if running is not None:
         if owned:
             proc = Path("/proc") / str(record["pid"])
             if _process_has_listener(proc, _comfy_listener_sockets()):
-                if running == argv and record.get("environment") == environment:
+                if running["args"] == argv and record.get("environment") == environment:
                     log("comfy: verified running environment and launch arguments")
-                    return
+                    return dict(running, verified=True)
             _stop_owned_comfy(record)
-        elif running in (argv, ["main.py", *argv[1:]]) and _legacy_comfy_checkout():
+        elif running["args"] in (argv, ["main.py", *argv[1:]]) and _legacy_comfy_checkout():
             log("comfy: verified existing checkout path and launch arguments")
-            return
+            return dict(running, verified=False)
         else:
             raise RuntimeError("既有 ComfyUI 路徑或啟動參數不符，Studio 無法確認程序由自己啟動")
     elif owned:
@@ -754,15 +777,15 @@ def start_comfy(has_pe: bool = False, *, environment: str):
         if process.poll() is not None:
             break
         try:
-            running = _comfy_argv()
+            running = _comfy_system()
         except (OSError, ComfyHTTPError):
             running = None
         if running is not None:
             proc = Path("/proc") / str(process.pid)
-            if running != argv or not _process_has_listener(proc, _comfy_listener_sockets()):
+            if running["args"] != argv or not _process_has_listener(proc, _comfy_listener_sockets()):
                 raise RuntimeError("ComfyUI 啟動後的程序或參數與預期不符")
             log("comfy: ready")
-            return
+            return dict(running, verified=True)
         time.sleep(2)
     tail = COMFY_LOG.read_text(errors="ignore")[-2000:]
     raise RuntimeError("ComfyUI did not become ready:\n" + tail)
@@ -915,7 +938,7 @@ def wait_history(pid: str, timeout: int, what: str) -> dict:
     raise RuntimeError(f"{what}: 超過 {timeout} 秒未完成")
 
 
-def stage_input_image(rel_path: str, job_id: str, idx: int) -> str:
+def stage_input_image(rel_path: str, job_id: str, idx: int, *, expected_sha: str | None = None) -> str:
     """Copy a verified reference from this run into ComfyUI's input directory."""
     input_root = confined_path(JOB, "inputs", directory=True)
     src = confined_path(input_root, rel_path)
@@ -924,7 +947,12 @@ def stage_input_image(rel_path: str, job_id: str, idx: int) -> str:
     safe_name = f"{prefix}_in{idx}{ext}"
     dest = confined_path(COMFY, f"input/{safe_name}", missing_ok=True)
     dest.parent.mkdir(exist_ok=True)
-    shutil.copy2(src, dest)
+    with tempfile.TemporaryDirectory(dir=dest.parent, prefix=".cstudio-reference-") as directory:
+        staged = Path(directory) / safe_name
+        shutil.copy2(src, staged)
+        if expected_sha is not None and file_sha256(staged) != expected_sha:
+            raise RuntimeError(f"ComfyUI 參考圖與此批次的 SHA-256 不符：{rel_path}")
+        staged.replace(dest)
     return safe_name
 
 
@@ -971,13 +999,29 @@ def collect_output_image(history_entry: dict, dest_path: Path, *, save_node: str
 # ---------------------------------------------------------------- 4 main batch execution
 def run_batch():
     manifest_path = confined_path(JOB, "manifest.json")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
     if MANAGED_RUN_ID and manifest.get("_run_id") != MANAGED_RUN_ID:
         raise RuntimeError("遠端 manifest 與執行中的批次不符")
     STATE["run_id"] = manifest.get("_run_id")
     save()
     check_cancel()
     jobs = manifest.get("jobs") or []
+    report_execution = manifest.get("_fingerprint_version") == 2
+    input_shas = {}
+    if MANAGED_RUN_ID:
+        request = _read_record(confined_path(JOB, "request.json")) or {}
+        if (
+            request.get("bundle_hash") != STATE.get("bundle_hash")
+            or request.get("manifest_sha256") != hashlib.sha256(manifest_bytes).hexdigest()
+            or not isinstance(request.get("input_shas"), dict)
+        ):
+            raise RuntimeError("遠端批次與啟動時驗證的 manifest 或程式版本不符")
+        input_shas = request["input_shas"]
+        for image in {rel for job in jobs for rel in job.get("inputs") or []}:
+            digest = input_shas.get(image)
+            if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+                raise RuntimeError("遠端批次缺少已驗證的參考圖摘要")
     for job in jobs:
         jid = job["id"]
         if not isinstance(jid, str) or not JOB_ID.fullmatch(jid):
@@ -994,12 +1038,12 @@ def run_batch():
 
     # 2. Download required models for this batch
     req_models = plugin.required_models_for_batch(manifest, cli_quant=cli_quant)
-    download_models(req_models, pins=pins if pin_models else None)
+    prepared_models = download_models(req_models, pins=pins if pin_models else None)
     check_cancel()
 
     # 3. Start ComfyUI
     has_pe = any(bool(j.get("refine_prompt", manifest.get("refine_prompt", False))) for j in (manifest.get("jobs") or []))
-    start_comfy(has_pe=has_pe, environment=environment)
+    comfy = start_comfy(has_pe=has_pe, environment=environment)
 
     confined_path(JOB, OUT.name, directory=True, missing_ok=True).mkdir(exist_ok=True)
     confined_path(JOB, WORK.name, directory=True, missing_ok=True).mkdir(exist_ok=True)
@@ -1017,7 +1061,7 @@ def run_batch():
         try:
             staged_inputs: list[str] = []
             for i_in, rel_in in enumerate(job.get("inputs") or [], 1):
-                staged_inputs.append(stage_input_image(rel_in, jid, i_in))
+                staged_inputs.append(stage_input_image(rel_in, jid, i_in, expected_sha=input_shas.get(rel_in)))
 
             graph = plugin.build_qwen21_graph(
                 job,
@@ -1044,7 +1088,7 @@ def run_batch():
 
             out_file = confined_path(JOB, f"{OUT.name}/{jid}.png", missing_ok=True)
             collect_output_image(h, out_file, save_node=save_node, prefix=graph[save_node]["inputs"]["filename_prefix"])
-            sha256 = hashlib.sha256(out_file.read_bytes()).hexdigest()
+            sha256 = file_sha256(out_file)
             elapsed = round(time.time() - t_job, 2)
 
             job_rec = {
@@ -1059,6 +1103,14 @@ def run_batch():
             }
             if refined_text is not None:
                 job_rec["refined_prompt"] = refined_text
+            if report_execution:
+                job_models = plugin.required_models_for_batch(dict(manifest, jobs=[job]), cli_quant=cli_quant)
+                job_rec["execution"] = {
+                    "pin_versions": pins is not None, "pin_models": pin_models,
+                    "environment": STATE["environment"], "gpu": STATE["gpu_info"], "comfy": comfy,
+                    "models": [prepared_models[model] for model in job_models],
+                    "fitted_models": FITTED.get(pid, []),
+                }
             STATE["jobs"][jid] = job_rec
             save()
             log(f"job [{idx}/{len(jobs)}] {jid}: done in {elapsed:.1f}s -> {out_file.name}")

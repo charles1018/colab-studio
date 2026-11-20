@@ -10,7 +10,7 @@ from pathlib import Path
 
 from filelock import FileLock
 
-from remote.job_paths import SHA256, confined_path
+from remote.job_paths import SHA256, confined_path, file_sha256, json_digest
 
 
 def read_object(path: Path) -> dict:
@@ -60,10 +60,44 @@ def verify_receipt(jid: str, info: dict):
 
 
 def matches_image(path: Path, info: dict) -> bool:
-    if not path.is_file() or path.stat().st_size != info["bytes"]:
-        return False
-    with path.open("rb") as image:
-        return hashlib.file_digest(image, "sha256").hexdigest() == info["sha256"]
+    return path.is_file() and path.stat().st_size == info["bytes"] and file_sha256(path) == info["sha256"]
+
+
+def execution_digest(fingerprint: str, execution, *, pin_versions: bool, pin_models: bool) -> str:
+    if (
+        not isinstance(execution, dict)
+        or execution.get("pin_versions") is not pin_versions or execution.get("pin_models") is not pin_models
+        or not isinstance(execution.get("environment"), dict)
+        or not isinstance(execution.get("gpu"), dict) or not execution["gpu"].get("name")
+        or not isinstance(execution.get("comfy"), dict)
+        or type(execution["comfy"].get("verified")) is not bool
+        or not isinstance(execution["comfy"].get("args"), list) or not execution["comfy"]["args"]
+        or any(not isinstance(arg, str) for arg in execution["comfy"]["args"])
+        or not isinstance(execution["comfy"].get("versions"), dict)
+        or not isinstance(execution.get("models"), list) or not execution["models"]
+        or not isinstance(execution.get("fitted_models"), list)
+        or (pin_models and execution["fitted_models"])
+    ):
+        raise ValueError("遠端成果缺少與批次相符的執行環境紀錄")
+    environment = execution["environment"]
+    if (
+        not isinstance(environment.get("python"), list) or len(environment["python"]) != 2
+        or not isinstance(environment.get("heads"), dict) or not environment["heads"]
+        or not isinstance(environment.get("packages"), dict)
+    ):
+        raise ValueError("遠端成果缺少有效的 Python、套件或 Git 版本紀錄")
+    for model in execution["models"]:
+        if (
+            not isinstance(model, dict)
+            or not all(isinstance(model.get(key), str) and model[key] for key in ("repo", "file", "path"))
+            or type(model.get("bytes")) is not int or model["bytes"] <= 0
+            or (pin_models and (
+                not is_sha256(model.get("sha256"))
+                or not isinstance(model.get("revision"), str) or not model["revision"]
+            ))
+        ):
+            raise ValueError("遠端成果缺少有效的模型檔案紀錄")
+    return json_digest({"schema": 2, "request": fingerprint, "execution": execution})
 
 
 def _copy_image(source: Path, dest: Path):
@@ -99,8 +133,16 @@ class RunOutputs:
 
     def _verified_record(self, jid: str, info: dict) -> dict:
         verify_receipt(jid, info)
-        return dict(info, run_id=self.run_id, bundle_hash=self.request["bundle_hash"],
-                    fingerprint=self.request["jobs"][jid]["fingerprint"], local_synced=True)
+        fingerprint = self.request["jobs"][jid]["fingerprint"]
+        record = dict(info, run_id=self.run_id, bundle_hash=self.request["bundle_hash"],
+                      fingerprint=fingerprint, local_synced=True)
+        if self.request["schema"] == 2:
+            record["fingerprint_version"] = 2
+            record["execution_fingerprint"] = execution_digest(
+                fingerprint, info.get("execution"), pin_versions=self.request["pin_versions"],
+                pin_models=self.request["pin_models"],
+            )
+        return record
 
     def published(self, jid: str, results: dict) -> bool:
         info = results["jobs"].get(jid)

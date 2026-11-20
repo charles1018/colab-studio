@@ -39,6 +39,7 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.on_stop = Mock()
         self.reservations = []
         self.commands = []
+        self.uploaded = {}
         self.real_colab = C.colab
         self.status = Mock(return_value=self.done_status())
         self.bundle_hash = R.compute_remote_bundle_hash()
@@ -101,6 +102,7 @@ class RuntimeAllocationTests(unittest.TestCase):
             Path(args[-1]).write_bytes(self.image_bytes)
             return ""
         if command == "upload":
+            self.uploaded[args[-1]] = Path(args[-2]).read_bytes()
             return ""
         raise AssertionError(f"Unexpected Colab operation: {command}")
 
@@ -113,6 +115,17 @@ class RuntimeAllocationTests(unittest.TestCase):
                 "status": "done", "file": "out/test.png",
                 "bytes": len(self.image_bytes),
                 "sha256": hashlib.sha256(self.image_bytes).hexdigest(),
+                "execution": {
+                    "pin_versions": True, "pin_models": True,
+                    "environment": {"python": ["/fixture/python", "3.12"],
+                                    "heads": {"ComfyUI": "fixture-commit"}, "packages": {"torch": "2.7"}},
+                    "gpu": {"name": "fixture"},
+                    "comfy": {"args": ["main.py"], "verified": True,
+                              "versions": {"comfyui_version": "1", "python_version": "3.12", "pytorch_version": "2.7"}},
+                    "models": [{"repo": "fixture", "file": "model.gguf", "path": "models/unet/model.gguf",
+                                "bytes": 500, "sha256": "1" * 64, "revision": "2" * 40}],
+                    "fitted_models": [],
+                },
             }},
         }
 
@@ -393,6 +406,7 @@ class RuntimeAllocationTests(unittest.TestCase):
 
     def test_upload_is_limited_to_the_declared_nested_input(self):
         ref = self.edit_reference()
+        self.on_allocate.side_effect = lambda: ref.write_bytes(b"changed after staging")
         C.remote_exec.side_effect = lambda *_args, **_opts: (
             self.prep_reply(state="prepared", missing_inputs=["inputs/style/ref.png"])
             if C.remote_exec.call_count == 1 else self.prep_reply()
@@ -401,9 +415,30 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.assertEqual(result["jobs"]["test"]["status"], "done")
         args, = [call.args for call in C.colab.call_args_list if call.args[0] == "upload"]
         run_dir = f"/content/cstudio/runs/{result['run_id']}"
-        self.assertEqual(args, ("upload", "-s", self.session, ref, f"{run_dir}/uploads/inputs/style/ref.png"))
+        remote_ref = f"{run_dir}/uploads/inputs/style/ref.png"
+        self.assertEqual(args[:3], ("upload", "-s", self.session))
+        self.assertEqual(args[-1], remote_ref)
+        self.assertNotEqual(args[-2], ref)
+        self.assertFalse(args[-2].exists())
+        self.assertEqual(self.uploaded, {remote_ref: b"fixture"})
+        self.assertEqual(ref.read_bytes(), b"changed after staging")
         download, = [call.args for call in C.colab.call_args_list if call.args[0] == "download"]
         self.assertEqual(download[-2], f"{run_dir}/out/test.png")
+
+    def test_reference_modified_before_snapshot_fails_before_allocating(self):
+        ref = self.edit_reference()
+        reference_hashes = R._reference_hashes
+
+        def hash_then_edit(*args):
+            hashes = reference_hashes(*args)
+            ref.write_bytes(b"changed before snapshot")
+            return hashes
+
+        with patch.object(R, "_reference_hashes", side_effect=hash_then_edit):
+            with self.assertRaisesRegex(RuntimeError, "參考圖在批次準備期間已變更"):
+                self.run_manifest()
+        self.assertNotIn("new", self.commands)
+        self.assertNotIn("upload", self.commands)
 
     def test_unexpected_remote_upload_path_stops_before_upload_or_worker_launch(self):
         self.edit_reference()
@@ -716,6 +751,143 @@ with outputs.lock():
         self.assertIn("識別不符", report["errors"]["test"])
         self.assertFalse((self.result_path.parent / "test.png").exists())
         self.assertFalse((self.result_path.parent / ".runs" / run_id / ".result-test.json").exists())
+
+    def test_pinned_resume_verifies_execution_and_picture_without_colab(self):
+        original = self.run_manifest()
+        saved = original["jobs"]["test"]
+        self.assertEqual(saved["fingerprint_version"], 2)
+        self.assertEqual(saved["execution"]["environment"]["packages"]["torch"], "2.7")
+        self.assertNotEqual(saved["fingerprint"], saved["execution_fingerprint"])
+        self.commands.clear()
+        with patch.object(C, "token_ok", return_value=False) as token:
+            self.assertEqual(self.run_manifest(), original)
+        self.assertEqual(self.commands, [])
+        token.assert_not_called()
+
+        manifest = json.loads(self.manifest.read_text())
+        for changes in ({"gpu": "A100"}, {"pin_versions": False}, {"pin_models": False}, {"bundle_hash": "0" * 64}):
+            with self.subTest(changes=changes):
+                fingerprints, _, done, stale = R.classify_jobs(manifest, self.directory, **changes)
+                self.assertNotEqual(fingerprints["test"], saved["fingerprint"])
+                self.assertFalse(done)
+                self.assertIn("執行設定已變更", stale[0][1])
+
+        saved["execution"]["environment"]["packages"]["torch"] = "changed"
+        self.result_path.write_text(json.dumps(original))
+        _, _, done, stale = R.classify_jobs(manifest, self.directory)
+        self.assertFalse(done)
+        self.assertEqual(stale, [("test", "本機成果的執行環境指紋不符")])
+
+    def test_execution_fingerprint_changes_with_actual_environment_and_fitted_paths(self):
+        original = self.run_manifest()["jobs"]["test"]
+        snapshot = self.done_status()
+        actual = snapshot["jobs"]["test"]["execution"]
+        actual["environment"]["packages"]["torch"] = "2.8"
+        actual["models"][0]["path"] = "models/diffusion_models/model.gguf"
+        self.status.return_value = snapshot
+        changed = self.run_manifest(force=True)["jobs"]["test"]
+        self.assertEqual(changed["fingerprint"], original["fingerprint"])
+        self.assertNotEqual(changed["execution_fingerprint"], original["execution_fingerprint"])
+        self.assertEqual(changed["execution"], actual)
+        actual["pin_models"] = False
+        unfitted = self.run_manifest(force=True, pin_models=False)["jobs"]["test"]
+        actual["fitted_models"] = [["10", "unet_name", "model.gguf", "other/model.gguf"]]
+        fitted = self.run_manifest(force=True, pin_models=False)["jobs"]["test"]
+        self.assertEqual(fitted["fingerprint"], unfitted["fingerprint"])
+        self.assertNotEqual(fitted["execution_fingerprint"], unfitted["execution_fingerprint"])
+
+    def test_resume_detects_same_size_output_changes_even_with_no_fingerprint(self):
+        original = self.run_manifest()["jobs"]["test"]
+        output = self.result_path.with_name("test.png")
+        changed = b"z" * original["bytes"]
+        output.write_bytes(changed)
+        self.commands.clear()
+        for use_fingerprint in (True, False):
+            with self.subTest(use_fingerprint=use_fingerprint):
+                with self.assertRaisesRegex(RuntimeError, "大小或 SHA-256 已變更"):
+                    self.run_manifest(use_fingerprint=use_fingerprint)
+                self.assertEqual(self.commands, [])
+                self.assertEqual(output.read_bytes(), changed)
+
+        reworked = self.run_manifest(remake_stale=True, stop_after=True)
+        self.assertEqual(output.read_bytes(), self.image_bytes)
+        self.assertEqual(reworked["shutdown_state"], C.ReleaseState.CONFIRMED)
+        self.assertEqual((output.parent / "_stale" / f"test_{reworked['run_id']}.png").read_bytes(), changed)
+
+    def test_unpinned_output_requires_explicit_reuse_even_when_request_matches(self):
+        snapshot = self.done_status()
+        actual = snapshot["jobs"]["test"]["execution"]
+        actual.update(pin_versions=False, pin_models=False)
+        actual["models"][0].pop("sha256")
+        self.status.return_value = snapshot
+        with patch.object(R, "bundle_and_launch_code", wraps=R.bundle_and_launch_code) as prepare:
+            original = self.run_manifest(pin_versions=False)
+        sent = json.loads(prepare.call_args.args[2])
+        self.assertFalse(sent["_pin_versions"])
+        self.assertFalse(sent["_pin_models"])
+        self.assertEqual(original["jobs"]["test"]["execution"], actual)
+        self.commands.clear()
+        with self.assertRaisesRegex(RuntimeError, "執行環境未完整釘選或驗證"):
+            self.run_manifest(pin_versions=False)
+        self.assertEqual(self.run_manifest(pin_versions=False, use_fingerprint=False), original)
+        self.assertEqual(self.commands, [])
+
+    def test_recovery_accepts_pre_upgrade_request_without_execution_receipt(self):
+        self.status.return_value = {"done": True, "alive": False, "jobs": {}}
+        run_id = self.run_manifest()["run_id"]
+        request_path = self.result_path.parent / ".runs" / run_id / "request.json"
+        request = json.loads(request_path.read_text())
+        request["schema"] = 1
+        request.pop("pin_versions")
+        request.pop("pin_models")
+        manifest = json.loads(self.manifest.read_text())
+        job = manifest["jobs"][0]
+        request["jobs"]["test"]["fingerprint"] = R.compute_job_fingerprint(
+            job, manifest, self.directory, versions=R.load_versions(),
+        )
+        request_path.write_text(json.dumps(request))
+        snapshot = self.done_status()
+        snapshot["jobs"]["test"].pop("execution")
+        self.status.return_value = snapshot
+        self.assertEqual(R.recover_outputs(self.manifest, run_id)["synced"], ["test"])
+        self.assertEqual(R.plan_batch(self.manifest)["legacy"], ["test"])
+        self.assertNotIn("execution_fingerprint", json.loads(self.result_path.read_text())["jobs"]["test"])
+
+    def test_legacy_output_without_digest_requires_explicit_reuse(self):
+        self.result_path.parent.mkdir()
+        self.result_path.with_name("test.png").write_bytes(self.image_bytes)
+        manifest = json.loads(self.manifest.read_text())
+        fingerprint = R.compute_job_fingerprint(
+            manifest["jobs"][0], manifest, self.directory, versions=R.load_versions(),
+        )
+        record = {"jobs": {"test": {"fingerprint": fingerprint, "status": "done"}}}
+        self.result_path.write_text(json.dumps(record))
+        plan = R.plan_batch(self.manifest)
+        self.assertEqual(plan["stale"], [("test", "舊成果缺少大小與 SHA-256 紀錄")])
+        self.assertEqual(self.run_manifest(use_fingerprint=False), record)
+        self.assertEqual(self.commands, [])
+
+    def test_verified_image_without_full_serving_versions_cannot_auto_resume(self):
+        snapshot = self.done_status()
+        del snapshot["jobs"]["test"]["execution"]["comfy"]["versions"]["pytorch_version"]
+        self.status.return_value = snapshot
+        saved = self.run_manifest()
+        self.assertTrue(saved["jobs"]["test"]["local_synced"])
+        self.commands.clear()
+        with self.assertRaisesRegex(RuntimeError, "ComfyUI 未回報完整版本"):
+            self.run_manifest()
+        self.assertEqual(self.run_manifest(use_fingerprint=False), saved)
+        self.assertEqual(self.commands, [])
+
+    def test_new_run_cannot_publish_a_receipt_without_matching_execution(self):
+        snapshot = self.done_status()
+        info = snapshot["jobs"]["test"]
+        info["execution"]["pin_models"] = False
+        self.status.return_value = snapshot
+        result = self.run_manifest()
+        self.assertIn("缺少與批次相符的執行環境紀錄", result["job_errors"]["test"]["error"])
+        self.assertNotIn("download", self.commands)
+        self.assertFalse(self.result_path.with_name("test.png").exists())
 
     def test_confirmed_cancel_limits_the_total_time_spent_on_downloads(self):
         self.manifest.write_text(json.dumps({"jobs": [

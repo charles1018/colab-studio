@@ -6,7 +6,9 @@ import hashlib
 import json
 import math
 import shlex
+import shutil
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -14,11 +16,14 @@ from typing import Any, Callable
 
 from filelock import Timeout as LockTimeout
 
-from remote.job_paths import JOB_ID, RUN_ID, bundle_digest, confined_path
+from remote.job_paths import JOB_ID, RUN_ID, bundle_digest, confined_path, file_sha256, json_digest
 
 from . import colab_client as C
 from .redact import redact, redact_diagnostics
-from .results import RunOutputs, SupersededResult, done_revision, is_sha256, read_object, save_results
+from .results import (
+    RunOutputs, SupersededResult, done_revision, execution_digest, is_sha256, matches_image, read_object,
+    save_results, verify_receipt,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / "remote"
@@ -137,15 +142,16 @@ def compute_job_fingerprint(
     base_dir: Path,
     cli_quant: str | None = None,
     versions: dict[str, Any] | None = None,
+    *,
+    input_shas: dict[str, str] | None = None,
 ) -> str:
+    """Compute the original graph fingerprint for existing results."""
     plugin = get_model_plugin(manifest.get("model"))
     graph = plugin.build_qwen21_graph(job, manifest=manifest, cli_quant=cli_quant)
 
-    input_hashes = []
-    for rel in job.get("inputs") or []:
-        fp = confined_path(base_dir, rel, missing_ok=True)
-        h = hashlib.sha256(fp.read_bytes()).hexdigest() if fp.is_file() else "missing"
-        input_hashes.append({"path": rel, "sha256": h})
+    if input_shas is None:
+        input_shas = _reference_hashes([job], base_dir)
+    input_hashes = [{"path": rel, "sha256": input_shas[rel]} for rel in job.get("inputs") or []]
 
     v_commits = {}
     if isinstance(versions, dict):
@@ -165,22 +171,74 @@ def compute_job_fingerprint(
     return hashlib.sha256(raw).hexdigest()
 
 
+def _reference_hashes(jobs: list[dict], base: Path) -> dict[str, str]:
+    hashes = {}
+    for rel in sorted({ref for job in jobs for ref in job.get("inputs") or []}):
+        path = confined_path(base, rel, missing_ok=True)
+        hashes[rel] = file_sha256(path) if path.is_file() else "missing"
+    return hashes
+
+
+def _stale_output(jid, image, record, fingerprint, legacy, *, use_fingerprint, pin_versions, pin_models):
+    has_integrity = "sha256" in record or "bytes" in record
+    if image.stat().st_size == 0:
+        return "本機成果是空檔"
+    if has_integrity:
+        try:
+            verify_receipt(jid, record)
+        except ValueError:
+            return "本機成果的大小或 SHA-256 紀錄無效"
+        if not matches_image(image, record):
+            return "本機成果的大小或 SHA-256 已變更"
+    if not use_fingerprint:
+        return None
+    if not has_integrity:
+        return "舊成果缺少大小與 SHA-256 紀錄"
+    version = record.get("fingerprint_version")
+    if version is None and record.get("fingerprint") == legacy and pin_versions and pin_models:
+        return None
+    if version != 2 or record.get("fingerprint") != fingerprint:
+        return "生成流程、參考圖片、版本或執行設定已變更"
+    execution = record.get("execution")
+    try:
+        digest = execution_digest(fingerprint, execution, pin_versions=pin_versions, pin_models=pin_models)
+    except ValueError:
+        return "本機成果的執行環境紀錄無效"
+    if digest != record.get("execution_fingerprint"):
+        return "本機成果的執行環境指紋不符"
+    if not (pin_versions and pin_models and execution["comfy"]["verified"]):
+        return "執行環境未完整釘選或驗證，離線無法確認相容"
+    if not {"comfyui_version", "python_version", "pytorch_version"} <= execution["comfy"]["versions"].keys():
+        return "ComfyUI 未回報完整版本，離線無法確認相容"
+    return None
+
+
 def classify_jobs(
     manifest: dict[str, Any],
     base_dir: Path,
     cli_quant: str | None = None,
     use_fingerprint: bool = True,
+    *,
+    gpu: str = "L4",
+    pin_versions: bool = True,
+    pin_models: bool = True,
+    bundle_hash: str | None = None,
+    input_shas: dict[str, str] | None = None,
+    versions: dict | None = None,
 ) -> tuple[dict[str, str], list[dict[str, Any]], list[str], list[tuple[str, str]]]:
     """Return (fps, todo_jobs, done_ids, stale_list[(jid, reason)])."""
     res_file = confined_path(base_dir, "out/results.json", missing_ok=True)
-    old_results = {}
-    if res_file.is_file():
-        try:
-            old_results = (json.loads(res_file.read_text(encoding="utf-8")).get("jobs")) or {}
-        except Exception:
-            old_results = {}
+    old_results = read_object(res_file).get("jobs", {})
+    if not isinstance(old_results, dict):
+        raise ValueError("results.json 的成果清單格式錯誤")
 
-    versions = load_versions()
+    if versions is None:
+        versions = load_versions()
+    pin_models = pin_models and pin_versions
+    run_settings = {"gpu": gpu, "pin_versions": pin_versions, "pin_models": pin_models,
+                    "bundle_hash": bundle_hash or compute_remote_bundle_hash()}
+    if input_shas is None:
+        input_shas = _reference_hashes(manifest["jobs"], base_dir)
     fps: dict[str, str] = {}
     todo: list[dict[str, Any]] = []
     done_ids: list[str] = []
@@ -188,34 +246,52 @@ def classify_jobs(
 
     for j in manifest.get("jobs") or []:
         jid = j["id"]
-        fp = compute_job_fingerprint(j, manifest, base_dir, cli_quant=cli_quant, versions=versions)
+        legacy = compute_job_fingerprint(j, manifest, base_dir, cli_quant, versions, input_shas=input_shas)
+        fp = json_digest({"schema": 2, "graph_fingerprint": legacy, **run_settings})
         fps[jid] = fp
         out_img = confined_path(base_dir, f"out/{jid}.png", missing_ok=True)
-        if not out_img.is_file() or out_img.stat().st_size == 0:
+        if not out_img.is_file():
             todo.append(j)
             continue
-        if not use_fingerprint:
+        prev = old_results.get(jid)
+        reason = _stale_output(jid, out_img, prev if isinstance(prev, dict) else {}, fp, legacy,
+                               use_fingerprint=use_fingerprint, pin_versions=pin_versions, pin_models=pin_models)
+        if reason is None:
             done_ids.append(jid)
-            continue
-        prev = old_results.get(jid) or {}
-        prev_fp = prev.get("fingerprint")
-        if prev_fp == fp:
-            done_ids.append(jid)
-        elif prev_fp is None:
-            stale.append((jid, "舊輸出沒有指紋紀錄"))
-            todo.append(j)
         else:
-            stale.append((jid, "生成流程、參考圖片或版本已變更"))
+            stale.append((jid, reason))
             todo.append(j)
 
     return fps, todo, done_ids, stale
 
 
-def plan_batch(manifest_path: str | Path, gpu: str = "L4", cli_quant: str | None = None) -> dict[str, Any]:
+def _snapshot_references(base: Path, destination: Path, hashes: dict[str, str]):
+    for rel, digest in hashes.items():
+        staged = confined_path(destination, rel, missing_ok=True)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(confined_path(base, rel), staged)
+        if file_sha256(staged) != digest:
+            raise RuntimeError(f"參考圖在批次準備期間已變更：{rel}，請重新執行")
+
+
+def _legacy_outputs(results: dict, done_ids: list[str]) -> list[str]:
+    records = results.get("jobs", {})
+    return [
+        jid for jid in done_ids if not isinstance(records.get(jid), dict)
+        or records[jid].get("fingerprint_version") != 2
+    ]
+
+
+def plan_batch(
+    manifest_path: str | Path, gpu: str = "L4", cli_quant: str | None = None,
+    *, pin_versions: bool = True, pin_models: bool = True,
+) -> dict[str, Any]:
     m, base = load_manifest(manifest_path, cli_quant=cli_quant)
     plugin = get_model_plugin(m.get("model"))
     try:
-        fps, todo, done_ids, stale = classify_jobs(m, base, cli_quant=cli_quant)
+        _, todo, done_ids, stale = classify_jobs(m, base, cli_quant=cli_quant, gpu=gpu,
+                                                pin_versions=pin_versions, pin_models=pin_models)
+        legacy = _legacy_outputs(read_object(confined_path(base, "out/results.json", missing_ok=True)), done_ids)
     except (OSError, ValueError) as exc:
         _fail(f"無法使用任務檔案：{exc}")
     req_models = plugin.required_models_for_batch(m, cli_quant=cli_quant)
@@ -237,18 +313,26 @@ def plan_batch(manifest_path: str | Path, gpu: str = "L4", cli_quant: str | None
     for ml in model_list:
         print(f"     - [{ml['dest']}] {ml['file']} ({ml['gb']:.2f} GB)", flush=True)
     print("   各任務明細：", flush=True)
+    stale_reasons = dict(stale)
     for j in m["jobs"]:
         jid = j["id"]
         w, h = plugin.resolve_dimensions(j, m)
         q = (cli_quant or j.get("quant") or m.get("quant") or plugin.DEFAULT_QUANT).upper()
         ref = "✨PE擴寫" if j.get("refine_prompt", m.get("refine_prompt", False)) else "直出"
         rgba = " [RGBA透明]" if j.get("transparent") else ""
-        st = "✅ 已完成" if jid in done_ids else ("⚠️ 過期" if any(s[0] == jid for s in stale) else "🆕 待生成")
+        st = "🆕 待生成"
+        if jid in legacy:
+            st = "✅ 舊成果已通過圖片驗證"
+        elif jid in done_ids:
+            st = "✅ 已完成"
+        elif jid in stale_reasons:
+            st = f"⚠️ 過期（{stale_reasons[jid]}）"
         print(f"     - {jid}: {st} | mode={j.get('mode', 't2i')}{rgba} | quant={q} | {w}x{h} | {ref}", flush=True)
 
     return {
         "total": len(m["jobs"]),
         "done": done_ids,
+        "legacy": legacy,
         "todo": [j["id"] for j in todo],
         "stale": stale,
         "models": model_list,
@@ -268,7 +352,11 @@ def recover_outputs(manifest_path: str | Path, run_id: str) -> dict:
     session, account, endpoint = (request.get(key) for key in ("session", "account_scope", "runtime_endpoint"))
     jobs = request.get("jobs")
     if (
-        type(request.get("schema")) is not int or request["schema"] != 1 or request.get("run_id") != run_id
+        type(request.get("schema")) is not int or request["schema"] not in (1, 2) or request.get("run_id") != run_id
+        or (request["schema"] == 2 and (
+            type(request.get("pin_versions")) is not bool or type(request.get("pin_models")) is not bool
+            or (request["pin_models"] and not request["pin_versions"])
+        ))
         or not is_sha256(request.get("bundle_hash"))
         or not all(isinstance(value, str) and value for value in (session, account, endpoint))
         or C.sanitize_session_name(session) != session or not isinstance(jobs, dict) or not jobs
@@ -374,7 +462,11 @@ REMOTE_CODE_FILES = (
 
 
 def compute_remote_bundle_hash() -> str:
-    return bundle_digest({rel: (REMOTE / rel).read_text(encoding="utf-8") for rel in REMOTE_CODE_FILES})
+    return bundle_digest(_remote_sources())
+
+
+def _remote_sources() -> dict[str, str]:
+    return {rel: (REMOTE / rel).read_text(encoding="utf-8") for rel in REMOTE_CODE_FILES}
 
 
 def bundle_and_launch_code(
@@ -462,17 +554,23 @@ def run_manifest(
             session = C.sanitize_session_name(session)
         except ValueError as exc:
             _fail(str(exc), exit_on_error)
-    if not C.token_ok():
-        _fail("尚未登入 Google Colab：請先執行 `uv run cstudio login url`", exit_on_error)
-
     m, base = load_manifest(manifest_path, cli_quant=cli_quant, exit_on_error=exit_on_error)
+    pin_versions = bool(pin_versions)
+    pin_models = pin_versions and bool(pin_models)
     try:
         out_dir = confined_path(base, "out", directory=True, missing_ok=True)
         res_file = confined_path(base, "out/results.json", missing_ok=True)
         prev_results = read_object(res_file)
         if not isinstance(prev_results.get("jobs", {}), dict):
             raise ValueError("results.json 的成果清單格式錯誤")
-        fps, todo, done_ids, stale = classify_jobs(m, base, cli_quant=cli_quant, use_fingerprint=use_fingerprint)
+        sources = _remote_sources()
+        bundle_hash = bundle_digest(sources)
+        all_input_shas = _reference_hashes(m["jobs"], base)
+        fps, todo, done_ids, stale = classify_jobs(
+            m, base, cli_quant=cli_quant, use_fingerprint=use_fingerprint, gpu=gpu,
+            pin_versions=pin_versions, pin_models=pin_models, bundle_hash=bundle_hash,
+            versions=json.loads(sources["versions.json"]), input_shas=all_input_shas,
+        )
         out_dir.mkdir(exist_ok=True)
     except (OSError, ValueError) as exc:
         _fail(f"無法使用任務檔案：{exc}", exit_on_error)
@@ -486,8 +584,10 @@ def run_manifest(
         msg += "\n👉 若要重做過期項目（舊檔會移至 out/_stale/），請加上 `--remake-stale`；若要全部重做請加 `--force`。"
         _fail(msg, exit_on_error)
 
+    if use_fingerprint and (legacy := _legacy_outputs(prev_results, done_ids)):
+        print(f"📄 沿用已通過圖片驗證的舊成果，原執行環境沒有紀錄：{', '.join(legacy)}", flush=True)
     if not todo:
-        print(f"✅ 全部 {len(m['jobs'])} 個任務皆已完成且指紋相符，無需啟動 Colab GPU！（輸出位於 {out_dir}）", flush=True)
+        print(f"✅ 全部 {len(m['jobs'])} 個任務沿用本機成果，無需啟動 Colab GPU（{out_dir}）", flush=True)
         if progress_cb:
             try:
                 progress_cb(
@@ -498,15 +598,17 @@ def run_manifest(
                         "gpu": gpu,
                         "_local_synced_jobs": list(done_ids),
                         "_local_results": prev_results,
-                        "log": ["全部任務皆已完成且指紋相符，免啟動 GPU"],
+                        "log": ["沿用全部本機成果，免啟動 GPU"],
                     }
                 )
             except Exception:
                 pass
         return prev_results
 
+    if not C.token_ok():
+        _fail("尚未登入 Google Colab：請先執行 `uv run cstudio login url`", exit_on_error)
     if done_ids:
-        print(f"⏭️ 略過已完成且指紋相符的任務：{', '.join(done_ids)}", flush=True)
+        print(f"⏭️ 沿用已有成果的任務：{', '.join(done_ids)}", flush=True)
 
     t0 = time.monotonic()
     deadline = t0 + max_minutes * 60
@@ -611,9 +713,15 @@ def run_manifest(
     finished = False
     run_lock = None
     cancel_sync_deadline = None
+    snapshot = None
+    input_shas = {rel: all_input_shas[rel] for rel in sorted({ref for job in todo for ref in job.get("inputs") or []})}
 
     try:
         _check_active()
+        if input_shas:
+            snapshot = tempfile.TemporaryDirectory(prefix="cstudio-references-")
+            _snapshot_references(base, Path(snapshot.name), input_shas)
+            _check_active()
         if auto_reuse and session is None:
             registered = C.owned_sessions()
             session = next((name for name in registered if C.is_owned_session(
@@ -700,25 +808,23 @@ def run_manifest(
             m,
             jobs=todo,
             _run_id=run_id,
-            _pin_versions=bool(pin_versions),
-            _pin_models=bool(pin_models and pin_versions),
+            _pin_versions=pin_versions,
+            _pin_models=pin_models,
+            _fingerprint_version=2,
         )
         if cli_quant:
             remote_m["_cli_quant"] = cli_quant
         manifest_json = json.dumps(remote_m, ensure_ascii=False, indent=1)
 
-        sources = {rel: (REMOTE / rel).read_text(encoding="utf-8") for rel in REMOTE_CODE_FILES}
-        bundle_hash = bundle_digest(sources)
         k_info = C.keep_info(session) or {}
         need_code = created or k_info.get("bundle_hash") != bundle_hash
 
-        files = sorted({f for j in todo for f in (j.get("inputs") or [])})
-        input_shas = {f: hashlib.sha256(confined_path(base, f).read_bytes()).hexdigest() for f in files}
         remote_run = f"{C.REMOTE_ROOT}/runs/{run_id}"
         archived = {jid for jid, _ in stale}
         request = {
-            "schema": 1, "run_id": run_id, "session": session, "account_scope": account,
+            "schema": 2, "run_id": run_id, "session": session, "account_scope": account,
             "runtime_endpoint": endpoint, "bundle_hash": bundle_hash,
+            "pin_versions": pin_versions, "pin_models": pin_models,
             "jobs": {jid: {"fingerprint": fps[jid], "previous": done_revision(results["jobs"].get(jid)),
                            "archive": jid in archived} for jid in sorted(expected_todo_ids)},
         }
@@ -764,7 +870,11 @@ def run_manifest(
             _check_active()
             print(f"⬆️ 上傳參考圖：{f}", flush=True)
             _emit({"stage": "uploading_inputs", "done": False, "log": [f"正在上傳參考圖片：{f}"]})
-            C.colab("upload", "-s", session, confined_path(base, f), f"{remote_run}/uploads/{f}", timeout=600, **target)
+            C.colab("upload", "-s", session, confined_path(Path(snapshot.name), f),
+                    f"{remote_run}/uploads/{f}", timeout=600, **target)
+        if snapshot is not None:
+            snapshot.cleanup()
+            snapshot = None
 
         _check_active()
         if prep["state"] == "prepared":
@@ -978,19 +1088,26 @@ def run_manifest(
                 finally:
                     if run_lock is not None:
                         run_lock.release()
-        elif allocation_reserved:
-            current = C.keep_info(session)
-            if not _run_lease(current or {}):
-                current = None
-            if current and allocation_attempted:
-                try:
-                    review_at = time.time() + 30
-                    C.set_keep(session, None, owner="pending", expected=current, extra={"busy_until": review_at})
-                except (OSError, C.KeepChanged):
-                    pass  # The reservation was already persisted before allocation.
-                print(f"⚠️ 尚未確認 {session} 的配置結果。請檢查 Colab runtime，含未命名的機器。", flush=True)
-            elif current:
-                C.drop_keep(session, expected=current)
+                    if snapshot is not None:
+                        snapshot.cleanup()
+        else:
+            try:
+                if allocation_reserved:
+                    current = C.keep_info(session)
+                    if not _run_lease(current or {}):
+                        current = None
+                    if current and allocation_attempted:
+                        try:
+                            review_at = time.time() + 30
+                            C.set_keep(session, None, owner="pending", expected=current, extra={"busy_until": review_at})
+                        except (OSError, C.KeepChanged):
+                            pass  # The reservation was already persisted before allocation.
+                        print(f"⚠️ 尚未確認 {session} 的配置結果。請檢查 Colab runtime，含未命名的機器。", flush=True)
+                    elif current:
+                        C.drop_keep(session, expected=current)
+            finally:
+                if snapshot is not None:
+                    snapshot.cleanup()
 
     print(f"✅ 批次結束：成功 {len(local_synced)}/{len(m['jobs'])}，耗時 {results['minutes']} 分鐘 → {out_dir}", flush=True)
     if results.get("error") and exit_on_error:

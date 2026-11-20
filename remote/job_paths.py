@@ -47,5 +47,14 @@ def confined_path(root: Path, relative: str, *, directory: bool = False, missing
 
 
 def bundle_digest(files: dict[str, str]) -> str:
-    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json_digest(files)
+
+
+def json_digest(data) -> str:
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()

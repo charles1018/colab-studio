@@ -45,6 +45,10 @@ uv run cstudio sheet jobs/demo_qwen21/out/*.png
 
 批次中斷後，可使用當時 CLI 或工作台日誌中的批次 ID 和原工作目錄執行 `recover`。每次會補抓原 runtime 已完成且通過大小及 SHA-256 驗證的圖片。仍在執行或暫時失聯時可以重試。補抓沿用原 Colab 授權及 runtime，並受原回收期限約束。原 runtime 已消失時，仍可完成中斷前已驗證並寫入本機發布紀錄的圖片。此功能適用於已保存 `out/.runs/<run_id>/request.json` 的批次。
 
+續跑會重驗本機圖的大小和 SHA-256。新版成果另記錄生成時的 Git 版本、Python 套件、Torch／CUDA、GPU、ComfyUI 啟動參數及模型路徑。離線規劃與續跑會比較請求指紋，並驗證保存的執行環境指紋。舊指紋相符且圖片驗證通過時，預設釘選模式可沿用舊圖，並標明其原執行環境缺少紀錄。
+
+`plan` 與 `run` 都接受 `--no-pin-versions` 和 `--no-pin-models`。若環境未完整釘選或 ComfyUI 啟動環境無法驗證，可用 `--remake-stale` 重做，或用 `--no-fingerprint` 明確沿用已有成果。已記有大小或摘要的圖仍須通過完整性驗證。
+
 `stop --all` 只關閉 Colab Studio 已登記的 Session。要關閉外部 Session，請明確指定 `--session NAME`。CLI 只有在所有目標均確認已關閉時才回傳成功，未確認的自有 Session 會保留 watchdog 重試紀錄。
 
 ---

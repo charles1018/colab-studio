@@ -15,6 +15,7 @@ from fastapi import HTTPException
 
 from cstudio import cli, colab_client, webui
 from remote import cancel, remote_runner as remote
+from remote.job_paths import file_sha256
 
 
 RUN = "0123456789ab"
@@ -215,6 +216,65 @@ class RemoteCancellationTests(unittest.TestCase):
         self.assertEqual(self.state["jobs"]["a"]["status"], "done")
         self.assertEqual(self.state["stage"], "done")
         self.assertEqual(cancel.request_cancel(self.job, RUN)["state"], "finished")
+
+    def test_managed_worker_records_effective_environment_and_rechecks_sealed_references(self):
+        comfy = self.job / "comfy"
+        comfy.mkdir()
+        sealed = self.job / "inputs"
+        sealed.mkdir()
+        reference = sealed / "ref.png"
+        reference.write_bytes(b"original reference")
+        manifest_path = self.job / "manifest.json"
+        manifest = {"_run_id": RUN, "_pin_versions": False, "_fingerprint_version": 2, "jobs": [
+            {"id": "a", "mode": "edit", "prompt": "edit", "inputs": ["ref.png"]},
+        ]}
+        manifest_path.write_text(json.dumps(manifest))
+        bundle_hash = self.state["bundle_hash"] = "a" * 64
+        (self.job / "request.json").write_text(json.dumps({
+            "manifest_sha256": file_sha256(manifest_path),
+            "bundle_hash": bundle_hash,
+            "input_shas": {"ref.png": file_sha256(reference)},
+        }))
+        self.state["environment"] = {
+            "python": ["/fixture/python", "3.12"], "heads": {"ComfyUI": "fixture"}, "packages": {"torch": "2.7"},
+        }
+        self.state["gpu_info"] = {"name": "fixture GPU"}
+        self.install.return_value = "installed"
+        self.start_comfy.return_value = {
+            "args": ["main.py", "--gpu-only"], "verified": True,
+            "versions": {"comfyui_version": "1", "python_version": "3.12", "pytorch_version": "2.8"},
+        }
+        self.download.side_effect = lambda files, **_: {
+            (repo, name, folder): {"repo": repo, "file": name, "path": f"models/{name}", "bytes": 42}
+            for repo, name, folder in files
+        }
+
+        def queue(graph, *, pin_models):
+            self.assertFalse(pin_models)
+            filename = graph["20"]["inputs"]["image"]
+            self.assertEqual((comfy / "input" / filename).read_bytes(), b"original reference")
+            remote.FITTED[PROMPT] = [("10", "unet_name", "original", "fitted")]
+            return PROMPT
+
+        def collect(_history, dest, **_save_image):
+            dest.write_bytes(b"result")
+
+        with patch.multiple(remote, COMFY=comfy, MANAGED_RUN_ID=RUN,
+                            queue_prompt=Mock(side_effect=queue), wait_history=Mock(return_value={}),
+                            collect_output_image=Mock(side_effect=collect)):
+            remote.run_batch()
+            rec = json.loads(self.status.read_text())["jobs"]["a"]
+            self.assertEqual(rec["execution"]["environment"], self.state["environment"])
+            self.assertEqual(rec["execution"]["comfy"], self.start_comfy.return_value)
+            self.assertEqual(rec["execution"]["gpu"], self.state["gpu_info"])
+            self.assertEqual(rec["execution"]["fitted_models"], [["10", "unet_name", "original", "fitted"]])
+            self.assertEqual(len(rec["execution"]["models"]), 3)
+
+            reference.write_bytes(b"modified reference")
+            remote.queue_prompt.reset_mock()
+            remote.run_batch()
+            remote.queue_prompt.assert_not_called()
+            self.assertIn("SHA-256 不符", self.state["jobs"]["a"]["error"])
 
 
 class CancellationClientTests(unittest.TestCase):

@@ -151,9 +151,39 @@ class EditAlphaTests(unittest.TestCase):
                     for job in manifest["jobs"]
                 }
             for job in manifest["jobs"]:
-                Image.new("RGB", (1, 1)).save(base / "out" / f"{job['id']}.png")
+                jid = job["id"]
+                image = base / "out" / f"{jid}.png"
+                Image.new("RGB", (1, 1)).save(image)
+                records[jid].update(status="done", file=f"out/{jid}.png", bytes=image.stat().st_size,
+                                    sha256=runner.file_sha256(image))
             (base / "out" / "results.json").write_text(json.dumps({"jobs": records}), encoding="utf-8")
             _, todo, done, stale = runner.classify_jobs(manifest, base)
             self.assertEqual(todo, [edit])
             self.assertEqual(done, ["t2i"])
             self.assertEqual([job_id for job_id, _ in stale], ["edit"])
+
+    def test_request_fingerprint_changes_for_effective_graph_and_ordered_references(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            Image.new("RGBA", (2, 2), (250, 0, 0, 50)).save(base / "a.png")
+            Image.new("RGBA", (2, 2), (0, 250, 0, 200)).save(base / "b.png")
+            edit = {"id": "edit", "mode": "edit", "prompt": "Edit", "inputs": ["a.png", "b.png"],
+                    "refine_prompt": True, "custom_size": True}
+            t2i = {"id": "t2i", "prompt": "Generate"}
+
+            def fingerprints(edit_job=edit, t2i_job=t2i, **options):
+                return runner.classify_jobs({"jobs": [edit_job, t2i_job]}, base, **options)[0]
+
+            original = fingerprints()
+            for changes in (
+                {"inputs": ["b.png", "a.png"]}, {"seed": 17}, {"resolution": "2K"}, {"pe_variant": "w4a8"},
+                {"refine_prompt": False}, {"quant": "BF16"}, {"text_encoder_variant": "w4a8"},
+            ):
+                with self.subTest(changes=changes):
+                    after = fingerprints(edit_job=dict(edit, **changes))
+                    self.assertNotEqual(after["edit"], original["edit"])
+                    self.assertEqual(after["t2i"], original["t2i"])
+            self.assertNotEqual(fingerprints(t2i_job=dict(t2i, transparent=True))["t2i"], original["t2i"])
+            self.assertNotEqual(fingerprints(cli_quant="Q4_K_M")["edit"], original["edit"])
+            Image.new("RGBA", (2, 2), (250, 0, 0, 51)).save(base / "a.png")
+            self.assertNotEqual(fingerprints()["edit"], original["edit"])
