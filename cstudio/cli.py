@@ -27,18 +27,23 @@ def cmd_check(_args):
     if names:
         print(f"🟢 目前開啟中的 Colab Sessions：{', '.join(names)}", flush=True)
     else:
-        print(f"⚪ 目前無開啟中的 Colab Session ({s_raw})", flush=True)
+        print(s_raw, flush=True)
 
 
 def cmd_sessions(_args):
-    names, raw = C.sessions()
+    account = C.account_scope()
+    names, raw = C.sessions(account=account)
     if not names:
-        print("⚪ 目前無開啟中的 Colab Session", flush=True)
+        print(raw, flush=True)
         return
     now = time.time()
+    assignments = C.listed_assignments(raw) or {}
     print("🟢 目前開啟中的 Colab Sessions：", flush=True)
     for n in names:
         info = C.keep_info(n)
+        if info and (info.get("account_scope", account) != account
+                     or assignments.get(info.get("runtime_endpoint")) != n):
+            info = None
         exp = info.get("expires") if info else None
         owner = (info or {}).get("created_by", "unknown")
         if exp is None and info:
@@ -52,25 +57,32 @@ def cmd_sessions(_args):
 
 
 def cmd_keep(args):
-    names, _ = C.sessions()
+    account = C.account_scope()
+    names, raw = C.sessions(account=account)
     session = args.session
     if not session:
-        owned = [n for n in names if C.is_owned_session(n)]
+        owned = [n for n in names if C.is_owned_session(n, account=account, assignments=C.listed_assignments(raw))]
         if len(owned) == 1:
             session = owned[0]
         else:
             sys.exit(f"請用 --session 指定名稱（目前開啟中：{names}）")
     if session not in names:
         sys.exit(f"找不到開啟中的 session：{session}（目前開啟中：{names}）")
-    if (C.keep_info(session) or {}).get("release_pending"):
+    info = C.keep_info(session) or {}
+    if info.get("release_pending"):
         sys.exit(f"{session} 正在關機，無法延長待命")
+    try:
+        target = C.keep_target(session, info, account)
+    except (OSError, RuntimeError) as exc:
+        sys.exit(str(exc))
     mins = max(1.0, min(240.0, float(args.minutes)))
-    C.set_keep(session, time.time() + mins * 60)
+    C.set_keep(session, time.time() + mins * 60, **target)
     C.start_watchdog(session)
     print(f"⏸️ 已將 {session} 的自動關機時間設為 {mins:g} 分鐘後", flush=True)
 
 
 def cmd_stop(args):
+    account = C.account_scope()
     if args.session:
         try:
             targets = [C.sanitize_session_name(args.session)]
@@ -83,11 +95,13 @@ def cmd_stop(args):
     if not targets:
         print("⚪ 目前沒有已登記的 Colab Studio Session 需要關閉", flush=True)
         return
+    if not account:
+        sys.exit("無法確認 Colab 登入身分")
 
     all_confirmed = True
     for session in targets:
         print(f"🛑 正在關閉 {session}...", flush=True)
-        outcome = C.release_runtime(session, owned_only=args.session is None)
+        outcome = C.release_runtime(session, owned_only=args.session is None, account=account)
         if outcome == C.ReleaseState.CONFIRMED:
             print(f"✅ 已確認 {session} 關閉", flush=True)
         else:
@@ -101,10 +115,13 @@ def cmd_stop(args):
 
 
 def cmd_cancel(args):
-    names, _ = C.sessions()
+    account = C.account_scope()
+    if not account:
+        sys.exit("無法確認 Colab 登入身分")
+    names, raw = C.sessions(account=account)
     session = args.session
     if not session:
-        owned = [n for n in names if C.is_owned_session(n)]
+        owned = [n for n in names if C.is_owned_session(n, account=account, assignments=C.listed_assignments(raw))]
         if len(owned) == 1:
             session = owned[0]
         else:
@@ -112,7 +129,7 @@ def cmd_cancel(args):
     if session not in names:
         sys.exit(f"找不到開啟中的 session：{session}")
     try:
-        res = C.request_cancel(session, args.run_id)
+        res = C.request_cancel(session, args.run_id, account=account)
     except (OSError, RuntimeError, ValueError) as exc:
         sys.exit(f"無法確認 {session} 的取消狀態：{exc}")
     run_id = res.get("run_id")

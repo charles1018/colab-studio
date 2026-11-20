@@ -16,6 +16,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
+from .colab_login import account_scope
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 REMOTE = ROOT / "remote"
@@ -47,15 +49,25 @@ class ColabTimeout(RuntimeError):
     """The command timed out before its outcome could be observed."""
 
 
-def colab(*args, timeout: int = 600, check: bool = True) -> str:
+def colab(
+    *args, timeout: int = 600, check: bool = True,
+    account: str | None = None, endpoint: str | None = None,
+) -> str:
+    env = ENV
+    command = [colab_exe()] if account is None else [sys.executable, "-m", "cstudio._colab"]
+    if account is not None:
+        env = dict(ENV, CSTUDIO_COLAB_ACCOUNT_SCOPE=account)
+        env.pop("CSTUDIO_COLAB_ENDPOINT", None)
+        if endpoint is not None:
+            env["CSTUDIO_COLAB_ENDPOINT"] = endpoint
     try:
         p = subprocess.run(
-            [colab_exe(), *map(str, args)],
+            [*command, *map(str, args)],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=ENV,
+            env=env,
             timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
@@ -80,47 +92,50 @@ def new_runtime(
     wait: int = 120,
     check_abort: Callable[[], None] | None = None,
     deadline: float | None = None,
+    *,
+    account: str | None = None,
 ) -> str:
+    account = account or account_scope()
+    if not account:
+        raise RuntimeError("無法確認 Colab 登入身分")
     for attempt in range(retries + 1):
         if check_abort:
             check_abort()
         if deadline is not None and time.time() >= deadline:
             raise RuntimeError("已到達 Colab GPU 配置時間上限")
         try:
-            # Let a request already in flight return its identity before cleanup.
-            return colab("new", "-s", session, "--gpu", gpu, timeout=ASSIGN_TIMEOUT)
-        except ColabTimeout:
-            raise
+            out = colab("new", "-s", session, "--gpu", gpu, timeout=ASSIGN_TIMEOUT, account=account)
         except RuntimeError as e:
-            busy = any(k in str(e) for k in ("Service Unavailable", "503", "Too Many Requests", "429"))
-            if busy and runtime_endpoint(session):
-                # A recorded assignment must be reconciled before any further allocation.
-                raise
-            if not busy or attempt == retries:
-                if busy:
-                    raise RuntimeError(
-                        f"分配不到 {gpu}（試了 {attempt + 1} 次都是 Service Unavailable）。"
-                        f"晚點再試，或改用另一種 GPU（L4／G4）。\n{e}"
-                    )
+            # Only the upstream explicit 412 rejection proves this request did not allocate.
+            refused = any(line.startswith("[colab] Allocation refused (precondition failed).")
+                          for line in str(e).splitlines())
+            if isinstance(e, ColabTimeout) or attempt == retries or not refused or runtime_endpoint(session):
                 raise
             print(
-                f"⏳ Colab 現在分配不到 {gpu}（Service Unavailable），{wait:g} 秒後再試（第 {attempt + 1}/{retries} 次重試）",
+                f"⏳ Colab 拒絕配置 {gpu}，{wait:g} 秒後再試（第 {attempt + 1}/{retries} 次重試）",
                 flush=True,
             )
             if check_abort:
                 check_abort()
             delay = min(wait, max(0, deadline - time.time())) if deadline is not None else wait
             time.sleep(delay)
-    return ""
+        else:
+            receipts = re.findall(r"^CSTUDIO_ASSIGNED (\S+)$", out, re.M)
+            if len(receipts) == 1:
+                return receipts[0]
+            raise RuntimeError(f"無法確認 {session} 的遠端識別，配置狀態待確認")
 
 
 def token_ok() -> bool:
     return (Path.home() / ".config" / "colab-cli" / "token.json").is_file()
 
 
-def usage() -> tuple[float | None, str]:
+def usage(*, account: str | None = None) -> tuple[float | None, str]:
+    account = account or account_scope()
+    if not account:
+        return None, "無法確認 Colab 登入身分"
     try:
-        out = colab("usage", timeout=120, check=False)
+        out = colab("usage", timeout=120, check=False, account=account)
     except Exception as e:
         out = f"（讀取失敗：{e}）"
     m = re.search(r"([\d.]+)\s*(?:compute units|運算單元|units)", out, re.I)
@@ -140,18 +155,8 @@ def parse_sessions(out: str) -> list[str]:
     return names
 
 
-def sessions(*, check: bool = False) -> tuple[list[str], str]:
-    out = colab("sessions", timeout=120, check=check)
-    return parse_sessions(out), out.strip()
-
-
-def listing_answered(names: list[str] | None, out: str) -> bool:
-    return bool(names) or "No active sessions" in out or bool(re.search(r"^\[\?\]", out, re.M))
-
-
-def session_gone(session: str, names: list[str] | None, out: str, endpoint: str | None = None) -> bool:
-    if names is None:
-        return False
+def listed_assignments(out: str) -> dict[str, str] | None:
+    """Return endpoint → alias for a complete listing, including unnamed assignments."""
     rows = [
         line for line in out.strip().splitlines() if line
         and not re.fullmatch(r"\[colab\] Pruned \d+ stale local session\(s\)\.", line)
@@ -163,26 +168,55 @@ def session_gone(session: str, names: list[str] | None, out: str, endpoint: str 
         ))
     ]
     if rows == ["[colab] No active sessions found on server."]:
-        return True
-    assignments = []
+        return {}
+    assignments = {}
+    names = set()
     for row in rows:
         match = re.fullmatch(r"\[([^\]]+)\] (\S+) \| Hardware: .+", row)
         if not match:
-            return False
-        assignments.append(match.groups())
-    if not assignments:
+            return None
+        name, endpoint = match.groups()
+        if endpoint in assignments or (name != "?" and name in names):
+            return None
+        assignments[endpoint] = name
+        names.add(name)
+    return assignments or None
+
+
+def sessions(*, check: bool = False, account: str | None = None) -> tuple[list[str], str]:
+    account = account or account_scope()
+    try:
+        if not account:
+            raise RuntimeError("無法確認 Colab 登入身分")
+        out = colab("sessions", timeout=120, check=True, account=account).strip()
+        if account_scope() != account:
+            raise RuntimeError("Colab 登入身分已變更")
+        assignments = listed_assignments(out)
+        if assignments is None:
+            raise RuntimeError("無法解析 Colab Session 清單")
+        return [name for name in assignments.values() if name != "?"], out
+    except (OSError, RuntimeError, SystemExit):
+        if check:
+            raise
+        return [], "無法確認 Colab Session 清單"
+
+
+def session_gone(session: str, names: list[str] | None, out: str, endpoint: str | None = None) -> bool:
+    assignments = listed_assignments(out) if names is not None else None
+    if assignments is None:
         return False
     if endpoint:
-        return all(active_endpoint != endpoint for _, active_endpoint in assignments)
-    return all(name not in (session, "?") for name, _ in assignments)
+        return endpoint not in assignments
+    return session not in assignments.values() and "?" not in assignments.values()
 
 
-def sessions_checked(tries: int = 2) -> tuple[list[str] | None, str]:
+def sessions_checked(tries: int = 2, *, account: str | None = None) -> tuple[list[str] | None, str]:
+    account = account or account_scope()
     out = ""
     for i in range(max(1, tries)):
         try:
-            names, out = sessions(check=True)
-            if listing_answered(names, out):
+            names, out = sessions(check=True, account=account)
+            if listed_assignments(out) is not None:
                 return names, out
         except (OSError, RuntimeError, SystemExit):
             out = ""
@@ -218,29 +252,48 @@ def runtime_endpoint(session: str) -> str | None:
     return state.endpoint if state else None
 
 
-def is_owned_session(name: str) -> bool:
+def is_owned_session(
+    name: str, *, account: str | None = None, assignments: dict[str, str] | None = None,
+) -> bool:
     try:
         name = sanitize_session_name(name)
     except ValueError:
         return False
     info = keep_info(name) or {}
-    if info.get("created_by") != "owned":
+    account = account or account_scope()
+    endpoint = info.get("runtime_endpoint")
+    if not account or not endpoint or info.get("created_by") != "owned":
         return False
-    if endpoint := info.get("runtime_endpoint"):
-        try:
-            return runtime_endpoint(name) == endpoint
-        except OSError:
-            return False
-    return True
+    if info.get("account_scope", account) != account:
+        return False
+    if assignments is not None and assignments.get(endpoint) != name:
+        return False
+    # Legacy ownership requires a positive match in the active account's listing.
+    if "account_scope" not in info and assignments is None:
+        return False
+    try:
+        return runtime_endpoint(name) == endpoint
+    except OSError:
+        return False
 
 
 def owned_sessions() -> list[str]:
     """Return locally registered Studio runtimes, including releases awaiting verification."""
-    return [
-        path.stem for path in sorted(KEEP.glob("*.json"))
-        if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", path.stem) and path.stem not in (".", "..")
-        and (keep_info(path.stem) or {}).get("created_by") == "owned"
-    ]
+    account = account_scope()
+    names = []
+    for path in sorted(KEEP.glob("*.json")):
+        info = keep_info(path.stem) or {}
+        if (account and info.get("created_by") == "owned" and info.get("runtime_endpoint")
+                and info.get("account_scope", account) == account):
+            names.append(path.stem)
+    return names
+
+
+def has_pending_allocation(account: str) -> bool:
+    return any(
+        info.get("created_by") == "pending" and info.get("account_scope") == account
+        for path in KEEP.glob("*.json") if (info := keep_info(path.stem))
+    )
 
 
 def set_keep(
@@ -249,6 +302,8 @@ def set_keep(
     pid: int | None = None,
     owner: str | None = None,
     extra: dict | None = None,
+    *,
+    reserve: bool = False,
 ):
     session = sanitize_session_name(session)
     KEEP.mkdir(parents=True, exist_ok=True)
@@ -270,7 +325,11 @@ def set_keep(
     try:
         with stream:
             json.dump(data, stream, ensure_ascii=False)
-        tmp.replace(kf)
+        if reserve:
+            # Install an allocation reservation only if another run has not claimed the alias.
+            os.link(tmp, kf)
+        else:
+            tmp.replace(kf)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -290,15 +349,22 @@ def release_runtime(
     owner: str | None = None,
     endpoint: str | None = None,
     *,
+    account: str | None = None,
     owned_only: bool = False,
     watchdog_keep: dict | None = None,
 ) -> ReleaseState:
     """Request release and verify the assignment independently of the command reply."""
     session = sanitize_session_name(session)
     keep = keep_info(session)
+    if keep is None and keep_file(session).exists():
+        return ReleaseState.FAILED
     if watchdog_keep is not None and keep != watchdog_keep:
         return ReleaseState.PENDING
     info = keep or {}
+    supplied_identity = account is not None and endpoint is not None
+    account = account or account_scope()
+    if not account or account_scope() != account or info.get("account_scope", account) != account:
+        return ReleaseState.FAILED
     if (owned_only or watchdog_keep is not None) and info.get("created_by") != "owned":
         return ReleaseState.FAILED
     if info.get("created_by") == "pending" and not (owner == "owned" and endpoint):
@@ -307,57 +373,66 @@ def release_runtime(
     owner = owner or info.get("created_by", "external")
     registered = info.get("runtime_endpoint")
     endpoint = endpoint or registered
+    if not endpoint and (not explicit_name or owner != "external"):
+        return ReleaseState.FAILED
     same_record = not (registered and registered != endpoint)
     retrying = watchdog_keep is not None
-    scheduled = retrying
     already_requested = (
         owner == "owned" and not retrying and same_record and info.get("release_pending")
         and isinstance(info.get("expires"), (int, float)) and time.time() < info["expires"]
     )
 
-    try:
-        current_endpoint = runtime_endpoint(session)
-    except Exception as exc:
-        current_endpoint = None
-        print(f"⚠️ 無法讀取 {session} 的遠端識別（{type(exc).__name__}）", flush=True)
-    if explicit_name and registered and current_endpoint and current_endpoint != registered:
+    names, out = sessions_checked(account=account)
+    assignments = listed_assignments(out) if names is not None else None
+    listed = next((ep for ep, alias in (assignments or {}).items() if alias == session), None)
+    if explicit_name and registered and listed and listed != registered:
         print(f"⚠️ {session} 的遠端識別已變更，請先確認關機目標", flush=True)
         return ReleaseState.FAILED
-    if not info.get("release_pending"):
-        endpoint = endpoint or current_endpoint
+    endpoint = endpoint or listed
+    # A legacy record can be bound only by a positive alias + endpoint match.
+    bound = supplied_identity or info.get("account_scope") == account or (endpoint is not None and listed == endpoint)
+    if not endpoint or not bound or account_scope() != account:
+        return ReleaseState.FAILED
 
-    if retrying and endpoint and not registered:
+    def confirm_absence() -> bool:
+        if not session_gone(session, names, out, endpoint) or account_scope() != account:
+            return False
+        if same_record and keep_info(session) == keep:
+            drop_keep(session)
+        return True
+
+    if confirm_absence():
+        return ReleaseState.CONFIRMED
+
+    scheduled = retrying
+    if retrying and "account_scope" not in info:
         if keep_info(session) != keep:
             return ReleaseState.PENDING
-        set_keep(session, info.get("expires"), extra={"runtime_endpoint": endpoint})
+        set_keep(session, info.get("expires"), extra={"account_scope": account})
         keep = keep_info(session)
-    elif owner == "owned" and same_record and endpoint and not retrying:
+    elif owner == "owned" and same_record and not retrying:
         try:
+            if keep_info(session) != keep:
+                return ReleaseState.FAILED
             if not already_requested:
                 set_keep(
                     session, time.time() + 30, owner=owner,
-                    extra={"busy_until": None, "release_pending": True, "runtime_endpoint": endpoint},
+                    extra={"busy_until": None, "release_pending": True,
+                           "runtime_endpoint": endpoint, "account_scope": account},
                 )
             start_watchdog(session)
             scheduled = True
         except Exception as exc:
             print(f"⚠️ 無法登記 {session} 的關機重試（{type(exc).__name__}）", flush=True)
         keep = keep_info(session)
-    try:
-        if not already_requested and same_record and endpoint and runtime_endpoint(session) == endpoint:
-            if keep_info(session) == keep:
-                colab("stop", "-s", session, timeout=300)
-    except (OSError, RuntimeError, SystemExit) as exc:
-        print(f"⚠️ 無法送出 {session} 的關機請求（{type(exc).__name__}）", flush=True)
-
-    try:
-        names, out = sessions_checked()
-        if session_gone(session, names, out, endpoint):
-            if same_record and keep_info(session) == keep:
-                drop_keep(session)
+    if not already_requested and same_record and listed == endpoint and keep_info(session) == keep:
+        try:
+            colab("stop", "-s", session, timeout=300, account=account, endpoint=endpoint)
+        except (OSError, RuntimeError, SystemExit) as exc:
+            print(f"⚠️ 無法送出 {session} 的關機請求（{type(exc).__name__}）", flush=True)
+        names, out = sessions_checked(account=account)
+        if confirm_absence():
             return ReleaseState.CONFIRMED
-    except Exception as exc:
-        print(f"⚠️ 無法確認 {session} 的關機狀態（{type(exc).__name__}）", flush=True)
     return ReleaseState.PENDING if scheduled else ReleaseState.FAILED
 
 
@@ -374,12 +449,16 @@ def pid_alive(pid: int | None) -> bool:
         return False
 
 
-def remote_exec(session: str, code: str, timeout: int = 120, tries: int = 3) -> str:
+def remote_exec(
+    session: str, code: str, timeout: int = 120, tries: int = 3,
+    *, account: str, endpoint: str,
+) -> str:
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
         f.write(code.rstrip("\n") + "\nprint('CSTUDIO_EXEC_OK')\n")
     try:
         for k in range(tries):
-            out = colab("exec", "-s", session, "-f", f.name, "--timeout", timeout, timeout=timeout + 30, check=False)
+            out = colab("exec", "-s", session, "-f", f.name, "--timeout", timeout,
+                        timeout=timeout + 30, check=False, account=account, endpoint=endpoint)
             if "CSTUDIO_EXEC_OK" in out:
                 return out.replace("CSTUDIO_EXEC_OK", "").strip()
             print(f"…exec 沒有回應，重試（{k + 1}/{tries}）", flush=True)
@@ -388,9 +467,10 @@ def remote_exec(session: str, code: str, timeout: int = 120, tries: int = 3) -> 
         os.unlink(f.name)
 
 
-def poll_remote_status(session: str, timeout: int = 60) -> dict | None:
+def poll_remote_status(session: str, timeout: int = 60, *, account: str, endpoint: str) -> dict | None:
     status_py = REMOTE / "status.py"
-    out = colab("exec", "-s", session, "-f", status_py, "--timeout", timeout, timeout=timeout + 20, check=False)
+    out = colab("exec", "-s", session, "-f", status_py, "--timeout", timeout,
+                timeout=timeout + 20, check=False, account=account, endpoint=endpoint)
     for line in reversed(out.splitlines()):
         if "CSTUDIO_STATUS " in line:
             try:
@@ -400,20 +480,55 @@ def poll_remote_status(session: str, timeout: int = 60) -> dict | None:
     return None
 
 
-def request_cancel(session: str, run_id: str | None = None, *, allow_start: bool = False) -> dict:
+def active_endpoint(session: str, account: str) -> str:
+    """Resolve a selected alias in the active account without adopting stale keep data."""
+    names, out = sessions_checked(account=account)
+    assignments = listed_assignments(out) if names is not None else None
+    endpoint = next((ep for ep, alias in (assignments or {}).items() if alias == session), None)
+    info = keep_info(session)
+    keep = info or {}
+    if (
+        not endpoint or runtime_endpoint(session) != endpoint or account_scope() != account
+        or (info is None and keep_file(session).exists())
+        or keep.get("account_scope", account) != account or keep.get("runtime_endpoint") not in (None, endpoint)
+        or keep.get("created_by") == "pending"
+    ):
+        raise RuntimeError("無法確認 Colab Session 的帳號及遠端識別")
+    return endpoint
+
+
+def keep_target(session: str, info: dict, account: str | None) -> dict:
+    """Bind a keep update to a verified assignment, preserving proven ownership."""
+    if not account:
+        raise RuntimeError("無法確認 Colab 登入身分")
+    endpoint = active_endpoint(session, account)
+    if (keep_info(session) or {}) != info:
+        raise RuntimeError("Colab Session 記錄已變更，請重新確認")
+    matched = info.get("runtime_endpoint") == endpoint
+    return {
+        "owner": "owned" if matched and info.get("created_by") == "owned" else "external",
+        "extra": {"account_scope": account, "runtime_endpoint": endpoint,
+                  "bundle_hash": info.get("bundle_hash") if matched else None},
+    }
+
+
+def request_cancel(
+    session: str, run_id: str | None = None, *, allow_start: bool = False,
+    account: str | None = None, endpoint: str | None = None,
+) -> dict:
     session = sanitize_session_name(session)
     if run_id is not None and not re.fullmatch(r"[0-9a-f]{12}", run_id):
         raise ValueError("不合法的批次 ID")
-    keep = keep_info(session) or {}
-    endpoint = keep.get("runtime_endpoint")
-    if endpoint and runtime_endpoint(session) != endpoint:
-        raise RuntimeError("Session 遠端識別已變更，無法確認取消目標")
+    account = account or account_scope()
+    if not account:
+        raise RuntimeError("無法確認 Colab 登入身分")
+    endpoint = endpoint or active_endpoint(session, account)
     source = (REMOTE / "cancel.py").read_text(encoding="utf-8")
     code = source + (
         f"\nprint('CSTUDIO_CANCEL ' + json.dumps("
         f"request_cancel(Path('/content/cstudio'), {run_id!r}, allow_start={allow_start!r})))\n"
     )
-    out = remote_exec(session, code, timeout=15, tries=1)
+    out = remote_exec(session, code, timeout=15, tries=1, account=account, endpoint=endpoint)
     for line in reversed(out.splitlines()):
         if line.startswith("CSTUDIO_CANCEL "):
             result = json.loads(line.partition(" ")[2])
@@ -466,26 +581,38 @@ def watchdog_loop(session: str):
                 say("keep file removed: exit")
                 return
             info = keep_info(session)
-            if info and info.get("created_by") == "pending":
+            if info is None:
+                say("cannot read keep record; waiting for ownership evidence")
+                continue
+            account = account_scope()
+            if not account or info.get("account_scope", account) != account:
+                continue
+            endpoint = info.get("runtime_endpoint")
+            if info.get("created_by") == "pending":
                 # An interrupted allocation can lack a local name-to-endpoint mapping.
                 # Confirm absence when possible, but never stop an unclaimed runtime.
-                if loops % 10 == 0 and time.time() >= info["busy_until"]:
-                    names, lout = sessions_checked()
-                    if session_gone(session, names, lout) and keep_info(session) == info:
+                if "account_scope" not in info:
+                    say("allocation is unconfirmed; inspect Colab runtimes for an unmatched assignment")
+                    return
+                if loops % 10 == 0 and time.time() >= (info.get("busy_until") or 0):
+                    names, lout = sessions_checked(account=account)
+                    assignments = listed_assignments(lout) if names is not None else None
+                    if (
+                        assignments is not None and session not in assignments.values()
+                        and assignments.keys() <= set(info.get("allocation_baseline", []))
+                        and account_scope() == account and keep_info(session) == info
+                    ):
                         drop_keep(session)
                         say("no active assignment found for pending allocation")
                         return
                     say("allocation is unconfirmed; inspect Colab runtimes for an unmatched assignment")
                 continue
-            if loops % 10 == 0:
-                names, lout = sessions_checked()
-                if session_gone(session, names, lout, (info or {}).get("runtime_endpoint")) and keep_info(session) == info:
+            if loops % 10 == 0 and info.get("account_scope") == account and endpoint:
+                names, lout = sessions_checked(account=account)
+                if session_gone(session, names, lout, endpoint) and keep_info(session) == info and account_scope() == account:
                     say("session already gone: dropping keep file")
                     drop_keep(session)
                     return
-            if info is None:
-                say("cannot read keep record; waiting for ownership evidence")
-                continue
             exp = info.get("expires")
             busy_until = info.get("busy_until")
             hard_expired = isinstance(busy_until, (int, float)) and time.time() >= busy_until
@@ -511,8 +638,13 @@ def watchdog_loop(session: str):
                 drop_keep(session)
                 return
 
+            if not endpoint:
+                say("keep record has no runtime endpoint; ownership is unconfirmed")
+                return
             if not (hard_expired or release_pending):
-                st = poll_remote_status(session)
+                if "account_scope" not in info and active_endpoint(session, account) != endpoint:
+                    continue
+                st = poll_remote_status(session, account=account, endpoint=endpoint)
                 if st and st.get("alive"):
                     say("time is up but batch is running: wait")
                     continue
@@ -520,9 +652,9 @@ def watchdog_loop(session: str):
                 continue
 
             say("time is up: releasing GPU")
-            if release_runtime(session, watchdog_keep=info) == ReleaseState.CONFIRMED:
+            if release_runtime(session, watchdog_keep=info, account=account) == ReleaseState.CONFIRMED:
                 say("confirmed released")
                 return
-            say("stop issued; will verify on next tick")
+            say("release unconfirmed; will verify on next tick")
         except Exception as e:
             say(f"error (will retry): {type(e).__name__}: {str(e)[:200]}")

@@ -275,13 +275,14 @@ class CancellationClientTests(unittest.TestCase):
 
     def test_local_client_rejects_confirmation_for_another_run(self):
         output = f'CSTUDIO_CANCEL {{"state": "confirmed", "run_id": "{OTHER_RUN}"}}'
-        with patch.object(colab_client, "remote_exec", return_value=output):
+        with patch.multiple(colab_client, remote_exec=Mock(return_value=output),
+                            account_scope=Mock(return_value="fixture-account"), active_endpoint=Mock(return_value="endpoint")):
             with self.assertRaisesRegex(RuntimeError, "遠端未回傳"):
                 colab_client.request_cancel("other", RUN)
 
     def test_cli_reports_pending_without_extending_keep(self):
         with patch.multiple(
-            colab_client, sessions=Mock(return_value=(["other"], "")),
+            colab_client, sessions=Mock(return_value=(["other"], "")), account_scope=Mock(return_value="fixture-account"),
             request_cancel=Mock(return_value={"state": "pending", "run_id": RUN}),
         ), redirect_stdout(io.StringIO()) as printed:
             cli.cmd_cancel(Namespace(session="other", run_id=RUN))

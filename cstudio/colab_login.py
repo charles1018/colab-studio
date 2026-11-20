@@ -4,6 +4,7 @@
   uv run cstudio login code <CODE>    -> saves OAuth token to ~/.config/colab-cli/token.json
   uv run cstudio login status
 """
+import hashlib
 import json
 import sys
 from importlib import resources
@@ -21,6 +22,22 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 REDIRECT = "https://sdk.cloud.google.com/applicationdefaultauthcode.html"
+
+
+def credential_scope(data: dict) -> str | None:
+    """Identify the local OAuth grant across access-token refreshes."""
+    grant = [data.get("client_id"), data.get("refresh_token")]
+    if not all(isinstance(value, str) and value for value in grant):
+        return None
+    return hashlib.sha256(json.dumps(grant).encode()).hexdigest()
+
+
+def account_scope() -> str | None:
+    try:
+        data = json.loads(TOKEN.read_text(encoding="utf-8"))
+        return credential_scope(data) if isinstance(data, dict) else None
+    except (OSError, ValueError, RecursionError):
+        return None
 
 
 def client_config():

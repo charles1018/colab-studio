@@ -18,6 +18,7 @@ class RuntimeAllocationTests(unittest.TestCase):
     session = "cstudio-test"
     endpoint = "fixture-runtime"
     no_sessions = "[colab] No active sessions found on server."
+    allocation_refused = "[colab] Allocation refused (precondition failed)."
     image_bytes = b"fixture image"
 
     def setUp(self):
@@ -41,6 +42,7 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.enterContext(patch.multiple(
             C,
             KEEP=self.directory / "keep",
+            account_scope=Mock(return_value="fixture-account"),
             time=clock,
             colab=Mock(side_effect=self.fake_colab),
             token_ok=Mock(return_value=True),
@@ -71,7 +73,7 @@ class RuntimeAllocationTests(unittest.TestCase):
             self.assertGreater(self.reservations[0]["busy_until"], self.now)
             self.runtimes[self.session] = self.endpoint
             self.on_allocate()
-            return "[colab] Session READY."
+            return f"CSTUDIO_ASSIGNED {self.endpoint}" if self.session in self.runtimes else "[colab] Session READY."
         if command == "stop":
             self.on_stop()
             self.runtimes.pop(args[1], None)
@@ -133,7 +135,7 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.on_allocate.side_effect = lambda: setattr(self, "abort", "stop")
         with self.assertRaisesRegex(RuntimeError, "stopped by user"):
             self.run_manifest()
-        self.assertEqual(self.commands, ["usage", "sessions", "new", "stop", "sessions", "usage"])
+        self.assertEqual(self.commands, ["usage", "sessions", "new", "sessions", "stop", "sessions", "usage"])
         self.assertNotIn(self.session, self.runtimes)
         self.assertIsNone(C.keep_info(self.session))
         C.remote_exec.assert_not_called()
@@ -238,6 +240,95 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.assertNotIn("new", self.commands)
         self.assertIsNone(C.keep_info(self.session))
 
+    def test_mixed_error_and_assignment_rows_do_not_authorize_allocation(self):
+        raw = "[other] other-endpoint | Hardware: L4\nPermission denied"
+        with patch.object(C, "sessions", return_value=(["other"], raw)):
+            with self.assertRaisesRegex(RuntimeError, "無法確認開啟中的"):
+                self.run_manifest()
+        self.assertNotIn("new", self.commands)
+
+    def test_absent_alias_with_existing_keep_does_not_reallocate(self):
+        C.set_keep(self.session, self.now + 60, owner="owned", extra={
+            "runtime_endpoint": "previous-endpoint", "account_scope": "another-account",
+        })
+        original = C.keep_info(self.session)
+        with self.assertRaises(RuntimeError):
+            self.run_manifest()
+        self.assertNotIn("new", self.commands)
+        self.assertEqual(C.keep_info(self.session), original)
+
+    def test_503_after_unrecorded_assignment_is_not_retried(self):
+        def lose_reply():
+            self.runtimes["?"] = self.runtimes.pop(self.session)
+            raise RuntimeError("503 Service Unavailable")
+
+        self.on_allocate.side_effect = lose_reply
+        with self.assertRaises(RuntimeError):
+            self.run_manifest(assign_retries=2, assign_wait=0)
+        self.assertEqual(self.commands.count("new"), 1)
+        self.assertNotIn("stop", self.commands)
+        self.assertEqual(C.keep_info(self.session)["created_by"], "pending")
+
+    def test_selected_alias_must_exist_for_web_reuse(self):
+        with self.assertRaisesRegex(RuntimeError, "可沿用或安全配置"):
+            self.run_manifest(reuse_only=True)
+        self.assertNotIn("new", self.commands)
+
+    def test_same_name_replacement_does_not_enter_the_runtime(self):
+        self.runtimes[self.session] = "replacement-endpoint"
+        C.set_keep(self.session, self.now + 60, owner="owned", extra={
+            "runtime_endpoint": self.endpoint, "account_scope": "fixture-account",
+        })
+        original = C.keep_info(self.session)
+        with self.assertRaisesRegex(RuntimeError, "遠端識別已變更"):
+            self.run_manifest()
+        C.remote_exec.assert_not_called()
+        C.poll_remote_status.assert_not_called()
+        self.assertNotIn("new", self.commands)
+        self.assertEqual(C.keep_info(self.session), original)
+
+    def test_account_change_during_allocation_preserves_original_recovery_record(self):
+        self.on_allocate.side_effect = lambda: setattr(C.account_scope, "return_value", "another-account")
+        with self.assertRaisesRegex(RuntimeError, "登入身分已變更"):
+            self.run_manifest()
+        self.assertNotIn("stop", self.commands)
+        self.assertEqual(C.keep_info(self.session)["account_scope"], "fixture-account")
+        self.assertEqual(C.keep_info(self.session)["runtime_endpoint"], self.endpoint)
+        C.remote_exec.assert_not_called()
+
+    def test_auto_reuse_uses_current_account_owned_assignment(self):
+        self.runtimes.update({"a-foreign": "other-endpoint", self.session: self.endpoint})
+        for name, account in [("a-foreign", "other-account"), (self.session, "fixture-account")]:
+            C.set_keep(name, self.now + 60, owner="owned", extra={
+                "runtime_endpoint": self.runtimes[name], "account_scope": account,
+            })
+        C.poll_remote_status.side_effect = [{"alive": False}, self.done_status()]
+        result = R.run_manifest(self.manifest, auto_reuse=True, exit_on_error=False)
+        self.assertEqual(result["session"], self.session)
+        self.assertNotIn("new", self.commands)
+
+    def test_pending_allocation_blocks_web_auto_create_even_when_listing_is_empty(self):
+        C.set_keep(self.session, None, owner="pending", extra={"account_scope": "fixture-account"})
+        with self.assertRaisesRegex(RuntimeError, "尚待確認"):
+            R.run_manifest(self.manifest, auto_reuse=True, exit_on_error=False)
+        self.assertNotIn("new", self.commands)
+
+    def test_name_only_legacy_keep_reuses_as_external_without_cache(self):
+        self.runtimes[self.session] = self.endpoint
+        C.set_keep(self.session, self.now + 60, owner="owned", extra={"bundle_hash": R.compute_remote_bundle_hash()})
+        C.poll_remote_status.side_effect = [{"alive": False}, self.done_status()]
+        with patch.object(R, "bundle_and_launch_code", wraps=R.bundle_and_launch_code) as bundle:
+            self.run_manifest()
+        self.assertIsNotNone(bundle.call_args.args[0])
+        self.assertEqual(C.keep_info(self.session)["created_by"], "external")
+        self.assertFalse(C.is_owned_session(self.session))
+
+    def test_contended_allocation_reservation_does_not_replace_other_run(self):
+        C.set_keep(self.session, None, owner="pending", extra={"allocation_id": "first"}, reserve=True)
+        with self.assertRaises(FileExistsError):
+            C.set_keep(self.session, None, owner="pending", extra={"allocation_id": "second"}, reserve=True)
+        self.assertEqual(C.keep_info(self.session)["allocation_id"], "first")
+
     def test_successful_allocation_syncs_and_transitions_to_idle(self):
         result = self.run_manifest()
         self.assertEqual(result["jobs"]["test"]["status"], "done")
@@ -277,32 +368,57 @@ class RuntimeAllocationTests(unittest.TestCase):
     def test_watchdog_releases_confirmed_owned_runtime_at_busy_deadline(self):
         self.runtimes[self.session] = self.endpoint
         C.set_keep(self.session, None, owner="owned", extra={
-            "busy_until": self.now + 30, "runtime_endpoint": self.endpoint,
+            "busy_until": self.now + 30, "runtime_endpoint": self.endpoint, "account_scope": "fixture-account",
         })
         C.watchdog_loop(self.session)
         self.assertNotIn(self.session, self.runtimes)
-        self.assertEqual(self.commands, ["stop", "sessions"])
+        self.assertEqual(self.commands, ["sessions", "stop", "sessions"])
         C.poll_remote_status.assert_not_called()
         self.assertIsNone(C.keep_info(self.session))
 
-    def test_watchdog_preserves_unconfirmed_allocation_until_verified_absent(self):
-        C.set_keep(self.session, None, owner="pending", extra={"busy_until": self.now})
-        listings = iter([([], "[?] fixture-runtime | Hardware: L4"), ([], self.no_sessions)])
+    def test_watchdog_waits_for_original_account_before_reconciling(self):
+        self.runtimes[self.session] = self.endpoint
+        C.set_keep(self.session, None, owner="owned", extra={
+            "busy_until": self.now, "runtime_endpoint": self.endpoint, "account_scope": "fixture-account",
+        })
+        C.account_scope.return_value = "foreign-account"
 
-        def list_while_pending():
+        def tick(seconds):
+            self.advance(seconds)
+            if self.now == 1_330:
+                C.colab.assert_not_called()
+                self.assertEqual(C.keep_info(self.session)["runtime_endpoint"], self.endpoint)
+                C.account_scope.return_value = "fixture-account"
+
+        with patch.object(C.time, "sleep", side_effect=tick):
+            C.watchdog_loop(self.session)
+        self.assertEqual(self.commands, ["sessions", "stop", "sessions"])
+        self.assertIsNone(C.keep_info(self.session))
+
+    def test_watchdog_preserves_unconfirmed_allocation_until_verified_absent(self):
+        C.set_keep(self.session, None, owner="pending", extra={
+            "busy_until": self.now, "account_scope": "fixture-account", "allocation_baseline": [],
+        })
+        listings = iter([
+            ([], "[?] fixture-runtime | Hardware: L4"),
+            (["foreign"], "[foreign] fixture-runtime | Hardware: L4"),
+            ([], self.no_sessions),
+        ])
+
+        def list_while_pending(**options):
             self.assertEqual(C.keep_info(self.session)["created_by"], "pending")
             return next(listings)
 
         with patch.object(C, "sessions_checked", side_effect=list_while_pending) as checks:
             C.watchdog_loop(self.session)
-        self.assertEqual(checks.call_count, 2)
+        self.assertEqual(checks.call_count, 3)
         self.assertNotIn("stop", self.commands)
         self.assertIsNone(C.keep_info(self.session))
 
     def test_release_does_not_stop_a_different_runtime_with_same_name(self):
         self.runtimes[self.session] = "replacement-runtime"
         C.set_keep(self.session, self.now + 60, owner="external", extra={
-            "runtime_endpoint": "replacement-runtime",
+            "runtime_endpoint": "replacement-runtime", "account_scope": "fixture-account",
         })
         self.assertEqual(C.release_runtime(self.session, "owned", self.endpoint), C.ReleaseState.CONFIRMED)
         self.assertEqual(self.commands, ["sessions"])
@@ -310,18 +426,18 @@ class RuntimeAllocationTests(unittest.TestCase):
 
     def test_cancel_during_retry_backoff_prevents_second_allocation(self):
         abort = Mock(side_effect=[None, None, RuntimeError("fixture cancelled")])
-        with patch.object(C, "colab", side_effect=RuntimeError("503")) as command:
+        with patch.object(C, "colab", side_effect=RuntimeError(self.allocation_refused)) as command:
             with self.assertRaisesRegex(RuntimeError, "fixture cancelled"):
                 C.new_runtime(self.session, "L4", retries=2, wait=3, check_abort=abort)
         command.assert_called_once()
         self.assertEqual(self.now, 1_003.0)
 
     def test_allocation_deadline_does_not_shorten_in_flight_request(self):
-        with patch.object(C, "colab", side_effect=RuntimeError("503")) as command:
+        with patch.object(C, "colab", side_effect=RuntimeError(self.allocation_refused)) as command:
             with self.assertRaisesRegex(RuntimeError, "配置時間上限"):
                 C.new_runtime(self.session, "L4", wait=120, deadline=self.now + 12)
         self.assertEqual(command.call_args_list, [
-            call("new", "-s", self.session, "--gpu", "L4", timeout=C.ASSIGN_TIMEOUT),
+            call("new", "-s", self.session, "--gpu", "L4", timeout=C.ASSIGN_TIMEOUT, account="fixture-account"),
         ])
         self.assertEqual(self.now, 1_012.0)
 
@@ -355,7 +471,7 @@ class RuntimeAllocationTests(unittest.TestCase):
             self.abort = "cancel"
             return 'CSTUDIO_PREP {"launched": true, "missing_inputs": []}'
 
-        def snapshot(_session):
+        def snapshot(_session, **_target):
             run_id = progress.call_args.args[0]["run_id"]
             if C.poll_remote_status.call_count == 1:
                 return {"run_id": run_id, "stage": "running", "done": False}
@@ -367,7 +483,8 @@ class RuntimeAllocationTests(unittest.TestCase):
             with self.assertRaisesRegex(R.RunCancelled, "已確認遠端批次取消"):
                 self.run_manifest(progress_cb=progress)
         cancelled = progress.call_args.args[0]
-        send.assert_called_once_with(self.session, cancelled["run_id"], allow_start=True)
+        send.assert_called_once_with(self.session, cancelled["run_id"], allow_start=True,
+                                     account="fixture-account", endpoint=self.endpoint)
         self.assertEqual(cancelled["stage"], "cancelled")
         self.assertEqual(cancelled["_local_synced_jobs"], ["test"])
         self.assertEqual((self.result_path.parent / "test.png").read_bytes(), self.image_bytes)
@@ -382,7 +499,7 @@ class RuntimeAllocationTests(unittest.TestCase):
             return 'CSTUDIO_PREP {"launched": true, "missing_inputs": []}'
 
         C.remote_exec.side_effect = prepare
-        C.poll_remote_status.side_effect = lambda _session: {
+        C.poll_remote_status.side_effect = lambda _session, **_target: {
             "run_id": progress.call_args.args[0]["run_id"], "stage": "cancel_failed",
             "done": True, "error": "fixture: remote task still active", "cancel_protocol": 1,
         }
@@ -407,7 +524,7 @@ class RuntimeAllocationTests(unittest.TestCase):
             setattr(self, "abort", "cancel") or 'CSTUDIO_PREP {"launched": true, "missing_inputs": []}'
         )
 
-        def snapshot(_session):
+        def snapshot(_session, **_target):
             run_id = progress.call_args.args[0]["run_id"]
             if C.poll_remote_status.call_count == 1:
                 return {"run_id": run_id, "stage": "running", "done": False}

@@ -29,6 +29,7 @@ class ShutdownTests(unittest.TestCase):
         self.enterContext(patch.multiple(
             C,
             KEEP=self.keep,
+            account_scope=Mock(return_value="fixture-account"),
             runtime_endpoint=Mock(side_effect=self.runtimes.get),
             colab=Mock(side_effect=self.fake_command),
             start_watchdog=Mock(),
@@ -54,7 +55,9 @@ class ShutdownTests(unittest.TestCase):
 
     def session(self, name, owner="owned"):
         self.runtimes[name] = name + "-endpoint"
-        C.set_keep(name, 5_000, owner=owner, extra={"runtime_endpoint": self.runtimes[name]})
+        C.set_keep(name, 5_000, owner=owner, extra={
+            "runtime_endpoint": self.runtimes[name], "account_scope": "fixture-account",
+        })
 
     def test_success_reply_without_verified_release_remains_pending(self):
         self.session("gpu")
@@ -79,7 +82,7 @@ class ShutdownTests(unittest.TestCase):
         original = C.keep_info("external")
         self.assertEqual(C.release_runtime("external"), C.ReleaseState.FAILED)
         self.assertEqual(C.keep_info("external"), original)
-        self.assertEqual(self.commands[0], ("stop", "-s", "external"))
+        self.assertIn(("stop", "-s", "external"), self.commands)
         C.start_watchdog.assert_not_called()
 
     def test_watchdog_launch_failure_keeps_record_but_does_not_claim_retry(self):
@@ -106,15 +109,60 @@ class ShutdownTests(unittest.TestCase):
         C.set_keep("gpu", 5_000, owner="owned")
         self.runtimes["?"] = "unclaimed-endpoint"
         self.assertEqual(C.release_runtime("gpu", owned_only=True), C.ReleaseState.FAILED)
-        self.assertEqual(self.commands, [("sessions",)])
+        self.assertEqual(self.commands, [])
         C.start_watchdog.assert_not_called()
         self.assertNotIn("release_pending", C.keep_info("gpu"))
+
+    def test_legacy_name_only_ownership_does_not_stop_a_replacement(self):
+        C.set_keep("gpu", 5_000, owner="owned")
+        self.runtimes["gpu"] = "unproven-runtime"
+        original = C.keep_info("gpu")
+        self.assertEqual(C.release_runtime("gpu", owned_only=True), C.ReleaseState.FAILED)
+        self.assertNotIn(("stop", "-s", "gpu"), self.commands)
+        self.assertEqual(C.keep_info("gpu"), original)
+
+    def test_other_accounts_empty_listing_cannot_confirm_or_remove_keep(self):
+        self.session("gpu")
+        self.runtimes.clear()
+        C.account_scope.return_value = "other-account"
+        original = C.keep_info("gpu")
+        self.assertEqual(C.release_runtime("gpu", owned_only=True), C.ReleaseState.FAILED)
+        self.assertEqual(C.owned_sessions(), [])
+        self.assertEqual(C.keep_info("gpu"), original)
+        C.colab.assert_not_called()
+
+    def test_account_switch_during_listing_prevents_stop_and_confirmation(self):
+        self.session("gpu")
+        original = C.keep_info("gpu")
+
+        def switch(*_args, **_options):
+            C.account_scope.return_value = "other-account"
+            return NO_SESSIONS
+
+        C.colab.side_effect = switch
+        with patch.object(C.time, "sleep"):
+            self.assertEqual(C.release_runtime("gpu", owned_only=True), C.ReleaseState.FAILED)
+        self.assertEqual(C.keep_info("gpu"), original)
+        self.assertTrue(all(call.args == ("sessions",) for call in C.colab.call_args_list))
+
+    def test_listing_failure_keeps_release_pending_without_dispatch(self):
+        self.session("gpu")
+        with patch.object(C, "sessions", side_effect=OSError("connection unavailable")), patch.object(C.time, "sleep"):
+            self.assertEqual(C.release_runtime("gpu", owned_only=True), C.ReleaseState.PENDING)
+        self.assertTrue(C.keep_info("gpu")["release_pending"])
+        C.colab.assert_not_called()
+
+    def test_external_named_assignment_without_keep_can_be_stopped_explicitly(self):
+        self.runtimes["external"] = "external-endpoint"
+        self.assertEqual(C.release_runtime("external"), C.ReleaseState.CONFIRMED)
+        self.assertIn(("stop", "-s", "external"), self.commands)
+        C.start_watchdog.assert_not_called()
 
     def test_explicit_shutdown_detects_stale_name_without_touching_replacement(self):
         self.session("gpu")
         self.runtimes["gpu"] = "replacement"
         self.assertEqual(C.release_runtime("gpu"), C.ReleaseState.FAILED)
-        C.colab.assert_not_called()
+        self.assertEqual(self.commands, [("sessions",)])
         self.assertEqual(C.keep_info("gpu")["runtime_endpoint"], "gpu-endpoint")
 
     def test_cli_bulk_reports_partial_release_and_skips_unowned_targets(self):
@@ -202,7 +250,12 @@ class ShutdownTests(unittest.TestCase):
             self.ui.refresh_colab_cache(force=True)
             self.assertEqual(self.ui.session, "gpu")
             self.runtimes.clear()
+            self.runtimes["?"] = "unrelated-unassigned-alias"
             self.assertEqual(C.release_runtime("gpu", watchdog_keep=C.keep_info("gpu")), C.ReleaseState.CONFIRMED)
+            C.account_scope.return_value = "other-account"
+            self.ui.refresh_colab_cache(force=True)
+            self.assertEqual(self.ui.stage, "shutdown_pending")
+            C.account_scope.return_value = "fixture-account"
             self.ui.refresh_colab_cache(force=True)
         self.assertIsNone(self.ui.session)
         self.assertEqual(self.ui.stage, "stopped")
@@ -229,8 +282,9 @@ class AssignmentVerificationTests(unittest.TestCase):
 
     def test_nonzero_exit_code_invalidates_even_a_complete_looking_list(self):
         response = subprocess.CompletedProcess(["fixture"], 1, stdout=NO_SESSIONS, stderr="")
-        with patch.object(C.subprocess, "run", return_value=response), patch.object(C, "colab_exe", return_value="fixture"):
+        with patch.object(C.subprocess, "run", return_value=response) as command, patch.object(C, "account_scope", return_value="fixture-account"):
             names, out = C.sessions_checked(tries=1)
+        command.assert_called_once()
         self.assertIsNone(names)
         self.assertFalse(C.session_gone("gpu", names, out, "known-endpoint"))
 

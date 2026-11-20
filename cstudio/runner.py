@@ -389,6 +389,10 @@ def run_manifest(
     progress_cb: Callable[[dict[str, Any]], None] | None = None,
     exit_on_error: bool = True,
     should_abort: Callable[[], str | bool | None] | None = None,
+    *,
+    account: str | None = None,
+    auto_reuse: bool = False,
+    reuse_only: bool = False,
 ) -> dict[str, Any]:
     if gpu not in C.GPUS:
         _fail(f"不支援的 GPU {gpu!r}（可用：{', '.join(C.GPUS)}）", exit_on_error)
@@ -504,6 +508,10 @@ def run_manifest(
         _check_abort()
         if time.time() >= deadline:
             raise RuntimeError(f"超過 {max_minutes} 分鐘上限，中止以保護運算單元")
+        if C.account_scope() != account:
+            raise RuntimeError("Colab 登入身分已變更，請重新確認目標 Session")
+        if endpoint and C.runtime_endpoint(session) != endpoint:
+            raise RuntimeError(f"Session {session} 的遠端識別已變更，請先確認目標")
 
     local_synced: set[str] = set(done_ids)
     results: dict[str, Any] = {
@@ -515,10 +523,15 @@ def run_manifest(
     }
 
     _check_abort()
-    cu_before, _ = C.usage()
-    alive, _ = C.sessions_checked()
-    if alive is None:
+    account = account or C.account_scope()
+    if not account or C.account_scope() != account:
+        _fail("無法確認 Colab 登入身分，請重新確認目標 Session", exit_on_error)
+    cu_before, _ = C.usage(account=account)
+    alive, listing = C.sessions_checked(account=account)
+    assignments = C.listed_assignments(listing) if alive is not None else None
+    if assignments is None:
         _fail("無法確認開啟中的 Colab Session，請稍後再試", exit_on_error)
+    active = {name: ep for ep, name in assignments.items() if name != "?"}
 
     allocation_reserved = False
     allocation_attempted = False
@@ -527,29 +540,45 @@ def run_manifest(
     owned = False
     endpoint: str | None = None
 
-    short = dict(timeout=45, tries=6)
     got: set[str] = set()
     expected_todo_ids = {j["id"] for j in todo}
     finished = False
 
     try:
         _check_active()
-        reuse = session in alive
+        if auto_reuse and session is None:
+            registered = C.owned_sessions()
+            session = next((name for name in registered if C.is_owned_session(
+                name, account=account, assignments=assignments,
+            ) and not (C.keep_info(name) or {}).get("release_pending")), None)
+            if session is None and (
+                "?" in assignments.values() or active.keys() & set(registered) or C.has_pending_allocation(account)
+            ):
+                _fail("有尚待確認的 Colab Session，請先檢查目標或明確選擇新開", exit_on_error)
+        reuse = session in active
+        named = session is not None
         session = session or C.new_session_name()
         results["session"] = session
-        keep = C.keep_info(session) or {}
+        record = C.keep_info(session)
+        keep = record or {}
+        if record is None and C.keep_file(session).exists():
+            _fail(f"無法讀取 Session {session} 的本機識別紀錄", exit_on_error)
+        if keep.get("account_scope", account) != account:
+            _fail(f"Session {session} 的記錄屬於另一個 Colab 登入身分", exit_on_error)
         if keep.get("created_by") == "pending" or keep.get("release_pending"):
             _fail(f"Session {session} 的配置或關機仍待確認，請先檢查 Colab runtime 狀態", exit_on_error)
 
         if reuse:
-            owned = keep.get("created_by") == "owned" and C.is_owned_session(session)
-            endpoint = C.runtime_endpoint(session)
-            if keep.get("runtime_endpoint") and keep["runtime_endpoint"] != endpoint:
+            endpoint = active[session]
+            if keep.get("runtime_endpoint") not in (None, endpoint) or C.runtime_endpoint(session) != endpoint:
                 _fail(f"Session {session} 的遠端識別已變更，請先確認目標", exit_on_error)
-            st_check = C.poll_remote_status(session)
-            if st_check and st_check.get("stage") == "cancel_failed":
+            owned = C.is_owned_session(session, account=account, assignments=assignments)
+            st_check = C.poll_remote_status(session, account=account, endpoint=endpoint)
+            if not isinstance(st_check, dict):
+                _fail(f"無法確認 Session {session} 的遠端工作狀態", exit_on_error)
+            if st_check.get("stage") == "cancel_failed":
                 _fail(f"Session {session} 仍有待確認的取消結果，請先檢查遠端任務", exit_on_error)
-            if st_check and st_check.get("alive"):
+            if st_check.get("alive"):
                 _fail(
                     f"⚠️ Session {session} 上已有正在執行的批次任務，請先等待完成或執行 `uv run cstudio cancel --session {session}`",
                     exit_on_error,
@@ -557,14 +586,20 @@ def run_manifest(
             print(f"♻️ 沿用開啟中的 Colab Session：{session}（省去安裝與重複下載模型）", flush=True)
             _emit({"stage": "reusing_vm", "done": False, "log": [f"沿用開啟中的 Colab Session：{session}"]})
             _check_active()
+            if C.keep_info(session) != record:
+                _fail(f"Session {session} 的本機紀錄已變更，請重新確認", exit_on_error)
             C.set_keep(
                 session, None, owner="owned" if owned else "external",
-                extra={"busy_until": deadline if owned and endpoint else None, "runtime_endpoint": endpoint},
+                extra={"busy_until": deadline if owned else None, "runtime_endpoint": endpoint,
+                       "account_scope": account,
+                       "bundle_hash": keep.get("bundle_hash") if keep.get("runtime_endpoint") == endpoint else None},
             )
             attached = True
             if owned and endpoint:
                 C.start_watchdog(session)
         else:
+            if reuse_only or C.keep_file(session).exists() or (named and "?" in assignments.values()):
+                _fail(f"無法確認 Session {session} 可沿用或安全配置，請先檢查 Colab runtime 狀態", exit_on_error)
             print(f"🚀 在 Google Colab 開啟 {gpu}：{session}", flush=True)
             _emit({"stage": "booting_vm", "done": False, "log": [f"正在 Google Colab 分配並啟動 {gpu} ({session})..."]})
             _check_active()
@@ -572,23 +607,27 @@ def run_manifest(
                 _fail(f"Session {session} 已有本機配置紀錄，請先確認 Colab runtime 狀態", exit_on_error)
             C.set_keep(
                 session, None, owner="pending",
-                extra={"busy_until": deadline + C.ASSIGN_TIMEOUT + 30, "runtime_endpoint": None, "bundle_hash": None},
+                extra={"busy_until": deadline + C.ASSIGN_TIMEOUT + 30, "runtime_endpoint": None,
+                       "bundle_hash": None, "account_scope": account, "allocation_id": run_id,
+                       "allocation_baseline": sorted(assignments)},
+                reserve=True,
             )
             allocation_reserved = True
             C.start_watchdog(session)
             _check_active()
             allocation_attempted = True
-            C.new_runtime(
+            endpoint = C.new_runtime(
                 session, gpu, retries=assign_retries, wait=assign_wait,
-                check_abort=_check_active, deadline=deadline,
+                check_abort=_check_active, deadline=deadline, account=account,
             )
-            endpoint = C.runtime_endpoint(session)
-            if not endpoint:
-                raise RuntimeError(f"無法確認 {session} 的遠端識別，配置狀態待確認")
             attached = created = owned = True
+            if (C.keep_info(session) or {}).get("allocation_id") != run_id:
+                raise RuntimeError(f"Session {session} 的配置紀錄已變更，請重新確認")
             C.set_keep(session, None, owner="owned", extra={"busy_until": deadline, "runtime_endpoint": endpoint})
 
         _check_active()
+        target = dict(account=account, endpoint=endpoint)
+        short = dict(timeout=45, tries=6, **target)
         # Prepare remote manifest containing only `todo` jobs + metadata flags
         remote_m = dict(
             m,
@@ -623,6 +662,7 @@ def run_manifest(
             **short,
         )
         if need_code:
+            _check_active()
             C.set_keep(session, None, owner="owned" if (owned or created) else "external", extra={"bundle_hash": bundle_hash})
 
         prep_info = {}
@@ -643,7 +683,7 @@ def run_manifest(
                 break
             print(f"⬆️ 上傳參考圖：{f}", flush=True)
             _emit({"stage": "uploading_inputs", "done": False, "log": [f"正在上傳參考圖片：{f}"]})
-            C.colab("upload", "-s", session, base / f, f"/content/cstudio/inputs/{f}", timeout=600)
+            C.colab("upload", "-s", session, base / f, f"/content/cstudio/inputs/{f}", timeout=600, **target)
 
         _check_active()
         if not cancel_pending:
@@ -667,14 +707,14 @@ def run_manifest(
             if cancel_pending and not cancel_sent:
                 _emit({"stage": "cancelling", "done": False})
                 try:
-                    receipt = C.request_cancel(session, run_id, allow_start=True)
+                    receipt = C.request_cancel(session, run_id, allow_start=True, **target)
                 except (OSError, RuntimeError, ValueError):
                     receipt = {"state": "unknown"}
                 if receipt["state"] == "unsupported":
                     raise RuntimeError("此遠端批次不支援指定任務取消，無法確認已停止")
                 cancel_sent = receipt["state"] in {"pending", "confirmed", "finished", "failed"}
 
-            st = C.poll_remote_status(session)
+            st = C.poll_remote_status(session, **target)
             if not st:
                 if time.time() - last_ok > 15 * 60:
                     raise RuntimeError("連續 15 分鐘無法讀取 Colab 狀態，連線可能已中斷")
@@ -717,7 +757,8 @@ def run_manifest(
                     pull_err = None
                     for pull_try in range(max_pull_tries):
                         try:
-                            C.colab("download", "-s", session, f"/content/cstudio/{jinfo['file']}", tmp_pull, timeout=600)
+                            C.colab("download", "-s", session, f"/content/cstudio/{jinfo['file']}", tmp_pull,
+                                    timeout=600, **target)
                             if not tmp_pull.is_file() or tmp_pull.stat().st_size == 0:
                                 raise RuntimeError("下載的暫存檔為空")
                             exp_sha = jinfo.get("sha256")
@@ -782,12 +823,18 @@ def run_manifest(
         if attached:
             owner = "owned" if owned else "external"
             try:
+                current = C.keep_info(session) or {}
+                same_keep = current.get("account_scope") == account and (
+                    current.get("runtime_endpoint") == endpoint
+                    or (created and current.get("allocation_id") == run_id and current.get("created_by") == "pending")
+                )
                 release = abort_reason == "stop" or (
                     abort_reason != "cancel" and (stop_after or (created and not finished))
                 )
                 if release:
                     print(f"🛑 關閉 Colab GPU：{session}", flush=True)
-                    outcome = C.release_runtime(session, owner, endpoint)
+                    outcome = (C.release_runtime(session, owner, endpoint, account=account)
+                               if same_keep or not current else C.ReleaseState.FAILED)
                     results["shutdown_state"] = outcome
                     if stopped is not None:
                         stopped.outcome = outcome
@@ -795,6 +842,8 @@ def run_manifest(
                         results["shutdown_pending"] = outcome == C.ReleaseState.PENDING
                         results.setdefault("error", f"尚未確認 {session} 已關閉，請檢查 Colab runtime 狀態")
                         print(f"⚠️ 尚未確認 {session} 已關閉", flush=True)
+                elif not same_keep:
+                    print(f"⚠️ Session {session} 的本機紀錄已變更，請檢查 Colab runtime 狀態", flush=True)
                 elif cancel_failed or (cancel_pending and not finished and abort_reason != "cancel"):
                     print(f"⚠️ 尚未確認 {session} 的批次已取消，請檢查遠端狀態", flush=True)
                 elif finished or owned or abort_reason == "cancel":
@@ -804,7 +853,7 @@ def run_manifest(
                         C.start_watchdog(session)
                     except OSError:
                         if created:
-                            outcome = C.release_runtime(session, owner, endpoint)
+                            outcome = C.release_runtime(session, owner, endpoint, account=account)
                             results["shutdown_state"] = outcome
                             results["shutdown_pending"] = outcome == C.ReleaseState.PENDING
                         raise
@@ -815,13 +864,13 @@ def run_manifest(
                     C.drop_keep(session)
                     print(f"⚠️ 批次未完成，外部 Session {session} 仍在運行。", flush=True)
             finally:
-                cu_after, _ = C.usage()
+                cu_after, _ = C.usage(account=account)
                 cu_used = round(cu_before - cu_after, 2) if (cu_before is not None and cu_after is not None) else None
                 results.update(cu_before=cu_before, cu_after=cu_after, cu_used=cu_used)
                 save_results(res_file, results)
                 if cu_used is not None:
                     print(f"💳 本批預估消耗 {cu_used} 運算單元（{cu_before} → {cu_after}；Colab 用量可能延遲更新）", flush=True)
-        elif allocation_reserved:
+        elif allocation_reserved and (C.keep_info(session) or {}).get("allocation_id") == run_id:
             if allocation_attempted:
                 try:
                     review_at = time.time() + 30

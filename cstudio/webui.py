@@ -114,6 +114,7 @@ def get_quant_catalog() -> list[dict[str, Any]]:
 def read_local_keeps() -> list[dict[str, Any]]:
     """Read local ~/.config/colab-studio/keep/*.json without spawning colab CLI."""
     now = time.time()
+    account = C.account_scope()
     out: list[dict[str, Any]] = []
     if not C.KEEP.is_dir():
         return out
@@ -127,13 +128,16 @@ def read_local_keeps() -> list[dict[str, Any]]:
             owner = d.get("created_by", "external")
             release_pending = bool(d.get("release_pending"))
             rem_sec = max(0, int(round(exp - now))) if isinstance(exp, (int, float)) else None
+            if (not account or d.get("account_scope", account) != account
+                    or (owner == "owned" and not d.get("runtime_endpoint"))):
+                owner, exp, rem_sec, release_pending = "unverified", None, None, False
             out.append(
                 {
                     "session": sess,
                     "owner": owner,
                     "expires": exp,
                     "remaining_sec": rem_sec,
-                    "busy": exp is None and owner != "pending",
+                    "busy": exp is None and owner not in ("pending", "unverified"),
                     "release_pending": release_pending,
                     "watchdog_alive": C.pid_alive(d.get("watchdog_pid")),
                 }
@@ -344,6 +348,8 @@ class StudioUIState:
         self.stage: str = "idle"
         self.stage_label: str = STAGE_LABELS_ZH["idle"]
         self.session: str | None = None
+        self.session_account: str | None = None
+        self.shutdown_endpoint: str | None = None
         self.gpu: str = "L4"
         self.quant: str = Q.DEFAULT_QUANT
         self.started_at: float | None = None
@@ -354,6 +360,7 @@ class StudioUIState:
         self.last_recipe: dict[str, Any] | None = None
 
         # Cached slow-path Colab status
+        self.colab_cache_account: str | None = None
         self.colab_cache: dict[str, Any] = {
             "checked_at": 0.0,
             "token_ok": C.token_ok(),
@@ -470,18 +477,20 @@ class StudioUIState:
             }
 
     def refresh_colab_cache(self, force: bool = False) -> dict[str, Any]:
+        account = C.account_scope()
         now = time.time()
         with self.lock:
             age = now - float(self.colab_cache.get("checked_at") or 0.0)
-            if not force and self.colab_cache.get("checked_at") and age < 30.0:
+            if not force and account == self.colab_cache_account and self.colab_cache.get("checked_at") and age < 30.0:
                 return dict(self.colab_cache, local_keeps=read_local_keeps())
 
         # Single-flight query so concurrent requests don't spawn duplicate `colab` CLI processes
         with self.colab_query_lock:
+            account = C.account_scope()
             now2 = time.time()
             with self.lock:
                 age2 = now2 - float(self.colab_cache.get("checked_at") or 0.0)
-                if not force and self.colab_cache.get("checked_at") and age2 < 10.0:
+                if not force and account == self.colab_cache_account and self.colab_cache.get("checked_at") and age2 < 10.0:
                     return dict(self.colab_cache, local_keeps=read_local_keeps())
                 self.colab_cache["refreshing"] = True
 
@@ -490,24 +499,29 @@ class StudioUIState:
             cu_raw = "尚未登入"
             sess_names: list[str] = []
             sess_raw = ""
-            if tok:
-                cu_val, cu_raw = C.usage()
+            if account:
+                cu_val, cu_raw = C.usage(account=account)
                 try:
-                    sess_names, sess_raw = C.sessions(check=True)
+                    sess_names, sess_raw = C.sessions(check=True, account=account)
                 except (OSError, RuntimeError, SystemExit):
                     sess_raw = "無法確認 Colab Session 清單"
 
             keeps_by_name = {k["session"]: k for k in read_local_keeps()}
+            assignments = C.listed_assignments(sess_raw)
+            endpoints = {name: ep for ep, name in (assignments or {}).items()}
             sessions_detail: list[dict[str, Any]] = []
             seen_names: set[str] = set()
             for n in sess_names:
                 seen_names.add(n)
                 k = keeps_by_name.get(n)
+                record = C.keep_info(n) or {}
+                if record.get("runtime_endpoint") != endpoints.get(n) or record.get("account_scope", account) != account:
+                    k = None
                 sessions_detail.append(
                     {
                         "name": n,
                         "alive": True,
-                        "owned": C.is_owned_session(n),
+                        "owned": C.is_owned_session(n, account=account, assignments=assignments),
                         "remaining_sec": k["remaining_sec"] if k else None,
                         "busy": k["busy"] if k else False,
                         "release_pending": k["release_pending"] if k else False,
@@ -540,12 +554,15 @@ class StudioUIState:
             }
             with self.lock:
                 self.colab_cache = updated
+                self.colab_cache_account = account
                 if (
                     not self.running and self.session and self.stage == "shutdown_pending"
+                    and account and account == self.session_account == C.account_scope()
                     and not C.keep_file(self.session).exists()
-                    and C.session_gone(self.session, sess_names, sess_raw)
+                    and C.session_gone(self.session, sess_names, sess_raw, self.shutdown_endpoint)
                 ):
                     self.session = None
+                    self.shutdown_endpoint = None
                     self.stage = "stopped"
                     self.stage_label = STAGE_LABELS_ZH["stopped"]
                 self._bump()
@@ -644,13 +661,14 @@ def _resolve_target_session(requested: str | None) -> str:
             return C.sanitize_session_name(req)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+    account = C.account_scope()
     with STATE.lock:
-        if STATE.session:
+        if STATE.session and STATE.session_account in (None, account):
             try:
                 return C.sanitize_session_name(STATE.session)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
-    keeps = read_local_keeps()
+    keeps = [keep for keep in read_local_keeps() if keep["owner"] not in ("pending", "unverified")]
     if len(keeps) == 1:
         return C.sanitize_session_name(keeps[0]["session"])
     names, _ = C.sessions()
@@ -671,15 +689,20 @@ def api_colab_keep(payload: dict[str, Any]):
     except (TypeError, ValueError) as e:
         raise HTTPException(status_code=400, detail="保留分鐘數 (minutes) 必須為數字") from e
     minutes = max(1.0, min(240.0, minutes))
+    account = C.account_scope()
     session = _resolve_target_session(payload.get("session"))
     now = time.time()
     cur_info = C.keep_info(session) or {}
     if cur_info.get("release_pending"):
         raise HTTPException(status_code=409, detail="此 Session 正在關機，無法延長待命")
+    try:
+        target = C.keep_target(session, cur_info, account)
+    except (RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     cur_exp = cur_info.get("expires")
     base_time = max(now, float(cur_exp)) if isinstance(cur_exp, (int, float)) else now
     new_exp = min(now + 240.0 * 60.0, base_time + minutes * 60.0)
-    C.set_keep(session, new_exp)
+    C.set_keep(session, new_exp, **target)
     C.start_watchdog(session)
     rem_sec = max(0, int(round(new_exp - now)))
     STATE.append_log(f"⏸️ 已延長 {session} 自動關機時間（目前剩餘約 {round(rem_sec / 60, 1)} 分鐘）")
@@ -703,6 +726,8 @@ def api_colab_cancel(payload: dict[str, Any] | None = None):
         requested = _resolve_target_session(requested)
     with STATE.lock:
         if STATE.running and (not requested or requested == STATE.session):
+            if STATE.session_account is not None and STATE.session_account != C.account_scope():
+                raise HTTPException(status_code=409, detail="工作台的 Colab 登入身分已變更")
             if run_id and run_id != STATE.run_id:
                 raise HTTPException(status_code=409, detail="工作台的執行中批次已變更")
             if STATE.abort_action == "stop":
@@ -746,9 +771,14 @@ def api_colab_stop(payload: dict[str, Any] | None = None):
             requested = C.sanitize_session_name(requested)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    account = C.account_scope()
     owned = set(C.owned_sessions()) if requested is None else set()
     with STATE.lock:
         active = STATE.session if STATE.running else None
+        if STATE.session_account is not None and STATE.session_account != account:
+            if requested is not None and requested == STATE.session:
+                raise HTTPException(status_code=409, detail="工作台的 Colab 登入身分已變更")
+            active = None
         if active and STATE.provisioning:
             owned.add(active)
         if stop_all:
@@ -778,7 +808,8 @@ def api_colab_stop(payload: dict[str, Any] | None = None):
         if session == deferred:
             pending.append(session)
             continue
-        outcome = C.release_runtime(session, owned_only=requested is None)
+        outcome = (C.release_runtime(session, owned_only=requested is None, account=account)
+                   if account else C.ReleaseState.FAILED)
         if outcome == C.ReleaseState.CONFIRMED:
             stopped.append(session)
         elif outcome == C.ReleaseState.PENDING:
@@ -791,6 +822,8 @@ def api_colab_stop(payload: dict[str, Any] | None = None):
             STATE.stage = "stopped"
             STATE.stage_label = STAGE_LABELS_ZH["stopped"]
         elif not STATE.running and STATE.session in pending:
+            STATE.session_account = account
+            STATE.shutdown_endpoint = (C.keep_info(STATE.session) or {}).get("runtime_endpoint")
             STATE.stage = "shutdown_pending"
             STATE.stage_label = STAGE_LABELS_ZH["shutdown_pending"]
         STATE._bump()
@@ -853,6 +886,9 @@ async def api_run_start(
             status_code=401,
             detail="尚未登入 Google Colab OAuth，請先點擊頂部狀態列的「🔑 登入 Google Colab」",
         )
+    account = C.account_scope()
+    if not account:
+        raise HTTPException(status_code=401, detail="無法確認 Colab 登入身分，請重新登入")
 
     mode_clean = str(mode or "t2i").strip().lower()
     if mode_clean not in ("t2i", "edit"):
@@ -1015,40 +1051,31 @@ async def api_run_start(
     manifest_path = job_folder / "manifest.json"
     manifest_path.write_text(json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Determine target session name upfront (Pitfall C fix) so cancel/stop always knows the target session immediately
+    # The runner selects automatic reuse from the authenticated assignment listing.
     req_sess = str(session or "").strip()
-    provisioning = False
+    target_session = None
     if req_sess and req_sess != "__new__":
         try:
             target_session = C.sanitize_session_name(req_sess)
         except ValueError as e:
             shutil.rmtree(job_folder, ignore_errors=True)
             raise HTTPException(status_code=400, detail=str(e)) from e
-    elif req_sess == "__new__":
-        target_session = C.new_session_name()
-        provisioning = True
-    else:
-        keeps = read_local_keeps()
-        owned_keeps = [k["session"] for k in keeps if k["owner"] == "owned"]
-        if owned_keeps:
-            target_session = owned_keeps[0]
-        else:
-            target_session = C.new_session_name()
-            provisioning = True
 
     with STATE.lock:
         if STATE.running:
             raise HTTPException(status_code=409, detail="另一個生成任務剛啟動，請稍候")
         STATE.running = True
-        STATE.provisioning = provisioning
+        STATE.provisioning = False
         STATE.cancel_requested = False
         STATE.abort_action = None
         STATE.run_id = None
         STATE.job_dir = folder_name
         STATE.job_id = job_id
         STATE.stage = "booting_vm"
-        STATE.stage_label = f"🚀 正在連線或啟動 Google Colab {gpu_clean} ({target_session})..."
+        STATE.stage_label = f"🚀 正在確認 Google Colab {gpu_clean} 的目標 Session..."
         STATE.session = target_session
+        STATE.session_account = account
+        STATE.shutdown_endpoint = None
         STATE.gpu = gpu_clean
         STATE.quant = quant_clean
         STATE.started_at = time.time()
@@ -1057,7 +1084,7 @@ async def api_run_start(
         STATE.synced_images = []
         STATE.logs = [
             f"📋 已建立本地任務：{folder_name} (mode={mode_clean}, quant={quant_clean}, seed={seed_int})",
-            f"🎯 目標 Colab Session：{target_session} (GPU={gpu_clean})",
+            f"🎯 目標 Colab Session：{target_session or '待確認'} (GPU={gpu_clean})",
         ]
         STATE.last_recipe = {
             "job_dir": folder_name,
@@ -1083,6 +1110,9 @@ async def api_run_start(
                 manifest_path,
                 gpu=gpu_clean,
                 session=target_session,
+                account=account,
+                auto_reuse=not req_sess,
+                reuse_only=target_session is not None,
                 cli_quant=quant_clean,
                 idle_minutes=idle_mins,
                 stop_after=stop_after_bool,
@@ -1126,6 +1156,8 @@ async def api_run_start(
                 STATE._bump()
         finally:
             with STATE.lock:
+                if STATE.stage == "shutdown_pending" and STATE.session:
+                    STATE.shutdown_endpoint = (C.keep_info(STATE.session) or {}).get("runtime_endpoint")
                 STATE.running = False
                 STATE.provisioning = False
                 STATE.finished_at = time.time()
