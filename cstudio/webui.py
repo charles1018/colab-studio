@@ -24,16 +24,16 @@ from threading import Event
 from typing import Any
 
 from fastapi import APIRouter, Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from filelock import Timeout as LockTimeout
-from PIL import Image
 from remote.job_paths import confined_path, relative_parts
 from remote.manifest import MODES, normalize_manifest, normalize_resolution
 
 from . import colab_client as C
 from . import colab_login as L
 from . import runner as R
+from . import web_gallery as G
 from .redact import redact
 from .web_inputs import (
     MAX_REFERENCES, GenerationRoute, clean_generation_staging, generation_staging, prepare_reference_images,
@@ -175,166 +175,13 @@ def read_local_keeps() -> list[dict[str, Any]]:
     return out
 
 
-def safe_job_dir(job_dir: str) -> Path:
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", job_dir) or job_dir in (".", ".."):
-        raise HTTPException(status_code=400, detail=f"不合法的任務資料夾名稱：{job_dir!r}")
-    try:
-        return confined_path(JOBS_DIR, job_dir, directory=True)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="找不到任務資料夾") from exc
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="不允許存取此任務資料夾") from exc
-
-
 def safe_subfile(job_dir: str, subfolder: str, filename: str) -> Path:
-    if subfolder not in ("out", "inputs"):
-        raise HTTPException(status_code=400, detail="不支援的子資料夾")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", filename) or filename in (".", ".."):
-        raise HTTPException(status_code=400, detail=f"不合法的檔案名稱：{filename!r}")
-    if subfolder == "out" and not filename.lower().endswith(".png"):
-        raise HTTPException(status_code=400, detail="輸出作品必須是 PNG")
-    base = safe_job_dir(job_dir)
-    try:
-        return confined_path(base, f"{subfolder}/{filename}")
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=404, detail=f"找不到圖片檔案：{job_dir}/{subfolder}/{filename}") from exc
-
-
-def inspect_image_meta(img_path: Path) -> dict[str, Any]:
-    try:
-        with Image.open(img_path) as im:
-            has_alpha = im.mode in ("RGBA", "LA") or ("transparency" in im.info)
-            return {"width": im.width, "height": im.height, "mode": im.mode, "has_alpha": has_alpha}
-    except Exception:
-        return {"width": None, "height": None, "mode": None, "has_alpha": False}
-
-
-def read_gallery_metadata(folder: Path, relative: str) -> dict[str, Any]:
-    try:
-        data = json.loads(confined_path(folder, relative).read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return G.safe_subfile(JOBS_DIR, job_dir, subfolder, filename)
 
 
 def scan_gallery(limit: int = 120) -> list[dict[str, Any]]:
-    """Scan local jobs/*/out/results.json and manifest.json to build rich gallery items."""
-    if JOBS_DIR.is_symlink() or JOBS_DIR.is_junction() or not JOBS_DIR.is_dir():
-        return []
-    items: list[dict[str, Any]] = []
-    for candidate in JOBS_DIR.iterdir():
-        job_dir_name = candidate.name
-        try:
-            folder = safe_job_dir(job_dir_name)
-            out_dir = confined_path(folder, "out", directory=True)
-        except (HTTPException, OSError, ValueError):
-            continue
-        manifest_data = read_gallery_metadata(folder, "manifest.json")
-        results_data = read_gallery_metadata(folder, "out/results.json")
-
-        m_jobs_by_id: dict[str, dict[str, Any]] = {}
-        raw_m_jobs = manifest_data.get("jobs")
-        for j in (raw_m_jobs if isinstance(raw_m_jobs, list) else []):
-            if isinstance(j, dict) and isinstance(j.get("id"), str):
-                m_jobs_by_id[j["id"]] = j
-
-        r_jobs = results_data.get("jobs") if isinstance(results_data.get("jobs"), dict) else {}
-        # Collect PNG files in out/
-        for candidate_png in out_dir.glob("*.png"):
-            if candidate_png.name.startswith(".") or candidate_png.name.endswith("_sheet.png"):
-                continue
-            try:
-                png = safe_subfile(job_dir_name, "out", candidate_png.name)
-                info = png.stat()
-            except (HTTPException, OSError):
-                continue
-            if info.st_size == 0:
-                continue
-            jid = png.stem
-            # If manifest has jobs defined and jid is not one of them (e.g. a user-created collage), skip
-            if m_jobs_by_id and jid not in m_jobs_by_id and jid not in r_jobs:
-                continue
-            r_info = r_jobs.get(jid) if isinstance(r_jobs.get(jid), dict) else {}
-            m_info = m_jobs_by_id.get(jid) or {}
-
-            # If results.json exists and explicitly marks this job as non-done error, skip
-            if r_info and r_info.get("status") not in (None, "done"):
-                continue
-
-            img_meta = inspect_image_meta(png)
-            mode = str(m_info.get("mode") or r_info.get("mode") or "t2i").lower()
-            raw_inputs = m_info.get("inputs") if isinstance(m_info.get("inputs"), list) else []
-            input_urls: list[dict[str, str]] = []
-            for rel_in in raw_inputs:
-                try:
-                    parts = relative_parts(rel_in)
-                    if len(parts) != 2 or parts[0] != "inputs":
-                        continue
-                    fn = safe_subfile(job_dir_name, *parts).name
-                except (HTTPException, ValueError):
-                    continue
-                input_urls.append(
-                    {
-                        "filename": fn,
-                        "artifact_id": f"{job_dir_name}/inputs/{fn}",
-                        "url": f"/api/jobs/{job_dir_name}/inputs/{fn}",
-                    }
-                )
-
-            seed_val = m_info.get("seed", r_info.get("seed", 42))
-            quant_val = str(
-                r_info.get("quant")
-                or m_info.get("quant")
-                or manifest_data.get("quant")
-                or Q.DEFAULT_QUANT
-            ).upper()
-            refine_val = bool(
-                m_info.get("refine_prompt", manifest_data.get("refine_prompt", bool(r_info.get("refined_prompt"))))
-            )
-            pe_var_val = str(m_info.get("pe_variant") or manifest_data.get("pe_variant") or "int8").lower()
-            transparent_val = bool(m_info.get("transparent", False))
-            ar_val = str(m_info.get("aspect_ratio") or manifest_data.get("aspect_ratio") or "1:1")
-            res_val = str(m_info.get("resolution") or manifest_data.get("resolution") or "1K").upper()
-            custom_size_val = bool(m_info.get("custom_size", mode == "t2i"))
-            edit_res_val = int(m_info.get("edit_resolution", 1024))
-
-            mtime = info.st_mtime
-            items.append(
-                {
-                    "artifact_id": f"{job_dir_name}/out/{png.name}",
-                    "job_dir": job_dir_name,
-                    "job_id": jid,
-                    "filename": png.name,
-                    "url": f"/api/jobs/{job_dir_name}/out/{png.name}?t={int(mtime)}",
-                    "created_at": mtime,
-                    "created_at_str": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
-                    "size_kb": round(info.st_size / 1024.0, 1),
-                    "width": img_meta["width"] or r_info.get("width"),
-                    "height": img_meta["height"] or r_info.get("height"),
-                    "has_alpha": img_meta["has_alpha"],
-                    "prompt": str(m_info.get("prompt") or r_info.get("prompt") or ""),
-                    "refined_prompt": r_info.get("refined_prompt"),
-                    "mode": mode,
-                    "quant": quant_val,
-                    "seed": str(seed_val),
-                    "refine_prompt": refine_val,
-                    "pe_variant": pe_var_val,
-                    "transparent": transparent_val,
-                    "aspect_ratio": ar_val,
-                    "resolution": res_val,
-                    "custom_size": custom_size_val,
-                    "edit_resolution": edit_res_val,
-                    "inputs": input_urls,
-                    "session": results_data.get("session"),
-                    "gpu": results_data.get("gpu") or manifest_data.get("_gpu") or "L4",
-                    "cu_used": results_data.get("cu_used"),
-                    "seconds": r_info.get("seconds"),
-                    "sha256": r_info.get("sha256"),
-                }
-            )
-
-    items.sort(key=lambda x: x["created_at"], reverse=True)
-    return items[:limit]
+    items, _ = G.gallery_page(JOBS_DIR, limit)
+    return items
 
 
 def resolve_artifact_to_path(artifact_id: str) -> Path:
@@ -550,7 +397,7 @@ class StudioUIState:
                     if info.st_size > 0:
                         jrec = r_jobs.get(jid) if isinstance(r_jobs.get(jid), dict) else {}
                         mtime = info.st_mtime
-                        img_meta = inspect_image_meta(png)
+                        img_meta = G.inspect_image_meta(png)
                         new_synced.append(
                             {
                                 "artifact_id": f"{self.job_dir}/out/{png.name}",
@@ -1108,8 +955,18 @@ def api_run_status():
 
 
 @app.get("/api/gallery")
-def api_gallery(limit: int = Query(120, ge=1, le=500)):
-    return {"items": scan_gallery(limit=limit)}
+def api_gallery(
+    limit: int = Query(120, ge=1, le=500),
+    before: str | None = Query(None, max_length=250),
+):
+    items, next_cursor = G.gallery_page(JOBS_DIR, limit, G.parse_cursor(before))
+    return {"items": items, "next_cursor": next_cursor}
+
+
+@app.get("/api/gallery/thumbnail/{job_dir}/{filename}")
+def api_gallery_thumbnail(job_dir: str, filename: str):
+    png = safe_subfile(job_dir, "out", filename)
+    return Response(G.gallery_thumbnail(png), media_type="image/png")
 
 
 @app.get("/api/jobs/{job_dir}/{subfolder}/{filename}")

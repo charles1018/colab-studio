@@ -2,6 +2,7 @@
 import asyncio
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ ORIGIN = f"http://{HOST}"
 UI_HEADER = ("x-colab-studio-request", "1")
 JSON_HEADER = ("content-type", "application/json")
 FILE_URL = "/api/jobs/fixture/out/sample.png"
+THUMBNAIL_URL = "/api/gallery/thumbnail/fixture/sample.png"
 MULTIPART_HEADER = ("content-type", "multipart/form-data; boundary=fixture")
 MULTIPART = (
     b'--fixture\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nSynthetic prompt\r\n'
@@ -234,7 +236,9 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_invalid_and_wrong_port_sessions_cannot_read_or_control(self):
         other_port_cookie = await self.open_ui("127.0.0.1:8765")
         for cookies in ((), (("cookie", "cstudio_ui_7860=invalid"),), (other_port_cookie,)):
-            for path in ("/api/meta", "/api/run/status", "/api/colab/status?force=true", "/api/gallery", FILE_URL):
+            for path in (
+                "/api/meta", "/api/run/status", "/api/colab/status?force=true", "/api/gallery", FILE_URL, THUMBNAIL_URL,
+            ):
                 with self.subTest(path=path, cookies=bool(cookies)):
                     response = await self.request(path, headers=(*cookies, UI_HEADER))
                     self.assertEqual(response.status, 401)
@@ -291,7 +295,7 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
                     response = await self.request(path, method="POST", body=body, headers=(cookie, *headers, *extra))
                     self.assertEqual(response.status, 403)
                     self.assertFalse(response.body_read)
-        for path in ("/api/run/status", "/api/colab/status?force=true", "/api/gallery", FILE_URL):
+        for path in ("/api/run/status", "/api/colab/status?force=true", "/api/gallery", FILE_URL, THUMBNAIL_URL):
             for headers in (
                 (("origin", "https://example.test"), UI_HEADER),
                 (("sec-fetch-site", "cross-site"), UI_HEADER),
@@ -834,6 +838,9 @@ with generation_staging(Path(sys.argv[1])) as stage:
             with self.subTest(artifact=artifact):
                 reply = await self.request(f"/api/jobs/{artifact}", headers=(cookie,))
                 self.assertIn(reply.status, (400, 404))
+                name, _, filename = artifact.split("/")
+                thumbnail = await self.request(f"/api/gallery/thumbnail/{name}/{filename}", headers=(cookie,))
+                self.assertIn(thumbnail.status, (400, 404))
                 reply = await self.start_edit(cookie, [artifact])
                 self.assertIn(reply.status, (400, 404))
         for artifact in ("/fixture/out/sample.png", "fixture//out/sample.png", r"fixture\out\sample.png"):
@@ -844,6 +851,37 @@ with generation_staging(Path(sys.argv[1])) as stage:
         self.assertEqual(sorted(path.name for path in self.jobs.iterdir()), before)
         self.run_manifest.assert_not_called()
         self.cloud["colab"].assert_not_called()
+
+    async def test_gallery_api_pages_and_serves_thumb_with_original_reference_intact(self):
+        cookie = await self.open_ui()
+        Image.new("RGBA", (384, 192), (200, 20, 30, 80)).save(self.image)
+        second = self.image.with_name("older.png")
+        Image.new("RGB", (4, 3)).save(second)
+        os.utime(second, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+        newest = await self.request("/api/gallery?limit=1", headers=(cookie,))
+        data = json.loads(newest.body)
+        item, = data["items"]
+        self.assertEqual(item["filename"], "sample.png")
+        thumb = await self.request(item["thumbnail_url"], headers=(cookie,))
+        self.assertEqual(thumb.status, 200)
+        self.assertEqual(thumb.headers[b"content-type"], b"image/png")
+        self.assertEqual(thumb.headers[b"cache-control"], b"no-store")
+        self.assertEqual(thumb.headers[b"cross-origin-resource-policy"], b"same-origin")
+        with Image.open(io.BytesIO(thumb.body)) as preview:
+            self.assertEqual(preview.size, (192, 96))
+            self.assertEqual(preview.getpixel((0, 0))[3], 80)
+        page_two = await self.request("/api/gallery?" + urlencode({
+            "limit": 1, "before": data["next_cursor"],
+        }), headers=(cookie,))
+        self.assertEqual(page_two.status, 200)
+        other = json.loads(page_two.body)
+        self.assertNotEqual(other["items"][0]["artifact_id"], item["artifact_id"])
+        self.assertIsNone(other["next_cursor"])
+        original = await self.request(item["url"], headers=(cookie,))
+        self.assertEqual(original.body, (self.image.parent / item["filename"]).read_bytes())
+        invalid = await self.request("/api/gallery?" + urlencode({"before": "10:../out/bad.png"}), headers=(cookie,))
+        self.assertEqual(invalid.status, 400)
+        self.assertEqual(sorted(path.name for path in self.image.parent.iterdir()), ["older.png", "sample.png"])
 
     async def test_gallery_edit_copies_exact_artifacts_in_order_and_preserves_alpha(self):
         cookie = await self.open_ui()

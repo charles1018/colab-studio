@@ -8,13 +8,25 @@ const vm = require("node:vm");
 
 const app = fs.readFileSync(path.join(__dirname, "../cstudio/static/app.js"), "utf8");
 
-function fixture(fetchStatus = async () => { throw new Error("Unexpected API call"); }) {
+function fixture(fetchStatus = async () => { throw new Error("Unexpected API call"); }, { gallery = false } = {}) {
   const elements = new Map();
+  const revoked = [];
   function element() {
     const classes = new Set();
+    const events = new Map();
+    const children = [];
     return {
-      dataset: {}, hidden: true,
+      dataset: {}, hidden: true, style: {}, children,
+      appendChild: (child) => children.push(child),
+      querySelectorAll: () => children,
+      set innerHTML(_value) { children.length = 0; },
+      addEventListener: (type, listener) => events.set(type, listener),
+      fire: (type) => events.get(type)?.(),
+      focus: () => {},
+      getAttribute(name) { return this[name] ?? null; },
+      removeAttribute(name) { delete this[name]; },
       classList: {
+        add: (name) => classes.add(name),
         contains: (name) => classes.has(name),
         toggle: (name, enabled) => enabled ? classes.add(name) : classes.delete(name),
       },
@@ -39,12 +51,15 @@ function fixture(fetchStatus = async () => { throw new Error("Unexpected API cal
   const context = vm.createContext({
     document: { getElementById, createElement: element },
     fetchStatus,
+    URLSearchParams,
+    URL: { createObjectURL: (file) => `blob:${file.name}`, revokeObjectURL: (url) => revoked.push(url) },
     loadFixtureGallery: () => { galleryLoads += 1; },
   });
   const run = (code) => vm.runInContext(code, context);
   run(app.replace(/\binitStudio\(\);\s*$/, ""));
-  run("apiFetch = fetchStatus; loadGallery = loadFixtureGallery;");
-  return { run, select, chips, getElementById, galleryLoads: () => galleryLoads };
+  run("apiFetch = fetchStatus;");
+  if (!gallery) run("loadGallery = loadFixtureGallery;");
+  return { run, select, chips, getElementById, revoked, galleryLoads: () => galleryLoads };
 }
 
 function row(id, name = "external", extra = {}) {
@@ -166,4 +181,80 @@ test("polling keeps submit disabled during a local upload and shows preparation 
   run("ui.submitting = false;");
   apply(status(4), 4);
   assert.equal(generate.disabled, false);
+});
+
+function galleryItem(id) {
+  return {
+    artifact_id: `folder/out/${id}.png`, job_dir: "folder", job_id: id, filename: `${id}.png`,
+    url: `/api/jobs/folder/out/${id}.png`, thumbnail_url: `/api/gallery/thumbnail/folder/${id}.png`,
+  };
+}
+
+test("gallery pages use lazy thumbnails and keep the selected original", async () => {
+  const requests = [];
+  const recent = galleryItem("newest");
+  const older = galleryItem("older");
+  const { run, getElementById } = fixture(async (url) => {
+    requests.push(url);
+    return url.includes("before")
+      ? { items: [older], next_cursor: null }
+      : { items: [recent], next_cursor: "91:folder/out/newest.png" };
+  }, { gallery: true });
+  const load = run("loadGallery");
+  await load(true);
+  const strip = getElementById("galleryStrip");
+  const stage = getElementById("stageImage");
+  const tile = strip.children[0].children[0];
+  assert.equal(tile.loading, "lazy");
+  assert.equal(tile.src, recent.thumbnail_url);
+  assert.equal(stage.src, recent.url);
+  assert.equal(getElementById("btnNewerGallery").disabled, true);
+  assert.equal(getElementById("btnOlderGallery").disabled, false);
+  await load(false, 1);
+  assert.equal(requests[1], "/api/gallery?limit=32&before=91%3Afolder%2Fout%2Fnewest.png");
+  assert.equal(stage.src, recent.url);
+  assert.equal(getElementById("btnOlderGallery").disabled, true);
+  assert.equal(getElementById("btnNewerGallery").disabled, false);
+  strip.children[0].fire("click");
+  assert.equal(stage.src, older.url);
+  assert.equal(getElementById("btnDownloadPng").href, older.url);
+});
+
+test("refresh ignores an older page response still in flight", async () => {
+  const pending = deferred();
+  let refreshes = 0;
+  const { run, getElementById } = fixture((url) => url.includes("before") ? pending.promise : Promise.resolve({
+    items: [galleryItem(`newest-${++refreshes}`)], next_cursor: "91:folder/out/newest.png",
+  }), { gallery: true });
+  const load = run("loadGallery");
+  await load(true);
+  const olderRequest = load(false, 1);
+  await load(true);
+  pending.resolve({ items: [galleryItem("too-late")], next_cursor: null });
+  await olderRequest;
+  assert.match(getElementById("stageImage").src, /newest-2/);
+  assert.match(getElementById("galleryCount").textContent, /第 1 頁/);
+});
+
+test("replacing, removing, restoring and clearing references revoke only discarded uploads", () => {
+  const { run, getElementById, revoked } = fixture();
+  run('setMode = () => {}; updateSizeControlVisibility = () => {};');
+  const upload = run("addUploadedFiles");
+  upload(["one", "two"].map((name) => ({ name, type: "image/png" })));
+  run("setArtifactAsReference")(galleryItem("canvas"));
+  assert.deepEqual(revoked, ["blob:one"]);
+  const render = getElementById("refCardsGrid");
+  render.children[1].children[0].children[1].children.at(-1).fire("click");
+  assert.deepEqual(revoked, ["blob:one", "blob:two"]);
+  upload([{ name: "restore", type: "image/png" }]);
+  run(`ui.selectedItem = { mode: "edit", job_id: "restored", inputs: [
+    { artifact_id: "folder/inputs/second.png", url: "/api/jobs/folder/inputs/second.png" },
+    { artifact_id: "folder/inputs/first.png", url: "/api/jobs/folder/inputs/first.png" },
+  ] }; restoreRecipeFromSelected();`);
+  assert.deepEqual(revoked, ["blob:one", "blob:two", "blob:restore"]);
+  assert.equal(run("ui.refImages.map(item => item.artifact_id).join(',')"),
+    "folder/inputs/second.png,folder/inputs/first.png");
+  upload([{ name: "clear", type: "image/png" }]);
+  run("replaceReferences([]);");
+  assert.deepEqual(revoked, ["blob:one", "blob:two", "blob:restore", "blob:clear"]);
 });

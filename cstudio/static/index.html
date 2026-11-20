@@ -365,8 +365,12 @@
       <!-- 底部水平歷史畫廊 (Bottom Gallery Strip) -->
       <footer class="gallery-strip-panel">
         <div class="gallery-header">
-          <span class="gallery-title">🖼️ 本地歷史畫廊 (<span id="galleryCount">0</span> 張已校驗同步作品)</span>
-          <button type="button" class="btn-ghost-xs" id="btnRefreshGallery">🔄 重新掃描 jobs/</button>
+          <span class="gallery-title">🖼️ 本地歷史畫廊 <span id="galleryCount" role="status"></span></span>
+          <div class="gallery-actions">
+            <button type="button" class="btn-ghost-xs" id="btnNewerGallery" disabled>較新</button>
+            <button type="button" class="btn-ghost-xs" id="btnOlderGallery" disabled>較舊</button>
+            <button type="button" class="btn-ghost-xs" id="btnRefreshGallery">重新整理</button>
+          </div>
         </div>
         <div class="gallery-strip" id="galleryStrip">
           <div class="gallery-empty-hint">尚無本地歷史圖片</div>

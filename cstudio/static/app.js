@@ -46,7 +46,8 @@ const ui = {
   // Reference images array: up to 10 items
   // Each item: { id: string, kind: "upload" | "artifact", file?: File, artifact_id?: string, previewUrl: string, name: string }
   refImages: [],
-  galleryItems: [],
+  galleryPage: 0,
+  galleryCursors: [null],
   selectedItem: null,
   lastSeed: "",
   loginFlowState: null,
@@ -164,6 +165,8 @@ const el = {
 
   galleryCount: document.getElementById("galleryCount"),
   btnRefreshGallery: document.getElementById("btnRefreshGallery"),
+  btnNewerGallery: document.getElementById("btnNewerGallery"),
+  btnOlderGallery: document.getElementById("btnOlderGallery"),
   galleryStrip: document.getElementById("galleryStrip"),
 };
 
@@ -265,6 +268,18 @@ function insertTokenAtCursor(token) {
   ta.setSelectionRange(pos, pos);
 }
 
+function releaseReference(item) {
+  if (item?.kind === "upload" && item.previewUrl.startsWith("blob:")) {
+    URL.revokeObjectURL(item.previewUrl);
+  }
+}
+
+function replaceReferences(items) {
+  ui.refImages.forEach(releaseReference);
+  ui.refImages = items;
+  renderRefImages();
+}
+
 function renderRefImages() {
   const count = ui.refImages.length;
   el.refCountBadge.textContent = `${count} / 10 張`;
@@ -322,9 +337,7 @@ function renderRefImages() {
     btnDel.textContent = "✕";
     btnDel.title = "移除此參考圖片";
     btnDel.addEventListener("click", () => {
-      if (item.kind === "upload" && item.previewUrl.startsWith("blob:")) {
-        URL.revokeObjectURL(item.previewUrl);
-      }
+      releaseReference(item);
       ui.refImages.splice(idx, 1);
       renderRefImages();
     });
@@ -372,16 +385,13 @@ function setArtifactAsReference(item, asPrimary = true) {
     id: `art_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     kind: "artifact",
     artifact_id: item.artifact_id,
-    previewUrl: item.url,
+    previewUrl: item.thumbnail_url || item.url,
     name: item.filename || "gallery.png",
   };
   setMode("edit");
   if (asPrimary) {
-    if (ui.refImages.length === 0) {
-      ui.refImages.push(refEntry);
-    } else {
-      ui.refImages[0] = refEntry;
-    }
+    releaseReference(ui.refImages[0]);
+    ui.refImages[0] = refEntry;
     showToast(`🎨 已將「${item.job_id}」設為圖片編輯模式的 <image1> 主畫布！`, true);
   } else {
     if (ui.refImages.length >= 10) {
@@ -403,6 +413,7 @@ function selectGalleryItem(item, openDrawerIfRefined = false) {
   if (!item) {
     el.stageEmpty.hidden = false;
     el.stageImageWrap.hidden = true;
+    el.stageImage.removeAttribute("src");
     el.floatingToolbar.hidden = true;
     el.promptDrawer.hidden = true;
     return;
@@ -410,7 +421,9 @@ function selectGalleryItem(item, openDrawerIfRefined = false) {
 
   el.stageEmpty.hidden = true;
   el.stageImageWrap.hidden = false;
-  el.stageImage.src = item.url;
+  if (el.stageImage.getAttribute("src") !== item.url) {
+    el.stageImage.src = item.url;
+  }
   el.floatingToolbar.hidden = false;
 
   const modeLabel = item.mode === "edit" ? "Edit 改圖" : "T2I 生圖";
@@ -492,41 +505,51 @@ function restoreRecipeFromSelected() {
     el.editSizingSelect.value = ui.editSizing;
     updateSizeControlVisibility();
 
-    if (Array.isArray(item.inputs) && item.inputs.length > 0) {
-      ui.refImages = item.inputs.map((inp, idx) => ({
+    const inputs = Array.isArray(item.inputs) ? item.inputs : [];
+    replaceReferences(inputs.map((inp, idx) => ({
         id: `restored_${idx}_${Date.now()}`,
         kind: "artifact",
         artifact_id: inp.artifact_id,
         previewUrl: inp.url,
         name: inp.filename,
-      }));
-    } else {
-      ui.refImages = [];
-    }
-    renderRefImages();
+    })));
   }
 
   showToast(`↺ 已還原「${item.job_id}」的提示詞、權重規格 (${item.quant}) 與種子碼 (${item.seed})`, true);
 }
 
-async function loadGallery(selectNewest = false) {
-  try {
-    const data = await apiFetch("/api/gallery?limit=120");
-    ui.galleryItems = data.items || [];
-    el.galleryCount.textContent = String(ui.galleryItems.length);
-    el.galleryStrip.innerHTML = "";
+const GALLERY_PAGE_SIZE = 32;
+let galleryRequest = 0;
 
-    if (ui.galleryItems.length === 0) {
-      selectGalleryItem(null);
+async function loadGallery(selectNewest = false, page = 0) {
+  const before = ui.galleryCursors[page];
+  if (before === undefined) return;
+  const request = ++galleryRequest;
+  el.btnNewerGallery.disabled = el.btnOlderGallery.disabled = true;
+  const query = new URLSearchParams({ limit: String(GALLERY_PAGE_SIZE) });
+  if (before) query.set("before", before);
+  try {
+    const { items, next_cursor: nextCursor } = await apiFetch(`/api/gallery?${query}`);
+    if (request !== galleryRequest) return;
+    ui.galleryPage = page;
+    ui.galleryCursors = ui.galleryCursors.slice(0, page + 1);
+    if (nextCursor) ui.galleryCursors.push(nextCursor);
+    el.galleryCount.textContent = `第 ${page + 1} 頁 · ${items.length} 張`;
+    el.galleryStrip.innerHTML = "";
+    el.galleryStrip.scrollLeft = 0;
+
+    if (items.length === 0) {
+      if (page === 0) selectGalleryItem(null);
       const hint = document.createElement("div");
       hint.className = "gallery-empty-hint";
-      hint.textContent = "尚無本地歷史圖片（生成完成後將自動同步至此）";
+      hint.textContent = page === 0 ? "尚無本地歷史圖片" : "此頁作品已移除或更新，請返回較新的頁面";
       el.galleryStrip.appendChild(hint);
       return;
     }
 
-    ui.galleryItems.forEach((item) => {
-      const card = document.createElement("div");
+    for (const item of items) {
+      const card = document.createElement("button");
+      card.type = "button";
       card.className = "gallery-item checkerboard";
       card.dataset.artifactId = item.artifact_id;
       card.title = `[${item.job_dir}] ${item.prompt || ""}\n量化: ${item.quant} | Seed: ${item.seed}`;
@@ -539,9 +562,11 @@ async function loadGallery(selectNewest = false) {
       }
 
       const img = document.createElement("img");
-      img.src = item.url;
       img.alt = item.job_id;
       img.loading = "lazy";
+      img.decoding = "async";
+      img.addEventListener("error", () => { img.hidden = true; });
+      img.src = item.thumbnail_url;
       card.appendChild(img);
 
       if (item.refined_prompt) {
@@ -558,13 +583,21 @@ async function loadGallery(selectNewest = false) {
 
       card.addEventListener("click", () => selectGalleryItem(item, Boolean(item.refined_prompt)));
       el.galleryStrip.appendChild(card);
-    });
+    }
 
     if (selectNewest || !ui.selectedItem) {
-      selectGalleryItem(ui.galleryItems[0], Boolean(ui.galleryItems[0].refined_prompt));
+      selectGalleryItem(items[0], Boolean(items[0].refined_prompt));
+    } else {
+      const updated = items.find((item) => item.artifact_id === ui.selectedItem.artifact_id);
+      if (updated) selectGalleryItem(updated);
     }
   } catch (err) {
-    console.warn("載入畫廊失敗:", err);
+    if (request === galleryRequest) el.galleryCount.textContent = "無法讀取畫廊";
+  } finally {
+    if (request === galleryRequest) {
+      el.btnNewerGallery.disabled = ui.galleryPage === 0;
+      el.btnOlderGallery.disabled = ui.galleryCursors.length <= ui.galleryPage + 1;
+    }
   }
 }
 
@@ -897,8 +930,7 @@ async function initStudio() {
     }
   });
   el.btnClearRefImages.addEventListener("click", () => {
-    ui.refImages = [];
-    renderRefImages();
+    replaceReferences([]);
   });
 
   el.refDropzone.addEventListener("dragover", (e) => {
@@ -1102,6 +1134,8 @@ async function initStudio() {
 
   el.btnCloseToast.addEventListener("click", hideToast);
   el.btnRefreshGallery.addEventListener("click", () => loadGallery(false));
+  el.btnNewerGallery.addEventListener("click", () => loadGallery(false, ui.galleryPage - 1));
+  el.btnOlderGallery.addEventListener("click", () => loadGallery(false, ui.galleryPage + 1));
 
   // Initial Renders & Polls
   renderRefImages();
