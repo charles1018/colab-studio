@@ -8,7 +8,6 @@ Builds flat ComfyUI API prompt graphs for:
 """
 from __future__ import annotations
 
-import math
 from typing import Any
 
 from .qwen_prompts import QWEN21_EDIT_SYSTEM_PROMPT, QWEN21_T2I_SYSTEM_PROMPT
@@ -209,6 +208,9 @@ def build_qwen21_graph(
       "54": SamplerCustomAdvanced
       "60": VAEDecode
       "61": SaveImage
+      "70".."79": JoinImageWithAlpha (Edit references for TextEncodeQwenImage21)
+      "80".."89": ImageCompositeMasked (Edit references for Prompt Enhancer)
+      "90": EmptyImage (white background for Edit Prompt Enhancer)
     """
     manifest = manifest or {}
     mode = str(job.get("mode", "t2i")).strip().lower()
@@ -289,17 +291,21 @@ def build_qwen21_graph(
         },
     }
 
-    # Load input images for edit mode
-    load_image_nodes: list[str] = []
+    reference_nodes: list[tuple[str, str]] = []
     if mode == "edit":
         for idx, img_name in enumerate(inputs):
-            nid = str(20 + idx)
-            load_image_nodes.append(nid)
-            graph[nid] = {
+            load_id, rgba_id = str(20 + idx), str(70 + idx)
+            reference_nodes.append((load_id, rgba_id))
+            graph[load_id] = {
                 "class_type": "LoadImage",
                 "inputs": {
                     "image": img_name,
                 },
+            }
+            # LoadImage returns 1 - alpha as its mask. JoinImageWithAlpha inverts it.
+            graph[rgba_id] = {
+                "class_type": "JoinImageWithAlpha",
+                "inputs": {"image": [load_id, 0], "alpha": [load_id, 1]},
             }
 
     # Prompt Enhancer chain (optional)
@@ -340,9 +346,22 @@ def build_qwen21_graph(
         }
 
         if mode == "edit":
+            # PE consumes RGB. Use the transparency mask to blend white into each reference.
+            graph["90"] = {
+                "class_type": "EmptyImage",
+                "inputs": {"width": 1, "height": 1, "batch_size": 1, "color": 0xFFFFFF},
+            }
             batch_inputs: dict[str, Any] = {}
-            for idx, nid in enumerate(load_image_nodes):
-                batch_inputs[BATCH_IMAGE_SLOTS[idx]] = [nid, 0]
+            for idx, (load_id, _) in enumerate(reference_nodes):
+                rgb_id = str(80 + idx)
+                graph[rgb_id] = {
+                    "class_type": "ImageCompositeMasked",
+                    "inputs": {
+                        "destination": [load_id, 0], "source": ["90", 0], "mask": [load_id, 1],
+                        "x": 0, "y": 0, "resize_source": True,
+                    },
+                }
+                batch_inputs[BATCH_IMAGE_SLOTS[idx]] = [rgb_id, 0]
             graph["31"] = {
                 "class_type": "BatchImagesNode",
                 "inputs": batch_inputs,
@@ -374,8 +393,8 @@ def build_qwen21_graph(
     }
     if mode == "edit":
         encode_inputs["vae"] = ["13", 0]
-        for idx, nid in enumerate(load_image_nodes):
-            encode_inputs[f"images.image_{idx + 1}"] = [nid, 0]
+        for idx, (_, rgba_id) in enumerate(reference_nodes):
+            encode_inputs[f"images.image_{idx + 1}"] = [rgba_id, 0]
 
     graph["40"] = {
         "class_type": "TextEncodeQwenImage21",

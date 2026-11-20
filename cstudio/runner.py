@@ -202,7 +202,7 @@ def classify_jobs(
             stale.append((jid, "舊輸出沒有指紋紀錄"))
             todo.append(j)
         else:
-            stale.append((jid, "prompt、量化等級或參考圖片已變更"))
+            stale.append((jid, "生成流程、參考圖片或版本已變更"))
             todo.append(j)
 
     return fps, todo, done_ids, stale
