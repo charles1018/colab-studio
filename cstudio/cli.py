@@ -3,38 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
-from pathlib import Path
 
 from . import colab_client as C
 from . import colab_login as L
 from . import runner as R
 from . import selftest as T
-
-CANCEL_CODE = """
-import json, subprocess, urllib.request
-from pathlib import Path
-BASE = 'http://127.0.0.1:8188'
-ST = Path('/content/cstudio/status.json')
-subprocess.run(['pkill', '-f', 'cstudio/remote_runner.py'], check=False)
-for ep, body in [('/interrupt', b'{}'), ('/queue', b'{"clear": true}')]:
-    try:
-        req = urllib.request.Request(BASE + ep, body, {'Content-Type': 'application/json'})
-        urllib.request.urlopen(req, timeout=10).read()
-    except Exception:
-        pass
-if ST.is_file():
-    try:
-        d = json.loads(ST.read_text(encoding='utf-8'))
-        d.update(done=True, stage='cancelled', error='cancelled by user')
-        ST.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding='utf-8')
-    except Exception:
-        pass
-print('CANCELLED_KEEP_GPU')
-"""
-
 
 def cmd_check(_args):
     exe = C.colab_exe()
@@ -131,13 +106,20 @@ def cmd_cancel(args):
             sys.exit(f"請用 --session <NAME> 指定要中斷任務的機器（目前開啟中：{names}）")
     if session not in names:
         sys.exit(f"找不到開啟中的 session：{session}")
-    out = C.remote_exec(session, CANCEL_CODE, timeout=45, tries=3)
-    C.set_keep(session, time.time() + 30 * 60)
-    C.start_watchdog(session)
-    if "CANCELLED_KEEP_GPU" in out:
-        print(f"⏹️ 已中斷 {session} 上的雲端任務，並保留 GPU 30 分鐘（模型不需重下）", flush=True)
+    try:
+        res = C.request_cancel(session, args.run_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        sys.exit(f"無法確認 {session} 的取消狀態：{exc}")
+    run_id = res.get("run_id")
+    state = res["state"]
+    if state == "confirmed":
+        print(f"⏹️ 已確認 {session} 的批次 {run_id} 取消", flush=True)
+    elif state == "pending":
+        print(f"⏳ {session} 的批次 {run_id} 已收到取消要求，等待遠端確認。", flush=True)
+    elif state in ("idle", "finished"):
+        print(f"{session} 上沒有符合條件的執行中批次。", flush=True)
     else:
-        print(f"⚠️ 已送出中斷指令，遠端回應：{out}", flush=True)
+        sys.exit(f"無法確認 {session} 的批次 {run_id} 已停止（{state}）")
 
 
 def main():
@@ -186,6 +168,7 @@ def main():
 
     p_cancel = sub.add_parser("cancel", help="中斷正在執行的雲端任務，但保留 Colab GPU 與已載入的模型")
     p_cancel.add_argument("--session", default=None)
+    p_cancel.add_argument("--run-id", default=None, help="限制取消目標為指定批次")
 
     sub.add_parser("test", help="執行離線自我測試 (驗證 Graph 組裝、12 種量化清單與指紋邏輯)")
 
@@ -212,22 +195,25 @@ def main():
     elif args.cmd == "plan":
         R.plan_batch(args.manifest, gpu=args.gpu, cli_quant=args.quant)
     elif args.cmd == "run":
-        R.run_manifest(
-            args.manifest,
-            gpu=args.gpu,
-            session=args.session,
-            cli_quant=args.quant,
-            idle_minutes=args.idle_minutes,
-            max_minutes=args.max_minutes,
-            stop_after=args.stop_after,
-            force=args.force,
-            remake_stale=args.remake_stale,
-            use_fingerprint=not args.no_fingerprint,
-            pin_versions=not args.no_pin_versions,
-            pin_models=not args.no_pin_models,
-            assign_retries=args.assign_retries,
-            assign_wait=args.assign_wait,
-        )
+        try:
+            R.run_manifest(
+                args.manifest,
+                gpu=args.gpu,
+                session=args.session,
+                cli_quant=args.quant,
+                idle_minutes=args.idle_minutes,
+                max_minutes=args.max_minutes,
+                stop_after=args.stop_after,
+                force=args.force,
+                remake_stale=args.remake_stale,
+                use_fingerprint=not args.no_fingerprint,
+                pin_versions=not args.no_pin_versions,
+                pin_models=not args.no_pin_models,
+                assign_retries=args.assign_retries,
+                assign_wait=args.assign_wait,
+            )
+        except R.RunCancelled as exc:
+            sys.exit(str(exc))
     elif args.cmd == "sessions":
         cmd_sessions(args)
     elif args.cmd == "keep":

@@ -316,6 +316,32 @@ def poll_remote_status(session: str, timeout: int = 60) -> dict | None:
     return None
 
 
+def request_cancel(session: str, run_id: str | None = None, *, allow_start: bool = False) -> dict:
+    session = sanitize_session_name(session)
+    if run_id is not None and not re.fullmatch(r"[0-9a-f]{12}", run_id):
+        raise ValueError("不合法的批次 ID")
+    keep = keep_info(session) or {}
+    endpoint = keep.get("runtime_endpoint")
+    if endpoint and runtime_endpoint(session) != endpoint:
+        raise RuntimeError("Session 遠端識別已變更，無法確認取消目標")
+    source = (REMOTE / "cancel.py").read_text(encoding="utf-8")
+    code = source + (
+        f"\nprint('CSTUDIO_CANCEL ' + json.dumps("
+        f"request_cancel(Path('/content/cstudio'), {run_id!r}, allow_start={allow_start!r})))\n"
+    )
+    out = remote_exec(session, code, timeout=15, tries=1)
+    for line in reversed(out.splitlines()):
+        if line.startswith("CSTUDIO_CANCEL "):
+            result = json.loads(line.partition(" ")[2])
+            if (
+                isinstance(result, dict)
+                and result.get("state") in ("idle", "pending", "confirmed", "finished", "failed", "unsupported")
+                and (run_id is None or result.get("run_id") == run_id)
+            ):
+                return result
+    raise RuntimeError("遠端未回傳可確認的取消狀態")
+
+
 def start_watchdog(session: str):
     info = keep_info(session) or {}
     if pid_alive(info.get("watchdog_pid")):

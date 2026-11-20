@@ -40,6 +40,8 @@ uv run cstudio ui --open
 uv run cstudio sheet jobs/demo_qwen21/out/*.png
 ```
 
+`cancel` 先送出指定批次的取消要求，確認遠端任務停止後才回報完成。CLI 回報等待確認時，可用 `cancel --session NAME --run-id RUN_ID` 再查同一批次。取消確認前，原有的 GPU 回收期限繼續適用。
+
 ---
 
 ## 2. 模型特性：`unsloth/Qwen-Image-2.1-Turbo-GGUF`

@@ -345,6 +345,79 @@ class RuntimeAllocationTests(unittest.TestCase):
         C.remote_exec.assert_not_called()
         self.assertIsNone(C.keep_info(self.session))
 
+    def test_cancel_after_launch_waits_for_confirmation_and_syncs_completed_jobs(self):
+        progress = Mock()
+
+        def prepare(_session, _code, **_opts):
+            self.abort = "cancel"
+            return 'CSTUDIO_PREP {"launched": true, "missing_inputs": []}'
+
+        def snapshot(_session):
+            run_id = progress.call_args.args[0]["run_id"]
+            if C.poll_remote_status.call_count == 1:
+                return {"run_id": run_id, "stage": "running", "done": False}
+            return dict(self.done_status(), run_id=run_id, stage="cancelled", cancel_protocol=1)
+
+        C.remote_exec.side_effect = prepare
+        C.poll_remote_status.side_effect = snapshot
+        with patch.object(C, "request_cancel", return_value={"state": "pending"}) as send:
+            with self.assertRaisesRegex(R.RunCancelled, "已確認遠端批次取消"):
+                self.run_manifest(progress_cb=progress)
+        cancelled = progress.call_args.args[0]
+        send.assert_called_once_with(self.session, cancelled["run_id"], allow_start=True)
+        self.assertEqual(cancelled["stage"], "cancelled")
+        self.assertEqual(cancelled["_local_synced_jobs"], ["test"])
+        self.assertEqual((self.result_path.parent / "test.png").read_bytes(), self.image_bytes)
+        self.assertEqual(C.keep_info(self.session)["expires"], self.now + 30 * 60)
+        self.assertNotIn("stop", self.commands)
+
+    def test_failed_remote_cancel_preserves_existing_recovery_deadline(self):
+        progress = Mock()
+
+        def prepare(_session, _code, **_opts):
+            self.abort = "cancel"
+            return 'CSTUDIO_PREP {"launched": true, "missing_inputs": []}'
+
+        C.remote_exec.side_effect = prepare
+        C.poll_remote_status.side_effect = lambda _session: {
+            "run_id": progress.call_args.args[0]["run_id"], "stage": "cancel_failed",
+            "done": True, "error": "fixture: remote task still active", "cancel_protocol": 1,
+        }
+        with patch.object(C, "request_cancel", return_value={"state": "pending"}):
+            result = self.run_manifest(progress_cb=progress)
+        self.assertEqual(result["error"], "fixture: remote task still active")
+        self.assertIsNone(C.keep_info(self.session)["expires"])
+        self.assertEqual(C.keep_info(self.session)["busy_until"], 1_000.0 + 120 * 60)
+
+    def test_an_unconfirmed_cancellation_blocks_reuse(self):
+        self.runtimes[self.session] = self.endpoint
+        C.poll_remote_status.return_value = {"stage": "cancel_failed", "alive": False}
+        with self.assertRaisesRegex(RuntimeError, "待確認的取消"):
+            self.run_manifest()
+        C.remote_exec.assert_not_called()
+        self.assertNotIn("new", self.commands)
+        self.assertNotIn("stop", self.commands)
+
+    def test_lost_cancel_reply_retries_without_treating_it_as_confirmation(self):
+        progress = Mock()
+        C.remote_exec.side_effect = lambda *_args, **_opts: (
+            setattr(self, "abort", "cancel") or 'CSTUDIO_PREP {"launched": true, "missing_inputs": []}'
+        )
+
+        def snapshot(_session):
+            run_id = progress.call_args.args[0]["run_id"]
+            if C.poll_remote_status.call_count == 1:
+                return {"run_id": run_id, "stage": "running", "done": False}
+            return dict(self.done_status(), run_id=run_id)
+
+        C.poll_remote_status.side_effect = snapshot
+        with patch.object(C, "request_cancel", side_effect=[RuntimeError("lost reply"), {"state": "finished"}]) as send:
+            result = self.run_manifest(progress_cb=progress)
+        self.assertEqual(send.call_count, 2)
+        self.assertNotIn("error", result)
+        self.assertEqual(progress.call_args.args[0]["stage"], "done")
+        self.assertEqual(C.keep_info(self.session)["expires"], self.now + 15 * 60)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,8 @@ const ui = {
   loginFlowState: null,
   lastRevision: -1,
   wasRunning: false,
+  runId: null,
+  runSession: null,
   activeSession: null,
   remainingSec: null,
   sessionBusy: false,
@@ -636,6 +638,8 @@ async function pollFastRunStatus() {
     el.authLabel.textContent = st.token_ok ? "Google Colab 已登入" : "尚未登入 Colab";
 
     applySessionKeepUI(st.session, st.active_keep, st.running);
+    ui.runId = st.running ? st.run_id : null;
+    ui.runSession = st.running ? st.session : null;
 
     // Populate session select dropdown with any known local keeps
     updateSessionDropdown(st.local_keeps || []);
@@ -664,7 +668,7 @@ async function pollFastRunStatus() {
         if (st.stage === "error" || st.error) {
           showToast(`❌ 生成失敗：${st.error || "未知錯誤"}`);
         } else if (st.stage === "cancelled") {
-          showToast("⏹️ 已中斷雲端任務，Colab GPU 與已載入模型仍保留待命中", true);
+          showToast("⏹️ 已確認任務取消", true);
         } else if (st.stage === "done") {
           showToast("✅ 雲端生成與 SHA256 校驗下載完成！", true);
         }
@@ -905,12 +909,18 @@ async function initStudio() {
   el.btnGenerate.addEventListener("click", handleStartGenerate);
   const doCancel = async () => {
     try {
-      await apiFetch("/api/colab/cancel", {
+      const res = await apiFetch("/api/colab/cancel", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session: ui.activeSession }),
+        body: JSON.stringify({ session: ui.runSession || ui.activeSession, run_id: ui.runId }),
       });
-      showToast("⏹️ 已送出中斷指令，GPU 與模型將保留 30 分鐘待命", true);
+      const message = {
+        pending: "⏳ 已要求取消，等待遠端確認",
+        confirmed: "⏹️ 已確認遠端批次取消",
+        idle: "目前沒有符合條件的執行中批次",
+        finished: "批次已經結束",
+      }[res.state];
+      if (message) showToast(message, true);
       await pollFastRunStatus();
     } catch (err) {
       showToast(`中斷任務失敗：${err.message}`);

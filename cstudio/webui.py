@@ -21,7 +21,6 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from . import cli as CLI
 from . import colab_client as C
 from . import colab_login as L
 from . import runner as R
@@ -48,7 +47,9 @@ STAGE_LABELS_ZH: dict[str, str] = {
     "generate": "🎨 正在執行 Qwen-Image-2.1 8 步極速取樣（含 Prompt Enhancer 擴寫）...",
     "syncing_outputs": "⬇️ 遠端生成完成，正在下載回本地並執行 SHA256 校驗...",
     "done": "✅ 生成與 SHA256 校驗下載完成！",
-    "cancelled": "⏹️ 任務已由使用者中斷（GPU 保留待命中）",
+    "cancelling": "⏳ 已要求取消，等待遠端確認",
+    "cancelled": "⏹️ 已確認任務取消",
+    "cancel_failed": "⚠️ 無法確認遠端任務已停止",
     "error": "❌ 執行發生錯誤",
     "crashed": "❌ 遠端程序異常中止",
 }
@@ -667,40 +668,41 @@ def api_colab_keep(payload: dict[str, Any]):
 @app.post("/api/colab/cancel")
 def api_colab_cancel(payload: dict[str, Any] | None = None):
     payload = payload or {}
+    requested = str(payload.get("session") or "").strip()
+    run_id = str(payload["run_id"]).strip() if payload.get("run_id") else None
+    if run_id and not re.fullmatch(r"[0-9a-f]{12}", run_id):
+        raise HTTPException(status_code=400, detail="不合法的批次 ID")
+    if requested:
+        requested = _resolve_target_session(requested)
     with STATE.lock:
-        STATE.cancel_requested = True
-        if STATE.abort_action != "stop":
+        if STATE.running and (not requested or requested == STATE.session):
+            if run_id and run_id != STATE.run_id:
+                raise HTTPException(status_code=409, detail="工作台的執行中批次已變更")
+            if STATE.abort_action == "stop":
+                raise HTTPException(status_code=409, detail="此 Session 正在關機")
+            STATE.cancel_requested = True
             STATE.abort_action = "cancel"
-        sess_in_state = STATE.session
-        STATE.stage = "cancelled"
-        STATE.stage_label = STAGE_LABELS_ZH["cancelled"]
-        STATE._bump()
+            STATE.stage = "cancelling"
+            STATE.stage_label = STAGE_LABELS_ZH["cancelling"]
+            STATE._bump()
+            return JSONResponse(status_code=202, content={
+                "ok": True, "state": "pending", "session": STATE.session, "run_id": STATE.run_id,
+            })
 
-    target_session = str( sess_in_state or payload.get("session") or "").strip()
-    if not target_session:
-        try:
-            target_session = _resolve_target_session(None)
-        except HTTPException:
-            return {"ok": True, "message": "已標記中斷當前排程任務", "session": None}
-
+    target_session = _resolve_target_session(requested)
     try:
-        target_session = C.sanitize_session_name(target_session)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    STATE.append_log(f"⏹️ 正在送出中斷指令至 {target_session}（保留 GPU 與已載入模型 30 分鐘）...")
-    try:
-        out = C.remote_exec(target_session, CLI.CANCEL_CODE, timeout=45, tries=2)
-    except Exception as e:
-        out = f"remote_exec error: {e}"
-    C.set_keep(target_session, time.time() + 30 * 60)
-    C.start_watchdog(target_session)
-    STATE.append_log(f"⏹️ 已中斷 {target_session} 上的雲端任務，GPU 將保留 30 分鐘待命")
-    return {
-        "ok": True,
-        "session": target_session,
-        "remote_response": out,
-        "local_keeps": read_local_keeps(),
-    }
+        res = C.request_cancel(target_session, run_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="未收到可確認的遠端取消結果") from exc
+    state = res["state"]
+    if state == "unsupported":
+        raise HTTPException(status_code=409, detail="此遠端批次使用舊版取消協定")
+    if state == "failed":
+        raise HTTPException(status_code=409, detail="遠端未能確認指定批次取消")
+    return JSONResponse(
+        status_code=202 if state == "pending" else 200,
+        content={"ok": True, "session": target_session, **res},
+    )
 
 
 def _stop_and_verify_session(sess: str) -> bool:
@@ -1039,10 +1041,7 @@ async def api_run_start(
                 should_abort=lambda: (STATE.abort_action or ("cancel" if STATE.cancel_requested else None)),
             )
             with STATE.lock:
-                if STATE.cancel_requested:
-                    STATE.stage = "cancelled"
-                    STATE.stage_label = STAGE_LABELS_ZH["cancelled"]
-                elif res.get("error"):
+                if res.get("error"):
                     STATE.stage = "error"
                     STATE.stage_label = STAGE_LABELS_ZH["error"]
                     STATE.error = str(res["error"])
@@ -1052,7 +1051,7 @@ async def api_run_start(
                 STATE._bump()
         except BaseException as exc:
             with STATE.lock:
-                if STATE.cancel_requested:
+                if isinstance(exc, R.RunCancelled):
                     STATE.stage = "cancelled"
                     STATE.stage_label = STAGE_LABELS_ZH["cancelled"]
                     STATE.error = None

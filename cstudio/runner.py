@@ -277,6 +277,7 @@ def save_results(path: Path, data: dict[str, Any]):
 
 REMOTE_CODE_FILES = (
     "__init__.py",
+    "cancel.py",
     "remote_runner.py",
     "start.py",
     "status.py",
@@ -358,6 +359,10 @@ def bundle_and_launch_code(
         "        res['pid'] = p.pid\n"
         "print('CSTUDIO_PREP ' + json.dumps(res))\n"
     )
+
+
+class RunCancelled(RuntimeError):
+    """The batch was cancelled locally or confirmed cancelled on the VM."""
 
 
 def run_manifest(
@@ -466,9 +471,13 @@ def run_manifest(
             pass
 
     abort_reason: str | None = None
+    remote_attempted = False
+    cancel_pending = False
+    cancel_sent = False
+    cancel_failed = False
 
     def _check_abort():
-        nonlocal abort_reason
+        nonlocal abort_reason, cancel_pending
         if not should_abort:
             return
         sig = should_abort()
@@ -477,8 +486,11 @@ def run_manifest(
         if sig == "stop":
             abort_reason = "stop"
             raise RuntimeError("使用者要求中斷任務並關閉 Colab GPU (stopped by user)")
+        if remote_attempted:
+            cancel_pending = True
+            return
         abort_reason = "cancel"
-        raise RuntimeError("任務已由使用者中斷 (cancelled by user)")
+        raise RunCancelled("本地已取消，尚未啟動遠端工作 (cancelled by user)")
 
     def _check_active():
         _check_abort()
@@ -527,6 +539,8 @@ def run_manifest(
             if keep.get("runtime_endpoint") and not owned:
                 _fail(f"Session {session} 的遠端識別已變更，請先確認目標", exit_on_error)
             st_check = C.poll_remote_status(session)
+            if st_check and st_check.get("stage") == "cancel_failed":
+                _fail(f"Session {session} 仍有待確認的取消結果，請先檢查遠端任務", exit_on_error)
             if st_check and st_check.get("alive"):
                 _fail(
                     f"⚠️ Session {session} 上已有正在執行的批次任務，請先等待完成或執行 `uv run cstudio cancel --session {session}`",
@@ -593,6 +607,8 @@ def run_manifest(
         input_shas = {f: hashlib.sha256((base / f).read_bytes()).hexdigest() for f in files}
 
         _emit({"stage": "syncing_code", "done": False, "log": [f"正在同步遠端程式與任務設定至 {session}..."]})
+        _check_active()
+        remote_attempted = True
         prep_out = C.remote_exec(
             session,
             bundle_and_launch_code(code_files, bundle_hash, manifest_json, dirs, input_shas),
@@ -611,20 +627,26 @@ def run_manifest(
                 break
 
         missing_inputs = prep_info.get("missing_inputs", files)
+        if prep_info.get("launched") is False:
+            remote_attempted = False
         for f in missing_inputs:
             _check_active()
+            if cancel_pending:
+                break
             print(f"⬆️ 上傳參考圖：{f}", flush=True)
             _emit({"stage": "uploading_inputs", "done": False, "log": [f"正在上傳參考圖片：{f}"]})
             C.colab("upload", "-s", session, base / f, f"/content/cstudio/inputs/{f}", timeout=600)
 
         _check_active()
-        if prep_info.get("launched"):
-            print(f"▶️ 已單次指令同步並啟動遠端引擎 (pid={prep_info.get('pid')})", flush=True)
-            _emit({"stage": "starting", "done": False, "log": [f"已啟動遠端生成引擎 (pid={prep_info.get('pid')})"]})
-        else:
-            launch_out = C.remote_exec(session, (REMOTE / "start.py").read_text(encoding="utf-8"), **short)
-            print(f"▶️ 已啟動遠端生成引擎：{launch_out.strip()[-200:]}", flush=True)
-            _emit({"stage": "starting", "done": False, "log": ["已啟動遠端生成引擎"]})
+        if not cancel_pending:
+            if prep_info.get("launched"):
+                print(f"▶️ 已單次指令同步並啟動遠端引擎 (pid={prep_info.get('pid')})", flush=True)
+                _emit({"stage": "starting", "done": False, "log": [f"已啟動遠端生成引擎 (pid={prep_info.get('pid')})"]})
+            else:
+                remote_attempted = True
+                launch_out = C.remote_exec(session, (REMOTE / "start.py").read_text(encoding="utf-8"), **short)
+                print(f"▶️ 已啟動遠端生成引擎：{launch_out.strip()[-200:]}", flush=True)
+                _emit({"stage": "starting", "done": False, "log": ["已啟動遠端生成引擎"]})
 
         shown_log: set[str] = set()
         last_ok = time.time()
@@ -633,6 +655,16 @@ def run_manifest(
         while True:
             time.sleep(4)
             _check_active()
+
+            if cancel_pending and not cancel_sent:
+                _emit({"stage": "cancelling", "done": False})
+                try:
+                    receipt = C.request_cancel(session, run_id, allow_start=True)
+                except (OSError, RuntimeError, ValueError):
+                    receipt = {"state": "unknown"}
+                if receipt["state"] == "unsupported":
+                    raise RuntimeError("此遠端批次不支援指定任務取消，無法確認已停止")
+                cancel_sent = receipt["state"] in {"pending", "confirmed", "finished", "failed"}
 
             st = C.poll_remote_status(session)
             if not st:
@@ -644,6 +676,8 @@ def run_manifest(
             st_run_id = st.get("run_id")
             if st_run_id and st_run_id != run_id:
                 continue
+            if st.get("stage") == "cancelled" and (st_run_id != run_id or st.get("cancel_protocol") != 1):
+                raise RuntimeError("收到無法驗證的遠端取消結果")
             # If remote_runner just started and hasn't written status.json yet, give it a brief grace window
             if not st_run_id and st.get("stage") in ("crashed", "not started") and time.time() < boot_grace_until:
                 continue
@@ -656,7 +690,9 @@ def run_manifest(
 
             # If remote reports done=True, hold stage as "syncing_outputs" until local download + SHA256 verification completes
             st_for_ui = dict(st)
-            if st_for_ui.get("done") and not st_for_ui.get("error"):
+            if cancel_pending and not st.get("done"):
+                st_for_ui["stage"] = "cancelling"
+            elif st_for_ui.get("done") and st_for_ui.get("stage") != "cancelled" and not st_for_ui.get("error"):
                 st_for_ui["stage"] = "syncing_outputs"
             _emit(st_for_ui)
 
@@ -716,7 +752,13 @@ def run_manifest(
                 _emit(st_for_ui)
 
             if st.get("done"):
-                if st.get("error") and st.get("stage") in ("error", "crashed", "cancelled"):
+                stage = st.get("stage")
+                if stage == "cancelled":
+                    abort_reason = "cancel"
+                    _emit(st)
+                    raise RunCancelled("已確認遠端批次取消 (cancelled by user)")
+                cancel_failed = stage == "cancel_failed"
+                if st.get("error") and stage in ("error", "crashed", "cancel_failed"):
                     results["error"] = st["error"]
                 finished = True
                 _emit(st)
@@ -740,6 +782,8 @@ def run_manifest(
                         results["shutdown_pending"] = True
                         results.setdefault("error", f"尚未確認 {session} 已關閉，請檢查 Colab runtime 狀態")
                         print(f"⚠️ 尚未確認 {session} 已關閉", flush=True)
+                elif cancel_failed or (cancel_pending and not finished and abort_reason != "cancel"):
+                    print(f"⚠️ 尚未確認 {session} 的批次已取消，請檢查遠端狀態", flush=True)
                 elif finished or owned or abort_reason == "cancel":
                     keep_mins = max(30.0, float(idle_minutes)) if abort_reason == "cancel" else idle_minutes
                     try:

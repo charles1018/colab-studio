@@ -13,8 +13,8 @@ import copy
 import hashlib
 import json
 import os
-import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -22,9 +22,11 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cancel import CANCEL_PROTOCOL, cancel_marker  # noqa: E402
 from models import get_model_plugin  # noqa: E402
 
 JOB = Path(os.environ.get("CSTUDIO_DIR", "/content/cstudio"))
@@ -38,6 +40,7 @@ COMFY_URL = os.environ.get("CSTUDIO_COMFY_URL", "http://127.0.0.1:8188")
 STATE: dict = {
     "stage": "starting",
     "run_id": None,
+    "cancel_protocol": CANCEL_PROTOCOL,
     "log": [],
     "jobs": {},
     "prompt_ids": [],
@@ -49,6 +52,15 @@ STATE: dict = {
 MODEL_EXT = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin")
 OBJECT_INFO: dict = {}
 FITTED: dict = {}
+IN_FLIGHT: dict[str, bool] = {}
+
+
+class BatchCancelled(Exception):
+    pass
+
+
+class CancellationUnconfirmed(Exception):
+    pass
 
 
 # ---------------------------------------------------------------- status & helpers
@@ -67,12 +79,50 @@ def log(msg: str, stage: str | None = None):
     save()
 
 
-def sh(args, **kw):
-    subprocess.run(args, check=True, **kw)
+def setup_command(args, *, check=True, read_stdout=False, capture_output=False):
+    check_cancel()
+    stdout = subprocess.PIPE if read_stdout or capture_output else None
+    stderr = subprocess.PIPE if capture_output else None
+    with subprocess.Popen(args, stdout=stdout, stderr=stderr, text=True, start_new_session=True) as proc:
+        while True:
+            try:
+                output, errors = proc.communicate(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                if not cancellation_requested():
+                    continue
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.communicate()
+                raise BatchCancelled() from None
+    result = subprocess.CompletedProcess(args, proc.returncode, output, errors)
+    if check:
+        result.check_returncode()
+    return result
+
+
+def cancellation_requested() -> bool:
+    run_id = STATE.get("run_id")
+    return bool(run_id and cancel_marker(JOB, run_id).is_file())
+
+
+def check_cancel():
+    if cancellation_requested():
+        cancel_prompts()
+        raise BatchCancelled()
 
 
 def _git_head(dest: Path) -> str | None:
-    r = subprocess.run(["git", "-C", str(dest), "rev-parse", "HEAD"], capture_output=True, text=True)
+    r = setup_command(["git", "-C", str(dest), "rev-parse", "HEAD"], capture_output=True, check=False)
     return r.stdout.strip() if r.returncode == 0 else None
 
 
@@ -80,22 +130,22 @@ def clone(url: str, dest: Path, commit: str | None = None):
     dest = Path(dest)
     if commit is None:
         if not dest.exists():
-            sh(["git", "clone", "--depth", "1", url, str(dest)])
+            setup_command(["git", "clone", "--depth", "1", url, str(dest)])
         else:
-            subprocess.run(["git", "-C", str(dest), "pull", "--ff-only"], check=False)
+            setup_command(["git", "-C", str(dest), "pull", "--ff-only"], check=False)
         return
     if str(commit).startswith("-"):
         raise RuntimeError(f"bad pinned commit {commit!r}")
     if not dest.exists():
-        sh(["git", "init", "-q", str(dest)])
-        sh(["git", "-C", str(dest), "remote", "add", "origin", url])
+        setup_command(["git", "init", "-q", str(dest)])
+        setup_command(["git", "-C", str(dest), "remote", "add", "origin", url])
     else:
-        top = subprocess.run(["git", "-C", str(dest), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        top = setup_command(["git", "-C", str(dest), "rev-parse", "--show-toplevel"], capture_output=True, check=False)
         if top.returncode != 0 or Path(top.stdout.strip()).resolve() != dest.resolve():
             raise RuntimeError(f"{dest} exists but is not its own git repo")
-    if subprocess.run(["git", "-C", str(dest), "fetch", "-q", "--depth", "1", "origin", commit], check=False).returncode != 0:
-        sh(["git", "-C", str(dest), "fetch", "-q", "origin"])
-    sh(["git", "-C", str(dest), "checkout", "-q", "--detach", commit])
+    if setup_command(["git", "-C", str(dest), "fetch", "-q", "--depth", "1", "origin", commit], check=False).returncode != 0:
+        setup_command(["git", "-C", str(dest), "fetch", "-q", "origin"])
+    setup_command(["git", "-C", str(dest), "checkout", "-q", "--detach", commit])
     head = _git_head(dest)
     if head != commit:
         raise RuntimeError(f"pinned checkout of {dest} failed: HEAD {head} != {commit}")
@@ -146,18 +196,18 @@ def install(pins: dict | None = None):
         clone(url, COMFY / "custom_nodes" / name, c)
 
     log("install: installing Python packages via uv/pip")
-    sh([*pip_cmd, "-r", str(COMFY / "requirements.txt")])
+    setup_command([*pip_cmd, "-r", str(COMFY / "requirements.txt")])
     for n in nodes:
         req = COMFY / "custom_nodes" / n["name"] / "requirements.txt"
         if req.is_file():
-            sh([*pip_cmd, "-r", str(req)])
+            setup_command([*pip_cmd, "-r", str(req)])
 
     extra_pip = [p.get("spec") or p["name"] for p in ((pins or {}).get("pip") or [])] or [
         "huggingface_hub>=0.26.0",
         "hf_xet",
         "gguf>=0.13.0",
     ]
-    sh([*pip_cmd, *extra_pip])
+    setup_command([*pip_cmd, *extra_pip])
 
     MARK.write_text(
         json.dumps(
@@ -185,7 +235,6 @@ def _model_pin_index(pins: dict | None) -> dict[tuple[str, str], dict]:
 
 def download_models(files: list[tuple[str, str, str]], pins: dict | None = None):
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-    from huggingface_hub import hf_hub_download
 
     pin_idx = _model_pin_index(pins)
     # Check free disk space before downloading missing files
@@ -204,6 +253,7 @@ def download_models(files: list[tuple[str, str, str]], pins: dict | None = None)
         )
 
     for i, (repo, name, folder) in enumerate(files, 1):
+        check_cancel()
         dest = COMFY / "models" / folder / Path(name).name
         dest.parent.mkdir(parents=True, exist_ok=True)
         p = pin_idx.get((repo, name))
@@ -218,8 +268,22 @@ def download_models(files: list[tuple[str, str, str]], pins: dict | None = None)
             dest.unlink()
 
         log(f"models [{i}/{len(files)}]: downloading {dest.name} from {repo}" + (f" @ {rev[:8]}" if rev else ""), "models")
-        kw = {"revision": rev} if rev else {}
-        got = Path(hf_hub_download(repo_id=repo, filename=name, local_dir="/content/hf", **kw))
+        # Keep the download in a process the runner can stop without interrupting ComfyUI.
+        code = (
+            "import json, sys\n"
+            "from huggingface_hub import hf_hub_download\n"
+            "repo, name, rev = sys.argv[1:]\n"
+            "path = hf_hub_download(repo_id=repo, filename=name, revision=rev or None, local_dir='/content/hf')\n"
+            "print('CSTUDIO_MODEL ' + json.dumps(path))\n"
+        )
+        transfer = setup_command([sys.executable, "-c", code, repo, name, rev or ""], read_stdout=True)
+        for line in reversed(transfer.stdout.splitlines()):
+            if line.startswith("CSTUDIO_MODEL "):
+                got = Path(json.loads(line.partition(" ")[2]))
+                break
+        else:
+            raise RuntimeError(f"模型下載程序未回傳檔案：{dest.name}")
+        check_cancel()
         if exp_bytes is not None and got.stat().st_size != exp_bytes:
             raise RuntimeError(f"下載檔案大小不符 {dest.name}: 預期 {exp_bytes} bytes, 實際 {got.stat().st_size} bytes")
         if dest.exists() or dest.is_symlink():
@@ -229,6 +293,7 @@ def download_models(files: list[tuple[str, str, str]], pins: dict | None = None)
         except OSError:
             shutil.move(str(got), str(dest))
         log(f"models [{i}/{len(files)}]: ready {dest.name} ({dest.stat().st_size / 1e9:.2f} GB)")
+        check_cancel()
 
 
 # ---------------------------------------------------------------- 3 ComfyUI HTTP API
@@ -254,7 +319,49 @@ def call(url: str, data: dict | None = None, timeout: int = 60):
         raise ComfyHTTPError(e.code, raw) from None
 
 
+def cancel_prompts():
+    if not IN_FLIGHT:
+        return
+
+    log("cancel: verifying this run's prompts", "cancelling")
+    deadline = time.monotonic() + 30
+    last_error = None
+    while IN_FLIGHT and time.monotonic() < deadline:
+        try:
+            queue = call(COMFY_URL + "/queue", timeout=5)
+            active = set()
+            for key in ("queue_running", "queue_pending"):
+                items = queue[key]
+                if not isinstance(items, list):
+                    raise ValueError("Invalid ComfyUI queue")
+                for item in items:
+                    if not isinstance(item, list) or len(item) < 2 or not isinstance(item[1], str):
+                        raise ValueError("Invalid ComfyUI queue entry")
+                    active.add(item[1])
+            for pid, acknowledged in list(IN_FLIGHT.items()):
+                if time.monotonic() >= deadline:
+                    break
+                if pid in active:
+                    IN_FLIGHT[pid] = True
+                    call(COMFY_URL + f"/api/jobs/{urllib.parse.quote(pid, safe='')}/cancel", {}, timeout=5)
+                elif acknowledged:
+                    del IN_FLIGHT[pid]
+                else:
+                    # After a lost submission reply, a prompt absent from the queue may not be visible yet.
+                    history = call(COMFY_URL + f"/history/{urllib.parse.quote(pid, safe='')}", timeout=5)
+                    if isinstance(history, dict) and pid in history:
+                        del IN_FLIGHT[pid]
+        except (OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError) as exc:
+            last_error = type(exc).__name__
+        if IN_FLIGHT:
+            time.sleep(1)
+    if IN_FLIGHT:
+        detail = f" ({last_error})" if last_error else ""
+        raise CancellationUnconfirmed(f"無法確認 ComfyUI 已停止此批次的 prompt{detail}")
+
+
 def start_comfy(has_pe: bool = False):
+    check_cancel()
     try:
         call(COMFY_URL + "/system_stats", timeout=5)
         log("comfy: already running on 127.0.0.1:8188")
@@ -273,6 +380,7 @@ def start_comfy(has_pe: bool = False):
         start_new_session=True,
     )
     for _ in range(90):
+        check_cancel()
         time.sleep(2)
         try:
             call(COMFY_URL + "/system_stats", timeout=5)
@@ -364,27 +472,45 @@ def fit_names(graph: dict):
 
 def queue_prompt(graph: dict) -> str:
     fitted = fit_names(graph)
-    resp = call(COMFY_URL + "/prompt", {"prompt": graph, "client_id": "cstudio"})
+    check_cancel()
+    pid = str(uuid.uuid4())
+    IN_FLIGHT[pid] = False
+    STATE["prompt_ids"].append(pid)
+    save()
+    try:
+        resp = call(COMFY_URL + "/prompt", {"prompt": graph, "client_id": "cstudio", "prompt_id": pid})
+    except ComfyHTTPError as exc:
+        if exc.code == 400:
+            IN_FLIGHT.pop(pid)
+        raise
     if not isinstance(resp, dict) or not resp.get("prompt_id"):
         raise RuntimeError(f"ComfyUI 回應沒有 prompt_id：{json.dumps(resp, ensure_ascii=False)[:300]}")
+    active_pid = resp["prompt_id"]
+    if active_pid != pid:
+        IN_FLIGHT.pop(pid)
+        STATE["prompt_ids"][-1] = active_pid
+    IN_FLIGHT[active_pid] = True
     if resp.get("node_errors"):
         raise RuntimeError(f"ComfyUI node_errors：{json.dumps(resp['node_errors'], ensure_ascii=False)[:400]}")
-    pid = resp["prompt_id"]
     if fitted:
-        FITTED[pid] = fitted
-    STATE.setdefault("prompt_ids", []).append(pid)
+        FITTED[active_pid] = fitted
     save()
-    return pid
+    return active_pid
 
 
 def wait_history(pid: str, timeout: int, what: str) -> dict:
     t0, last = time.time(), time.time()
     fails = 0
     while time.time() - t0 < timeout:
+        cancelling = cancellation_requested()
+        if cancelling:
+            cancel_prompts()
         try:
             h = call(COMFY_URL + f"/history/{pid}").get(pid)
             fails = 0
         except Exception as e:
+            if cancelling:
+                raise BatchCancelled() from e
             fails += 1
             if fails > 5:
                 raise RuntimeError(f"{what}: 輪詢 ComfyUI 連續失敗 {fails} 次：{e}")
@@ -392,6 +518,9 @@ def wait_history(pid: str, timeout: int, what: str) -> dict:
             continue
 
         if h and h.get("status", {}).get("completed") is not None:
+            IN_FLIGHT.pop(pid, None)
+            if cancelling and not h["status"].get("completed"):
+                raise BatchCancelled()
             if h["status"].get("status_str") == "error":
                 msgs = [m[1] for m in h["status"].get("messages", []) if m[0] == "execution_error"]
                 m = msgs[0] if msgs else {}
@@ -399,6 +528,8 @@ def wait_history(pid: str, timeout: int, what: str) -> dict:
                     f"ComfyUI 執行錯誤: {m.get('node_type', '')} {m.get('exception_message', 'error')[:500]}".strip()
                 )
             return h
+        if cancelling:
+            raise BatchCancelled()
         if time.time() - last > 30:
             last = time.time()
             log(f"{what}: generating ({time.time() - t0:.0f}s)")
@@ -471,6 +602,7 @@ def run_batch():
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     STATE["run_id"] = manifest.get("_run_id")
     save()
+    check_cancel()
 
     pins = load_pins(manifest)
     plugin = get_model_plugin(manifest.get("model"))
@@ -478,10 +610,12 @@ def run_batch():
 
     # 1. Install ComfyUI & ComfyUI-GGUF
     install(pins)
+    check_cancel()
 
     # 2. Download required models for this batch
     req_models = plugin.required_models_for_batch(manifest, cli_quant=cli_quant)
     download_models(req_models, pins=pins if manifest.get("_pin_models", True) else None)
+    check_cancel()
 
     # 3. Start ComfyUI
     has_pe = any(bool(j.get("refine_prompt", manifest.get("refine_prompt", False))) for j in (manifest.get("jobs") or []))
@@ -494,6 +628,7 @@ def run_batch():
     log(f"batch: starting {len(jobs)} job(s)", "running")
 
     for idx, job in enumerate(jobs, 1):
+        check_cancel()
         jid = job["id"]
         t_job = time.time()
         STATE["jobs"][jid] = {"status": "running", "started": t_job}
@@ -545,6 +680,8 @@ def run_batch():
             STATE["jobs"][jid] = job_rec
             save()
             log(f"job [{idx}/{len(jobs)}] {jid}: done in {elapsed:.1f}s -> {out_file.name}")
+        except (BatchCancelled, CancellationUnconfirmed):
+            raise
         except Exception as e:
             tb = traceback.format_exc()
             STATE["jobs"][jid] = {
@@ -557,6 +694,8 @@ def run_batch():
             log(f"job [{idx}/{len(jobs)}] {jid}: FAILED - {e}")
 
     bad = [k for k, v in STATE["jobs"].items() if v.get("status") != "done"]
+    if bad or IN_FLIGHT:
+        check_cancel()
     STATE["done"] = True
     STATE["stage"] = "done" if not bad else "done_with_errors"
     if bad:
@@ -565,9 +704,15 @@ def run_batch():
     log(f"batch finished: {len(jobs) - len(bad)}/{len(jobs)} succeeded")
 
 
-if __name__ == "__main__":
+def main():
     try:
         run_batch()
+    except BatchCancelled:
+        STATE.update(done=True, stage="cancelled", error=None)
+        log("batch cancelled")
+    except CancellationUnconfirmed as exc:
+        STATE.update(done=True, stage="cancel_failed", error=str(exc))
+        log(f"cancel unconfirmed: {exc}")
     except Exception as exc:
         STATE["done"] = True
         STATE["stage"] = "error"
@@ -576,3 +721,7 @@ if __name__ == "__main__":
         traceback.print_exc()
         save()
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
