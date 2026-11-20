@@ -2,21 +2,24 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
-import threading
-from contextlib import aclosing, nullcontext
+import shutil
+from contextlib import aclosing, contextmanager, nullcontext
 from pathlib import Path
-from tempfile import SpooledTemporaryFile
+from tempfile import SpooledTemporaryFile, mkdtemp
 from typing import BinaryIO
 
 from anyio import CancelScope
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.routing import APIRoute
+from filelock import FileLock, Timeout
 from PIL import Image
 from starlette.concurrency import run_in_threadpool
 from starlette.formparsers import MultiPartException, MultiPartParser, parse_options_header
 
+from remote.job_paths import confined_path
 from remote.manifest import MAX_REFERENCES
 
 MIB = 1024 * 1024
@@ -28,7 +31,62 @@ MAX_FIELD_BYTES = 64 * 1024
 MAX_IMAGE_SIDE = 8192
 MAX_IMAGE_PIXELS = 4096**2
 IMAGE_FORMATS = ("PNG", "JPEG", "WEBP", "AVIF", "GIF", "BMP", "TIFF")
-GENERATION_SLOT = threading.Lock()
+STAGING_DIR = ".webui-staging"
+STAGING_MARKER = ".cstudio-web-staging"
+LOGGER = logging.getLogger(__name__)
+
+
+def _staging_lock(root: Path, name: str, *, timeout: float) -> FileLock:
+    return FileLock(confined_path(root, name, missing_ok=True), timeout=timeout, mode=0o600)
+
+
+@contextmanager
+def generation_staging(jobs: Path):
+    root = confined_path(jobs, STAGING_DIR, directory=True, missing_ok=True)
+    root.mkdir(mode=0o700, exist_ok=True)
+    gate = _staging_lock(root, ".lock", timeout=5)
+    with gate:
+        folder = Path(mkdtemp(prefix="pending-", dir=root))
+        try:
+            (folder / STAGING_MARKER).touch(exist_ok=False)
+            lease = _staging_lock(folder, ".lease", timeout=0)
+            lease.acquire()
+        except (OSError, ValueError, Timeout):
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
+    try:
+        yield folder
+    finally:
+        try:
+            with gate:
+                lease.release()
+                shutil.rmtree(folder)
+        except (OSError, Timeout):
+            LOGGER.warning("暫時無法移除工作台暫存目錄，重新啟動時會再清理")
+        finally:
+            lease.release()
+
+
+def clean_generation_staging(jobs: Path) -> None:
+    try:
+        root = confined_path(jobs, STAGING_DIR, directory=True)
+    except FileNotFoundError:
+        return
+    with _staging_lock(root, ".lock", timeout=5):
+        for path in root.iterdir():
+            if not re.fullmatch(r"pending-[a-z0-9_]{8}", path.name):
+                continue
+            try:
+                folder = confined_path(root, path.name, directory=True)
+                confined_path(folder, STAGING_MARKER)
+                with _staging_lock(folder, ".lease", timeout=0):
+                    pass
+                shutil.rmtree(folder)
+            except (FileNotFoundError, ValueError, Timeout):
+                # Another process may still hold this lease. Only remove managed directories.
+                continue
+            except OSError:
+                LOGGER.warning("暫時無法清理一個工作台暫存目錄")
 
 
 class ReferenceMultipartParser(MultiPartParser):
@@ -117,17 +175,19 @@ class GenerationRoute(APIRoute):
                         raise HTTPException(status_code=413, detail=too_large)
                 return message
 
-            if not GENERATION_SLOT.acquire(blocking=False):
-                raise HTTPException(status_code=409, detail="另一個生成請求正在接收或準備圖片")
-            guarded = GenerationRequest(request.scope, receive)
-            try:
-                return await handle(guarded)
-            finally:
-                try:
-                    with CancelScope(shield=True):
-                        await guarded.close()
-                finally:
-                    GENERATION_SLOT.release()
+            loop = asyncio.get_running_loop()
+            with CancelScope() as cancel:
+                with request.app.state.reserve_generation(lambda: loop.call_soon_threadsafe(cancel.cancel)) as attempt:
+                    guarded = GenerationRequest(request.scope, receive)
+                    guarded.state.generation = attempt
+                    try:
+                        response = await handle(guarded)
+                    finally:
+                        with CancelScope(shield=True):
+                            await guarded.close()
+            if attempt.preparation_cancelled:
+                raise HTTPException(status_code=409, detail="已取消本機生成準備")
+            return response
 
         return limited
 
@@ -180,8 +240,13 @@ async def prepare_reference_images(sources: list[UploadFile | Path], folder: Pat
     except asyncio.CancelledError:
         # Join the encoder before the request closes its uploads or deletes its staging directory.
         with CancelScope(shield=True):
-            try:
-                await task
-            except Exception:
-                pass
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not task.cancelled():
+                task.exception()
         raise

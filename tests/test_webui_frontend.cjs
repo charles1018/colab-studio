@@ -148,3 +148,22 @@ test("progress shows the bound run and actual GPU, and completion refreshes only
   assert.equal(galleryLoads(), 1);
   assert.equal(run("slowPoll"), null);
 });
+
+test("polling keeps submit disabled during a local upload and shows preparation cancellation", () => {
+  const { run, getElementById } = fixture();
+  const apply = run("applyStatus");
+  const generate = getElementById("btnGenerate");
+  const cancel = getElementById("btnCancelTop");
+  run("ui.submitting = true;");
+  apply(status(1), 1);
+  assert.equal(generate.disabled, true);
+  assert.match(generate.textContent, /正在準備生成/);
+  apply(status(2, [], { preparing: true, preparation_id: "attempt", can_cancel: true }), 2);
+  assert.equal(generate.disabled, true);
+  assert.equal(cancel.disabled, false);
+  apply(status(3, [], { preparing: true, preparation_id: "attempt", can_cancel: false }), 3);
+  assert.equal(cancel.disabled, true);
+  run("ui.submitting = false;");
+  apply(status(4), 4);
+  assert.equal(generate.disabled, false);
+});

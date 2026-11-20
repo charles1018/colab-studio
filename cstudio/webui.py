@@ -3,25 +3,30 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import logging
 import math
 import random
 import re
 import secrets
 import sys
-import tempfile
 import threading
 import time
 import uuid
 import webbrowser
-from dataclasses import replace
+from collections.abc import Callable
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, field, replace
 from ipaddress import ip_address
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 from fastapi import APIRouter, Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from filelock import Timeout as LockTimeout
 from PIL import Image
 from remote.job_paths import confined_path, relative_parts
 from remote.manifest import MODES, normalize_manifest, normalize_resolution
@@ -30,7 +35,9 @@ from . import colab_client as C
 from . import colab_login as L
 from . import runner as R
 from .redact import redact
-from .web_inputs import MAX_REFERENCES, GenerationRoute, prepare_reference_images
+from .web_inputs import (
+    MAX_REFERENCES, GenerationRoute, clean_generation_staging, generation_staging, prepare_reference_images,
+)
 from .web_sessions import CACHE_SECONDS, STALE_SECONDS, CloudStatus, session_id, session_rows
 
 HERE = Path(__file__).resolve().parent
@@ -38,6 +45,9 @@ ROOT = HERE.parent
 STATIC_DIR = HERE / "static"
 JOBS_DIR = ROOT / "jobs"
 REMOTE = ROOT / "remote"
+REQUEST_DRAIN_SECONDS = 5
+WORKER_DRAIN_SECONDS = C.RECOVERY_TIMEOUT
+LOGGER = logging.getLogger(__name__)
 if str(REMOTE) not in sys.path:
     sys.path.insert(0, str(REMOTE))
 from models import qwen_image_21 as Q  # noqa: E402
@@ -339,6 +349,16 @@ def resolve_artifact_to_path(artifact_id: str) -> Path:
     return safe_subfile(job_dir, subfolder, filename)
 
 
+@dataclass
+class GenerationAttempt:
+    cancel_upload: Callable[[], None]
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    request_open: bool = True
+    preparation_cancelled: bool = False
+    phase: str = "preparing"
+    finished: Event = field(default_factory=Event)
+
+
 class StudioUIState:
     """Thread-safe state manager for Colab Studio Web UI."""
 
@@ -349,6 +369,8 @@ class StudioUIState:
         self.view_id = uuid.uuid4().hex
         self.session_key = secrets.token_bytes(32)
         self.running: bool = False
+        self.generation: GenerationAttempt | None = None
+        self.closing = False
         self.provisioning: bool = False
         self.cancel_requested: bool = False
         self.abort_action: str | None = None
@@ -377,6 +399,88 @@ class StudioUIState:
         self.colab_cache_account: str | None = None
         self.colab_cache = CloudStatus()
         self.cloud_generation = 0
+
+    @contextmanager
+    def reserve_generation(self, cancel_upload: Callable[[], None]):
+        with self.lock:
+            if self.closing:
+                raise HTTPException(status_code=503, detail="工作台正在關閉")
+            if self.generation or self.running:
+                raise HTTPException(status_code=409, detail="已有生成請求正在接收、準備或執行")
+            attempt = self.generation = GenerationAttempt(cancel_upload)
+        try:
+            yield attempt
+        finally:
+            with self.lock:
+                attempt.request_open = False
+                self._release_generation(attempt)
+
+    def _release_generation(self, attempt: GenerationAttempt) -> None:
+        if not attempt.request_open and attempt.phase != "running":
+            self.generation = None
+            attempt.finished.set()
+
+    def _cancel_preparation(self) -> bool:
+        attempt = self.generation
+        if not attempt or attempt.phase != "preparing":
+            return False
+        if not attempt.preparation_cancelled:
+            attempt.preparation_cancelled = True
+            attempt.cancel_upload()
+        return True
+
+    def _request_run_cancel(self) -> None:
+        self.cancel_requested = True
+        self.abort_action = "cancel"
+        self.stage = "cancelling"
+        self.stage_label = STAGE_LABELS_ZH["cancelling"]
+        self._bump()
+
+    def begin_shutdown(self) -> Event | None:
+        with self.lock:
+            self.closing = True
+            attempt = self.generation
+            if not self._cancel_preparation() and self.running and not self.abort_action:
+                self._request_run_cancel()
+            return attempt.finished if attempt else None
+
+    def abort_signal(self) -> str | None:
+        with self.lock:
+            return self.abort_action or ("cancel" if self.cancel_requested else None)
+
+    def _publish_generation(
+        self, attempt: GenerationAttempt, recipe: dict, account: str, endpoint: str | None,
+    ) -> None:
+        attempt.phase = "running"
+        self.running = True
+        self.provisioning = False
+        self.cancel_requested = False
+        self.abort_action = None
+        self.run_id = None
+        self.job_dir = recipe["job_dir"]
+        self.job_id = recipe["job_id"]
+        self.stage = "selecting_vm"
+        self.stage_label = STAGE_LABELS_ZH[self.stage]
+        self.progress_step = "boot"
+        self.session = recipe["session"]
+        self.session_account = account
+        self.session_endpoint = endpoint
+        self.runtime_attached = False
+        self.shutdown_endpoint = None
+        self.requested_gpu = recipe["gpu"]
+        self.actual_gpu = None
+        self.gpu_source = None
+        self.quant = recipe["quant"]
+        self.started_at = time.time()
+        self.finished_at = None
+        self.error = None
+        self.synced_images = []
+        self.logs = [
+            f"📋 已建立本地任務：{self.job_dir} (mode={recipe['mode']}, quant={self.quant}, seed={recipe['seed']})",
+            f"🎯 目標 Colab Session：{self.session or '待確認'} (GPU={self.requested_gpu})",
+        ]
+        self.last_recipe = recipe
+        self._bump()
 
     def _bump(self) -> int:
         self.revision += 1
@@ -509,11 +613,15 @@ class StudioUIState:
         active = target
         if active is None:
             active = next((row for row in sessions if row["presence"] != "gone"), sessions[0] if sessions else None)
+        preparing = self.generation is not None and self.generation.phase == "preparing"
         return {
             "view_id": self.view_id,
             "revision": self._bump(),
             "running": self.running,
-            "can_cancel": self.running and run_visible and not self.cancel_requested,
+            "preparing": preparing,
+            "preparation_id": self.generation.id if preparing else None,
+            "can_cancel": (self.running and run_visible and not self.cancel_requested)
+                          or (preparing and not self.generation.preparation_cancelled),
             "run_id": self.run_id if run_visible else None,
             "job_dir": self.job_dir,
             "job_id": self.job_id,
@@ -554,7 +662,7 @@ class StudioUIState:
         with self.lock:
             account = self._observe_account()
             baseline = self.colab_cache
-            if not account or (not force and baseline.fresh(time.monotonic(), CACHE_SECONDS)):
+            if self.closing or not account or (not force and baseline.fresh(time.monotonic(), CACHE_SECONDS)):
                 return self._status(account)
 
         # Concurrent requests for the same account/generation share the query, including force.
@@ -562,7 +670,7 @@ class StudioUIState:
             with self.lock:
                 account = self._observe_account()
                 cache = self.colab_cache
-                if not account or (cache is not baseline and cache.checked_mono is not None):
+                if self.closing or not account or (cache is not baseline and cache.checked_mono is not None):
                     return self._status(account)
                 generation = self.cloud_generation
 
@@ -578,7 +686,7 @@ class StudioUIState:
 
             with self.lock:
                 current = self._observe_account()
-                if current != account or generation != self.cloud_generation:
+                if self.closing or current != account or generation != self.cloud_generation:
                     return self._status(current)
                 now = time.time()
                 self.colab_cache = CloudStatus(
@@ -606,7 +714,27 @@ class StudioUIState:
 
 
 STATE = StudioUIState()
-app = FastAPI(title="Colab Studio Local Web UI", version="0.1.0")
+
+
+@asynccontextmanager
+async def workbench_lifespan(_: FastAPI):
+    state = STATE
+    try:
+        await asyncio.to_thread(clean_generation_staging, JOBS_DIR)
+    except (OSError, ValueError, LockTimeout):
+        LOGGER.warning("無法清理上次未完成的工作台暫存目錄")
+    with state.lock:
+        state.closing = False
+    try:
+        yield
+    finally:
+        finished = state.begin_shutdown()
+        if finished is not None and not await asyncio.to_thread(finished.wait, WORKER_DRAIN_SECONDS):
+            LOGGER.warning("工作台收尾逾時，已登記的 Colab Session 保留既有回收紀錄")
+
+
+app = FastAPI(title="Colab Studio Local Web UI", version="0.1.0", lifespan=workbench_lifespan)
+app.state.reserve_generation = lambda cancel_upload: STATE.reserve_generation(cancel_upload)
 LOCAL_UI_HOSTS = ("127.0.0.1", "localhost", "::1")
 LOCAL_AUTHORITY = re.compile(r"(127\.0\.0\.1|localhost|\[::1\])(?::([0-9]{1,5}))?", re.IGNORECASE | re.ASCII)
 UI_SESSION_TOKEN = secrets.token_urlsafe(32)
@@ -832,12 +960,21 @@ def api_colab_cancel(payload: dict[str, Any] | None = None):
     payload = payload or {}
     requested = str(payload.get("session") or "").strip()
     selection = payload.get("session_id")
+    preparation_id = payload.get("preparation_id")
     run_id = str(payload["run_id"]).strip() if payload.get("run_id") else None
     if run_id and not re.fullmatch(r"[0-9a-f]{12}", run_id):
         raise HTTPException(status_code=400, detail="不合法的批次 ID")
     if requested:
         requested = _resolve_target_session(requested)
     with STATE.lock:
+        if preparation_id is not None:
+            attempt = STATE.generation
+            if (
+                selection is not None or requested or run_id or not attempt or attempt.id != preparation_id
+                or not STATE._cancel_preparation()
+            ):
+                raise HTTPException(status_code=409, detail="此本機生成準備已變更，請重新確認")
+            return JSONResponse(status_code=202, content={"ok": True, "state": "preparation_pending"})
         if selection is None and STATE.running and (not requested or requested == STATE.session):
             if STATE.session_account is not None and STATE.session_account != C.account_scope():
                 raise HTTPException(status_code=409, detail="工作台的 Colab 登入身分已變更")
@@ -845,11 +982,7 @@ def api_colab_cancel(payload: dict[str, Any] | None = None):
                 raise HTTPException(status_code=409, detail="工作台的執行中批次已變更")
             if STATE.abort_action == "stop":
                 raise HTTPException(status_code=409, detail="此 Session 正在關機")
-            STATE.cancel_requested = True
-            STATE.abort_action = "cancel"
-            STATE.stage = "cancelling"
-            STATE.stage_label = STAGE_LABELS_ZH["cancelling"]
-            STATE._bump()
+            STATE._request_run_cancel()
             return JSONResponse(status_code=202, content={
                 "ok": True, "state": "pending", "session": STATE.session, "run_id": STATE.run_id,
             })
@@ -894,6 +1027,11 @@ def api_colab_stop(payload: dict[str, Any] | None = None):
     account = C.account_scope()
     owned = set(C.owned_sessions()) if requested is None else set()
     with STATE.lock:
+        preparation_cancelled = stop_all and STATE._cancel_preparation()
+        generation_cancel_pending = (stop_all and STATE.running and STATE.stage == "selecting_vm"
+                                     and STATE.session_account == account)
+        if generation_cancel_pending:
+            STATE._request_run_cancel()
         active = STATE.session if STATE.running else None
         if STATE.session_account is not None and STATE.session_account != account:
             if requested is not None and requested == STATE.session:
@@ -949,14 +1087,19 @@ def api_colab_stop(payload: dict[str, Any] | None = None):
             STATE.stage = "shutdown_pending"
             STATE.stage_label = STAGE_LABELS_ZH["shutdown_pending"]
         STATE._bump()
+    awaiting = bool(pending or preparation_cancelled or generation_cancel_pending)
     result = {
-        "ok": not pending and not failed, "requested": targets, "stopped": stopped,
+        "ok": not awaiting and not failed, "requested": targets, "stopped": stopped,
         "verified_gone": stopped, "pending": pending, "failed": failed,
     }
-    if failed and not (stopped or pending):
+    if preparation_cancelled:
+        result["preparation_cancelled"] = True
+    if generation_cancel_pending:
+        result["generation_cancel_pending"] = True
+    if failed and not (stopped or awaiting):
         result["detail"] = f"無法確認關機：{', '.join(failed)}"
         return JSONResponse(status_code=502, content=result)
-    return JSONResponse(status_code=207 if failed else 202 if pending else 200, content=result)
+    return JSONResponse(status_code=207 if failed else 202 if awaiting else 200, content=result)
 
 
 @app.get("/api/run/status")
@@ -980,6 +1123,7 @@ generation = APIRouter(route_class=GenerationRoute)
 
 @generation.post("/api/run/start")
 async def api_run_start(
+    request: Request,
     mode: str = Form("t2i"),
     prompt: str = Form(""),
     refine_prompt: str = Form("false"),
@@ -1000,12 +1144,8 @@ async def api_run_start(
     ref_files: list[UploadFile] = File(default=[]),
 ):
     """Validate inputs, create local jobs/webui_<timestamp>/ folder, and start background runner."""
-    with STATE.lock:
-        if STATE.running:
-            raise HTTPException(
-                status_code=409,
-                detail="目前已有正在執行的生成任務，請先等待完成或點擊「⏹️ 中斷當前任務」",
-            )
+    state = STATE
+    attempt = request.state.generation
 
     if not C.token_ok():
         raise HTTPException(
@@ -1157,84 +1297,35 @@ async def api_run_start(
     if isinstance(session_id, str) and session_id:
         if target_session is None:
             raise HTTPException(status_code=400, detail="請指定要沿用的 Colab Session")
-        expected_endpoint = STATE.selected_endpoint(account, target_session, session_id)
+        expected_endpoint = state.selected_endpoint(account, target_session, session_id)
 
-    try:
-        JOBS_DIR.mkdir(parents=True, exist_ok=True)
-        job_folder = confined_path(JOBS_DIR, folder_name, directory=True, missing_ok=True)
-        if job_folder.exists():
-            raise FileExistsError(job_folder)
-        with tempfile.TemporaryDirectory(prefix=".webui-", dir=JOBS_DIR) as scratch:
-            staged_job = Path(scratch) / "job"
-            inputs_folder = staged_job / "inputs"
-            inputs_folder.mkdir(parents=True)
-            (staged_job / "out").mkdir()
-            if resolved_sources:
-                await prepare_reference_images(resolved_sources, inputs_folder)
-            problems = R.validate_manifest(manifest_data, staged_job)
-            if problems:
-                raise HTTPException(status_code=400, detail=redact("任務設定驗證未通過：\n- " + "\n- ".join(problems)))
-            (staged_job / "manifest.json").write_text(
-                json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8",
-            )
-            if job_folder.exists():
-                raise FileExistsError(job_folder)
-            staged_job.rename(job_folder)
-    except FileExistsError as exc:
-        raise HTTPException(status_code=409, detail="任務資料夾已經存在") from exc
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="無法使用任務資料夾") from exc
-    manifest_path = job_folder / "manifest.json"
-
-    with STATE.lock:
-        if STATE.running:
-            raise HTTPException(status_code=409, detail="另一個生成任務剛啟動，請稍候")
-        STATE.running = True
-        STATE.provisioning = False
-        STATE.cancel_requested = False
-        STATE.abort_action = None
-        STATE.run_id = None
-        STATE.job_dir = folder_name
-        STATE.job_id = job_id
-        STATE.stage = "selecting_vm"
-        STATE.stage_label = STAGE_LABELS_ZH["selecting_vm"]
-        STATE.progress_step = "boot"
-        STATE.session = target_session
-        STATE.session_account = account
-        STATE.session_endpoint = expected_endpoint
-        STATE.runtime_attached = False
-        STATE.shutdown_endpoint = None
-        STATE.requested_gpu = gpu_clean
-        STATE.actual_gpu = None
-        STATE.gpu_source = None
-        STATE.quant = quant_clean
-        STATE.started_at = time.time()
-        STATE.finished_at = None
-        STATE.error = None
-        STATE.synced_images = []
-        STATE.logs = [
-            f"📋 已建立本地任務：{folder_name} (mode={mode_clean}, quant={quant_clean}, seed={seed_int})",
-            f"🎯 目標 Colab Session：{target_session or '待確認'} (GPU={gpu_clean})",
-        ]
-        STATE.last_recipe = {
-            "job_dir": folder_name,
-            "job_id": job_id,
-            "mode": mode_clean,
-            "prompt": prompt_clean,
-            "quant": quant_clean,
-            "seed": str(seed_int),
-            "refine_prompt": refine_bool,
-            "pe_variant": pe_var_clean,
-            "transparent": transparent_bool,
-            "aspect_ratio": ar_clean,
-            "resolution": res_clean,
-            "edit_sizing": edit_sizing,
-            "gpu": gpu_clean,
-            "session": target_session,
-        }
-        STATE._bump()
+    recipe = {
+        "job_dir": folder_name,
+        "job_id": job_id,
+        "mode": mode_clean,
+        "prompt": prompt_clean,
+        "quant": quant_clean,
+        "seed": str(seed_int),
+        "refine_prompt": refine_bool,
+        "pe_variant": pe_var_clean,
+        "transparent": transparent_bool,
+        "aspect_ratio": ar_clean,
+        "resolution": res_clean,
+        "edit_sizing": edit_sizing,
+        "gpu": gpu_clean,
+        "session": target_session,
+    }
+    launch = Event()
+    committed = False
 
     def _worker():
+        launch.wait()
+        if not committed:
+            return
+        stage = "error"
+        error = None
+        clear_session = False
+        log = None
         try:
             res = R.run_manifest(
                 manifest_path,
@@ -1247,62 +1338,98 @@ async def api_run_start(
                 cli_quant=quant_clean,
                 idle_minutes=idle_mins,
                 stop_after=stop_after_bool,
-                progress_cb=STATE.on_runner_progress,
+                progress_cb=state.on_runner_progress,
                 exit_on_error=False,
-                should_abort=lambda: (STATE.abort_action or ("cancel" if STATE.cancel_requested else None)),
+                should_abort=state.abort_signal,
             )
-            with STATE.lock:
-                if res.get("shutdown_state") == C.ReleaseState.PENDING:
-                    STATE.stage = "shutdown_pending"
-                    STATE.stage_label = STAGE_LABELS_ZH["shutdown_pending"]
-                elif res.get("error"):
-                    STATE.stage = "error"
-                    STATE.stage_label = STAGE_LABELS_ZH["error"]
-                    STATE.error = redact(str(res["error"]))
-                else:
-                    STATE.stage = "done"
-                    STATE.stage_label = STAGE_LABELS_ZH["done"]
-                    if res.get("shutdown_state") == C.ReleaseState.CONFIRMED:
-                        STATE.session = None
-                STATE._bump()
+            clear_session = res.get("shutdown_state") == C.ReleaseState.CONFIRMED
+            if res.get("shutdown_state") == C.ReleaseState.PENDING:
+                stage = "shutdown_pending"
+            elif res.get("error"):
+                error = redact(str(res["error"]))
+            else:
+                stage = "done"
         except BaseException as exc:
-            with STATE.lock:
-                if isinstance(exc, R.RunCancelled):
-                    STATE.stage = "cancelled"
-                    STATE.stage_label = STAGE_LABELS_ZH["cancelled"]
-                    STATE.error = None
-                elif isinstance(exc, R.RunStopped) and exc.outcome != C.ReleaseState.FAILED:
-                    if exc.outcome == C.ReleaseState.CONFIRMED:
-                        STATE.stage = "stopped"
-                        STATE.session = None
-                    else:
-                        STATE.stage = "shutdown_pending" if exc.outcome == C.ReleaseState.PENDING else "stopped_local"
-                    STATE.stage_label = STAGE_LABELS_ZH[STATE.stage]
-                    STATE.error = None
+            log = f"⚠️ {redact(str(exc))}"
+            if isinstance(exc, R.RunCancelled):
+                stage = "cancelled"
+            elif isinstance(exc, R.RunStopped) and exc.outcome != C.ReleaseState.FAILED:
+                clear_session = exc.outcome == C.ReleaseState.CONFIRMED
+                if clear_session:
+                    stage = "stopped"
                 else:
-                    STATE.stage = "error"
-                    STATE.stage_label = STAGE_LABELS_ZH["error"]
-                    STATE.error = redact(str(exc))
-                STATE.logs.append(f"⚠️ {redact(str(exc))}")
-                STATE._bump()
+                    stage = "shutdown_pending" if exc.outcome == C.ReleaseState.PENDING else "stopped_local"
+            else:
+                error = redact(str(exc))
         finally:
-            with STATE.lock:
-                if STATE.stage == "shutdown_pending" and STATE.session:
-                    STATE.shutdown_endpoint = (
-                        STATE.session_endpoint or (C.keep_info(STATE.session) or {}).get("runtime_endpoint")
+            with state.lock:
+                if clear_session:
+                    state.session = None
+                state.stage = stage
+                state.stage_label = STAGE_LABELS_ZH[stage]
+                state.error = error
+                if log:
+                    state.logs.append(log)
+                if stage == "shutdown_pending" and state.session:
+                    state.shutdown_endpoint = (
+                        state.session_endpoint or (C.keep_info(state.session) or {}).get("runtime_endpoint")
                     )
-                STATE.running = False
-                STATE.provisioning = False
-                STATE.finished_at = time.time()
-                STATE.invalidate_cloud()
-                STATE._bump()
+                state.running = False
+                state.provisioning = False
+                state.finished_at = time.time()
+                attempt.phase = "finished"
+                state._release_generation(attempt)
+                state.invalidate_cloud()
+                state._bump()
             try:
-                STATE.refresh_colab_cache(force=True)
+                state.refresh_colab_cache(force=True)
             except Exception:
                 pass
 
-    t = threading.Thread(target=_worker, name=f"cstudio-run-{folder_name}", daemon=True)
-    t.start()
+    try:
+        JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        job_folder = confined_path(JOBS_DIR, folder_name, directory=True, missing_ok=True)
+        manifest_path = job_folder / "manifest.json"
+        if job_folder.exists():
+            raise FileExistsError(job_folder)
+        with generation_staging(JOBS_DIR) as scratch:
+            staged_job = scratch / "job"
+            inputs_folder = staged_job / "inputs"
+            inputs_folder.mkdir(parents=True)
+            (staged_job / "out").mkdir()
+            if resolved_sources:
+                await prepare_reference_images(resolved_sources, inputs_folder)
+            problems = R.validate_manifest(manifest_data, staged_job)
+            if problems:
+                raise HTTPException(status_code=400, detail=redact("任務設定驗證未通過：\n- " + "\n- ".join(problems)))
+            (staged_job / "manifest.json").write_text(
+                json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            with state.lock:
+                if state.closing or attempt.preparation_cancelled:
+                    raise HTTPException(status_code=409, detail="已取消本機生成準備")
+                if C.account_scope() != account:
+                    raise HTTPException(status_code=409, detail="Colab 登入身分已變更，請重新提交")
+                if job_folder.exists():
+                    raise FileExistsError(job_folder)
+                # The thread can start only after the validated folder and its state are published.
+                try:
+                    thread = threading.Thread(target=_worker, name=f"cstudio-run-{folder_name}", daemon=True)
+                    thread.start()
+                except (OSError, RuntimeError) as exc:
+                    LOGGER.warning("無法啟動工作台生成執行緒")
+                    raise HTTPException(status_code=503, detail="無法啟動生成任務，請重試") from exc
+                staged_job.rename(job_folder)
+                state._publish_generation(attempt, recipe, account, expected_endpoint)
+                committed = True
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail="任務資料夾已經存在") from exc
+    except LockTimeout as exc:
+        raise HTTPException(status_code=503, detail="工作台暫存目錄暫時無法使用，請重試") from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="無法使用任務資料夾") from exc
+    finally:
+        launch.set()
 
     return JSONResponse(
         status_code=202,
@@ -1312,7 +1439,7 @@ async def api_run_start(
             "job_id": job_id,
             "session": target_session,
             "seed": str(seed_int),
-            "status": STATE.fast_status(),
+            "status": state.fast_status(),
         },
     )
 
@@ -1332,7 +1459,14 @@ def launch_ui(host: str = "127.0.0.1", port: int = 7860, open_browser: bool = Fa
     print(f"🎨 啟動 Colab Studio 本地輕量 Web UI：{url}", flush=True)
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    uvicorn.run(app, host=bind_host, port=port, log_level="info", proxy_headers=False)
+    class StudioServer(uvicorn.Server):
+        async def shutdown(self, sockets=None):
+            STATE.begin_shutdown()
+            await super().shutdown(sockets=sockets)
+
+    config = uvicorn.Config(app, host=bind_host, port=port, log_level="info", proxy_headers=False,
+                            timeout_graceful_shutdown=REQUEST_DRAIN_SECONDS)
+    StudioServer(config).run()
 
 
 def main():

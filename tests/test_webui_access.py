@@ -2,6 +2,8 @@
 import asyncio
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -91,8 +93,28 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
             get_login_url=self.begin_login, submit_login_code=self.finish_login,
         ))
         self.run_manifest = self.enterContext(patch.object(W.R, "run_manifest", return_value={}))
+        self.worker_threads = []
+        self.wait_for_workers = False
         self.state = W.StudioUIState()
         self.enterContext(patch.multiple(W, JOBS_DIR=self.jobs, STATE=self.state))
+
+    def use_worker_threads(self, *, wait=True):
+        def tracked_thread(**kwargs):
+            thread = threading.Thread(**kwargs)
+            self.worker_threads.append(thread)
+            return thread
+
+        self.wait_for_workers = wait
+        self.enterContext(patch.object(W, "threading", SimpleNamespace(Thread=tracked_thread)))
+        self.addCleanup(self.join_workers)
+
+    def join_workers(self):
+        for thread in self.worker_threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive(), "fixture worker did not finish")
+
+    def assert_clean_staging(self):
+        self.assertEqual(list((self.jobs / U.STAGING_DIR).glob("pending-*")), [])
 
     def fake_begin_login(self):
         self.pending.write_text("fixture state", encoding="utf-8")
@@ -105,6 +127,7 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
 
     async def request(
         self, target, *, method="GET", host=HOST, headers=(), body=b"", peer="127.0.0.1", root_path="",
+        before_read=None,
     ):
         path, _, query = target.partition("?")
         fields = ([("host", host)] if host is not None else []) + list(headers)
@@ -127,6 +150,8 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
 
         async def receive():
             nonlocal reads
+            if before_read:
+                await before_read(reads)
             if reads == len(incoming):
                 await asyncio.Future()
             data = incoming[reads]
@@ -139,6 +164,8 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
             messages.append(message)
 
         await W.app(scope, receive, send)
+        if self.wait_for_workers:
+            await asyncio.to_thread(self.join_workers)
         start, *chunks = messages
         return SimpleNamespace(
             status=start["status"], headers=dict(start["headers"]),
@@ -160,7 +187,9 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
     def assert_no_effects(self):
         for fake in (*self.cloud.values(), self.begin_login, self.finish_login, self.run_manifest):
             fake.assert_not_called()
-        self.assertEqual(list(self.jobs.iterdir()), [self.image.parents[1]])
+        self.assertEqual([path for path in self.jobs.iterdir() if path.name != U.STAGING_DIR],
+                         [self.image.parents[1]])
+        self.assert_clean_staging()
         self.assertEqual(self.state.revision, 0)
         self.assertFalse(self.state.running)
         self.assertEqual(self.pending.read_text(encoding="utf-8"), "original pending")
@@ -282,8 +311,8 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 403)
         self.assert_no_effects()
 
-    async def submit_form(self, cookie, body, *, headers=()):
-        return await self.request("/api/run/start", method="POST", body=body, headers=(
+    async def submit_form(self, cookie, body, *, headers=(), before_read=None):
+        return await self.request("/api/run/start", method="POST", body=body, before_read=before_read, headers=(
             cookie, ("origin", ORIGIN), UI_HEADER, MULTIPART_HEADER, *headers,
         ))
 
@@ -362,9 +391,7 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
         cookie = await self.open_ui()
         colors = [(value, 20, 30) if value % 2 else (value, 30, 40, 51) for value in range(10)]
         pictures = [image_bytes("RGBA" if len(color) == 4 else "RGB", color=color) for color in colors]
-        self.enterContext(patch.object(W, "threading", SimpleNamespace(
-            Thread=lambda *, target, **_: SimpleNamespace(start=target),
-        )))
+        self.use_worker_threads()
         body = edit_form(pictures)
         with patch.multiple(U, MAX_REQUEST_BYTES=len(body), MAX_REFERENCE_BYTES=max(map(len, pictures))):
             response = await self.submit_form(cookie, (body[:300], body[300:]), headers=(
@@ -381,9 +408,7 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_urlencoded_t2i_keeps_form_compatibility_under_smaller_body_cap(self):
         cookie = await self.open_ui()
-        self.enterContext(patch.object(W, "threading", SimpleNamespace(
-            Thread=lambda *, target, **_: SimpleNamespace(start=target),
-        )))
+        self.use_worker_threads()
         headers = (cookie, ("origin", ORIGIN), UI_HEADER, ("content-type", "application/x-www-form-urlencoded"))
         with patch.object(U, "MAX_FORM_BYTES", 32):
             rejected = await self.request("/api/run/start", method="POST", headers=headers, body=b"prompt=" + b"a" * 32)
@@ -413,9 +438,7 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_form_normalizes_aliases_and_preserves_full_unsigned_seed(self):
         cookie = await self.open_ui()
-        self.enterContext(patch.object(W, "threading", SimpleNamespace(
-            Thread=lambda *, target, **_: SimpleNamespace(start=target),
-        )))
+        self.use_worker_threads()
         headers = (cookie, ("origin", ORIGIN), UI_HEADER, ("content-type", "application/x-www-form-urlencoded"))
         response = await self.request(
             "/api/run/start", method="POST", headers=headers, body=urlencode({
@@ -489,9 +512,7 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("encoder fixture timed out")
             encode(*args)
 
-        self.enterContext(patch.object(W, "threading", SimpleNamespace(
-            Thread=lambda *, target, **_: SimpleNamespace(start=target),
-        )))
+        self.use_worker_threads()
         with patch.object(U, "write_reference_images", side_effect=wait_and_encode):
             pending = asyncio.create_task(self.submit_form(cookie, body))
             try:
@@ -530,6 +551,8 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await asyncio.to_thread(started.wait, 3))
                 pending.cancel()
                 await asyncio.sleep(0)
+                pending.cancel()
+                await asyncio.sleep(0)
                 self.assertFalse(pending.done())
             finally:
                 release.set()
@@ -537,8 +560,250 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
                     await pending
         encoder.assert_called_once()
         self.assertTrue(finished.is_set())
-        self.assertFalse(U.GENERATION_SLOT.locked())
+        self.assertIsNone(self.state.generation)
         self.assert_no_effects()
+
+    async def test_running_worker_retains_slot_after_submit_finishes(self):
+        cookie = await self.open_ui()
+        self.use_worker_threads(wait=False)
+        started, release = threading.Event(), threading.Event()
+
+        def wait_and_run(manifest, **_):
+            self.assertTrue(manifest.is_file())
+            started.set()
+            self.assertTrue(release.wait(5))
+            return {}
+
+        self.run_manifest.side_effect = wait_and_run
+        try:
+            first = await self.submit_form(cookie, MULTIPART)
+            self.assertEqual(first.status, 202, first.body)
+            self.assertTrue(await asyncio.to_thread(started.wait, 3))
+            second = await self.submit_form(cookie, edit_form((image_bytes(),)))
+            self.assertEqual(second.status, 409)
+            self.assertFalse(second.body_read)
+        finally:
+            release.set()
+            await asyncio.to_thread(self.join_workers)
+        self.assertIsNone(self.state.generation)
+        self.assert_clean_staging()
+        self.run_manifest.assert_called_once()
+        self.assertEqual(len(list(self.jobs.glob("webui_*"))), 1)
+
+    async def test_failed_thread_start_rolls_back_and_allows_retry(self):
+        cookie = await self.open_ui()
+        fail = Mock(side_effect=RuntimeError("synthetic credential value"))
+        with patch.object(W, "threading", SimpleNamespace(Thread=lambda **_: SimpleNamespace(start=fail))):
+            with self.assertLogs(W.LOGGER, level="WARNING") as captured:
+                rejected = await self.submit_form(cookie, edit_form((image_bytes(),)))
+        self.assertEqual(rejected.status, 503, rejected.body)
+        self.assertNotIn(b"synthetic credential value", rejected.body)
+        self.assertNotIn("synthetic credential value", "\n".join(captured.output))
+        fail.assert_called_once()
+        self.assertIsNone(self.state.generation)
+        self.assert_no_effects()
+        self.use_worker_threads()
+        self.assertEqual((await self.submit_form(cookie, MULTIPART)).status, 202)
+        self.assert_clean_staging()
+        self.run_manifest.assert_called_once()
+
+    async def test_failed_publication_does_not_let_waiting_worker_run(self):
+        cookie = await self.open_ui()
+        self.use_worker_threads()
+        with patch.object(Path, "rename", side_effect=PermissionError("fixture rename failed")):
+            failed = await self.submit_form(cookie, MULTIPART)
+        self.assertEqual(failed.status, 400, failed.body)
+        self.assertEqual(len(self.worker_threads), 1)
+        self.assertIsNone(self.state.generation)
+        self.assert_no_effects()
+
+    async def test_targeted_preparation_cancel_waits_for_encoder_and_leaves_slot_reusable(self):
+        cookie = await self.open_ui()
+        body = edit_form((image_bytes(),))
+        started, release = threading.Event(), threading.Event()
+        encode = U.write_reference_images
+
+        def wait_and_encode(*args):
+            started.set()
+            self.assertTrue(release.wait(5))
+            encode(*args)
+
+        async def cancel(preparation_id):
+            return await self.request("/api/colab/cancel", method="POST",
+                                      headers=(cookie, ("origin", ORIGIN), UI_HEADER, JSON_HEADER),
+                                      body=json.dumps({"preparation_id": preparation_id}).encode())
+
+        with patch.object(U, "write_reference_images", side_effect=wait_and_encode):
+            pending = asyncio.create_task(self.submit_form(cookie, body))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 3))
+                response = await self.request("/api/run/status", headers=(cookie,))
+                status = json.loads(response.body)
+                self.assertTrue(status["preparing"])
+                self.assertTrue(status["can_cancel"])
+                self.assertEqual((await cancel("older-attempt")).status, 409)
+                accepted = await cancel(status["preparation_id"])
+                self.assertEqual(accepted.status, 202)
+                self.assertFalse(pending.done())
+                self.assertEqual((await self.submit_form(cookie, MULTIPART)).status, 409)
+            finally:
+                release.set()
+                rejected = await asyncio.wait_for(pending, timeout=3)
+        self.assertEqual(rejected.status, 409, rejected.body)
+        self.assertIsNone(self.state.generation)
+        self.assert_clean_staging()
+        self.run_manifest.assert_not_called()
+        self.cloud["request_cancel"].assert_not_called()
+        self.assertEqual(list(self.jobs.glob("webui_*")), [])
+        self.use_worker_threads()
+        self.assertEqual((await self.submit_form(cookie, MULTIPART)).status, 202)
+
+    async def test_lifespan_shutdown_interrupts_upload_and_rejects_new_work(self):
+        cookie = await self.open_ui()
+        blocked = asyncio.Event()
+        body = edit_form((image_bytes(),))
+        async with W.app.router.lifespan_context(W.app):
+            async def pause(reads):
+                if reads:
+                    blocked.set()
+                    await asyncio.Future()
+
+            pending = asyncio.create_task(self.submit_form(cookie, (body[:-8], body[-8:]), before_read=pause))
+            await asyncio.wait_for(blocked.wait(), timeout=3)
+        self.assertEqual((await asyncio.wait_for(pending, timeout=3)).status, 409)
+        rejected = await self.submit_form(cookie, MULTIPART)
+        self.assertEqual(rejected.status, 503)
+        self.assertFalse(rejected.body_read)
+        self.assertIsNone(self.state.generation)
+        self.assert_no_effects()
+
+    async def test_lifespan_shutdown_signals_worker_and_keeps_published_job(self):
+        cookie = await self.open_ui()
+        self.use_worker_threads(wait=False)
+        started, allow_finish = threading.Event(), threading.Event()
+        signal = []
+
+        def fake_run(manifest, *, should_abort, **_):
+            self.assertTrue(manifest.is_file())
+            started.set()
+            self.assertTrue(allow_finish.wait(5))
+            signal.append(should_abort())
+            raise W.R.RunCancelled("fixture batch cancelled")
+
+        self.run_manifest.side_effect = fake_run
+        lifespan = W.app.router.lifespan_context(W.app)
+        await lifespan.__aenter__()
+        try:
+            response = await self.submit_form(cookie, MULTIPART)
+            self.assertEqual(response.status, 202)
+            job_dir = self.jobs / json.loads(response.body)["job_dir"]
+            self.assertTrue(await asyncio.to_thread(started.wait, 3))
+        finally:
+            shutdown = asyncio.create_task(lifespan.__aexit__(None, None, None))
+            try:
+                await asyncio.sleep(0)
+                self.assertTrue(self.state.closing)
+                self.assertFalse(shutdown.done())
+                self.assertEqual((await self.submit_form(cookie, MULTIPART)).status, 503)
+            finally:
+                allow_finish.set()
+                await asyncio.wait_for(shutdown, timeout=3)
+        self.assertEqual(signal, ["cancel"])
+        self.assertTrue((job_dir / "manifest.json").is_file())
+        self.assertIsNone(self.state.generation)
+        self.cloud["release_runtime"].assert_not_called()
+        self.cloud["sessions"].assert_not_called()
+
+    async def test_stop_all_during_preflight_reports_local_cancellation_pending(self):
+        cookie = await self.open_ui()
+        self.use_worker_threads(wait=False)
+        started, allow_finish = threading.Event(), threading.Event()
+
+        def fake_run(_, *, should_abort, **__):
+            started.set()
+            self.assertTrue(allow_finish.wait(5))
+            self.assertEqual(should_abort(), "cancel")
+            raise W.R.RunCancelled("fixture batch cancelled")
+
+        self.run_manifest.side_effect = fake_run
+        try:
+            self.assertEqual((await self.submit_form(cookie, MULTIPART)).status, 202)
+            self.assertTrue(await asyncio.to_thread(started.wait, 3))
+            stop = await self.request("/api/colab/stop", method="POST", body=b'{"all":true}',
+                                      headers=(cookie, ("origin", ORIGIN), UI_HEADER, JSON_HEADER))
+            self.assertEqual(stop.status, 202, stop.body)
+            data = json.loads(stop.body)
+            self.assertTrue(data["generation_cancel_pending"])
+            self.assertFalse(data["ok"])
+            self.assertEqual(data["verified_gone"], [])
+        finally:
+            allow_finish.set()
+            await asyncio.to_thread(self.join_workers)
+        self.assertEqual(self.state.stage, "cancelled")
+        self.cloud["release_runtime"].assert_not_called()
+
+    async def test_lifespan_restart_only_removes_abandoned_managed_staging(self):
+        await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-c", """
+import os
+import sys
+from pathlib import Path
+from cstudio.web_inputs import generation_staging
+with generation_staging(Path(sys.argv[1])) as stage:
+    (stage / 'partial.png').write_bytes(b'fixture temporary data')
+    os._exit(0)
+""", str(self.jobs)],
+            check=True, timeout=5,
+        )
+        root = self.jobs / U.STAGING_DIR
+        abandoned, = root.glob("pending-*")
+        unrelated = root / "pending-keepthis"
+        unrelated.mkdir()
+        legacy = self.jobs / ".webui-old"
+        legacy.mkdir()
+        self.state.begin_shutdown()
+        with U.generation_staging(self.jobs) as active:
+            (active / "copy.png").write_bytes(b"other process fixture")
+            async with W.app.router.lifespan_context(W.app):
+                self.assertFalse(abandoned.exists())
+                self.assertEqual((active / "copy.png").read_bytes(), b"other process fixture")
+                self.assertFalse(self.state.closing)
+        self.assertTrue(legacy.is_dir())
+        self.assertTrue(self.image.is_file())
+        self.assertEqual(list(root.glob("pending-*")), [unrelated])
+
+    async def test_shutdown_timeout_leaves_an_inflight_worker_and_its_keep_intact(self):
+        cookie = await self.open_ui()
+        self.use_worker_threads(wait=False)
+        started, allow_finish = threading.Event(), threading.Event()
+        W.C.KEEP.mkdir()
+        keep = W.C.KEEP / "example.json"
+        lease = b'{"session":"example","created_by":"owned","account_scope":"fixture-account"}'
+        keep.write_bytes(lease)
+
+        def fake_run(_, *, should_abort, **__):
+            started.set()
+            self.assertTrue(allow_finish.wait(5))
+            self.assertEqual(should_abort(), "cancel")
+            raise W.R.RunCancelled("fixture batch cancelled")
+
+        self.run_manifest.side_effect = fake_run
+        try:
+            with patch.object(W, "WORKER_DRAIN_SECONDS", 0), self.assertLogs(W.LOGGER, level="WARNING"):
+                async with W.app.router.lifespan_context(W.app):
+                    self.assertEqual((await self.submit_form(cookie, MULTIPART)).status, 202)
+                    self.assertTrue(await asyncio.to_thread(started.wait, 3))
+            self.assertTrue(self.state.running)
+            self.assertIsNotNone(self.state.generation)
+            self.assertEqual(keep.read_bytes(), lease)
+            self.cloud["release_runtime"].assert_not_called()
+        finally:
+            allow_finish.set()
+            await asyncio.to_thread(self.join_workers)
+        self.assertIsNone(self.state.generation)
+        self.assertEqual(self.state.stage, "cancelled")
+        self.assertEqual(keep.read_bytes(), lease)
 
     async def test_gallery_and_edit_reject_symlink_aliases_without_creating_a_job(self):
         cookie = await self.open_ui()
@@ -593,9 +858,7 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
         item, = json.loads(response.body)["items"]
         restored_ref, = item["inputs"]
         self.assertEqual(restored_ref["artifact_id"], "fixture/inputs/flat.png")
-        self.enterContext(patch.object(W, "threading", SimpleNamespace(
-            Thread=lambda *, target, **_: SimpleNamespace(start=target),
-        )))
+        self.use_worker_threads()
         response = await self.start_edit(cookie, [restored_ref["artifact_id"], item["artifact_id"]])
         self.assertEqual(response.status, 202, response.body)
         new_job = self.jobs / json.loads(response.body)["job_dir"]
@@ -609,9 +872,7 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_origin_login_controls_and_multipart_generation(self):
         cookie = await self.open_ui()
-        self.enterContext(patch.object(W, "threading", SimpleNamespace(
-            Thread=lambda *, target, **_: SimpleNamespace(start=target),
-        )))
+        self.use_worker_threads()
         for path, extra, body in CONTROLS:
             with self.subTest(path=path):
                 response = await self.request(path, method="POST", body=body, headers=(
@@ -710,7 +971,9 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
                                    body=form)
         self.assertEqual(start.status, 409)
         self.run_manifest.assert_not_called()
-        self.assertEqual(list(self.jobs.iterdir()), [self.image.parents[1]])
+        self.assertEqual([path for path in self.jobs.iterdir() if path.name != U.STAGING_DIR],
+                         [self.image.parents[1]])
+        self.assert_clean_staging()
         for action in ("keep", "cancel"):
             rejected = await self.request(f"/api/colab/{action}", method="POST",
                                           headers=(cookie, UI_HEADER, origin, JSON_HEADER),
@@ -722,19 +985,17 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
         current = await self.request("/api/run/status", headers=(cookie,))
         new_id = json.loads(current.body)["sessions"][0]["id"]
         form = urlencode({"prompt": "Synthetic prompt", "session": "external", "session_id": new_id}).encode()
-        with patch.object(W, "threading", SimpleNamespace(
-            Thread=lambda *, target, **_: SimpleNamespace(start=target),
-        )):
-            accepted = await self.request("/api/run/start", method="POST",
-                                          headers=(cookie, UI_HEADER, origin, form_header), body=form)
+        self.use_worker_threads()
+        accepted = await self.request("/api/run/start", method="POST",
+                                      headers=(cookie, UI_HEADER, origin, form_header), body=form)
         self.assertEqual(accepted.status, 202, accepted.body)
         self.assertEqual(self.run_manifest.call_args.kwargs["expected_endpoint"], "fixture-new-endpoint")
-        self.assertFalse(json.loads(accepted.body)["status"]["running"])
-        await self.request("/api/run/status", headers=(cookie,))
+        finished = await self.request("/api/run/status", headers=(cookie,))
+        self.assertFalse(json.loads(finished.body)["running"])
         self.assertEqual(self.cloud["sessions"].call_count, 3, "completion triggers one additional listing")
 
     def test_launcher_binds_only_supported_loopback_hosts_and_disables_forwarding(self):
-        with patch("uvicorn.run") as run, patch.object(W.webbrowser, "open") as open_browser, patch("builtins.print"):
+        with patch("uvicorn.Server.run", autospec=True) as run, patch.object(W.webbrowser, "open") as open_browser, patch("builtins.print"):
             for host in ("0.0.0.0", "::", "192.0.2.10", "workbench.example.test"):
                 with self.subTest(host=host), self.assertRaisesRegex(SystemExit, "loopback|只允許"):
                     W.launch_ui(host=host, open_browser=True)
@@ -743,4 +1004,10 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
             for host, expected in (("127.0.0.1", "127.0.0.1"), ("localhost", "127.0.0.1"), ("::1", "::1")):
                 with self.subTest(host=host):
                     W.launch_ui(host=host, port=8765)
-                    run.assert_called_with(W.app, host=expected, port=8765, log_level="info", proxy_headers=False)
+                    config = run.call_args.args[0].config
+                    self.assertIs(config.app, W.app)
+                    self.assertEqual(config.host, expected)
+                    self.assertEqual(config.port, 8765)
+                    self.assertEqual(config.log_level, "info")
+                    self.assertFalse(config.proxy_headers)
+                    self.assertEqual(config.timeout_graceful_shutdown, W.REQUEST_DRAIN_SECONDS)

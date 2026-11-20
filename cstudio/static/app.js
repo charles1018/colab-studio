@@ -56,6 +56,8 @@ const ui = {
   lastStatus: null,
   finishedJob: null,
   wasRunning: false,
+  preparing: false,
+  submitting: false,
   canCancel: false,
   runId: null,
   runSession: null,
@@ -682,11 +684,11 @@ function applyStatus(st, request) {
 
   ui.runId = st.running ? st.run_id : null;
   ui.runSession = st.running ? st.session : null;
-  ui.canCancel = st.running ? st.can_cancel : Boolean(ui.activeSession);
+  ui.preparing = Boolean(st.preparing);
+  ui.canCancel = st.running || ui.preparing ? st.can_cancel : Boolean(ui.activeSession);
   el.btnCancelRun.disabled = el.btnCancelTop.disabled = !ui.canCancel;
   el.btnCancelRun.hidden = el.progressOverlay.hidden = !st.running;
-  el.btnGenerate.disabled = st.running;
-  el.btnGenerate.textContent = st.running ? "⏳ 雲端生成進行中..." : "🚀 開始生成 (Generate)";
+  renderGenerateButton();
   if (st.running) {
     ui.wasRunning = true;
     el.progressStageText.textContent = st.stage_label;
@@ -704,6 +706,12 @@ function applyStatus(st, request) {
     renderFinishedRun(st);
   }
   return true;
+}
+
+function renderGenerateButton() {
+  el.btnGenerate.disabled = ui.submitting || ui.preparing || Boolean(ui.lastStatus?.running);
+  el.btnGenerate.textContent = ui.lastStatus?.running ? "⏳ 雲端生成進行中..."
+    : ui.preparing || ui.submitting ? "⏳ 正在準備生成..." : "🚀 開始生成 (Generate)";
 }
 
 async function pollFastRunStatus() {
@@ -780,6 +788,7 @@ function refreshSlowColabStatus(force = false, afterChange = false) {
 // Start Generation Action
 // ----------------------------------------------------------------------------
 async function handleStartGenerate() {
+  if (ui.submitting || ui.preparing || ui.lastStatus?.running) return;
   hideToast();
   const prompt = el.promptInput.value.trim();
   if (!prompt) {
@@ -831,7 +840,8 @@ async function handleStartGenerate() {
   }
 
   try {
-    el.btnGenerate.disabled = true;
+    ui.submitting = true;
+    renderGenerateButton();
     const request = ++statusRequest;
     const res = await apiFetch("/api/run/start", {
       method: "POST",
@@ -846,8 +856,10 @@ async function handleStartGenerate() {
     }
     await pollFastRunStatus();
   } catch (err) {
-    el.btnGenerate.disabled = false;
     showToast(`無法啟動生成任務：${err.message}`);
+  } finally {
+    ui.submitting = false;
+    renderGenerateButton();
   }
 }
 
@@ -946,7 +958,8 @@ async function initStudio() {
   el.btnGenerate.addEventListener("click", handleStartGenerate);
   const doCancel = async () => {
     if (!ui.canCancel) return;
-    const target = ui.wasRunning ? { session: ui.runSession, run_id: ui.runId }
+    const target = ui.preparing ? { preparation_id: ui.lastStatus.preparation_id }
+      : ui.wasRunning ? { session: ui.runSession, run_id: ui.runId }
       : { session: ui.activeSession.name, session_id: ui.activeSession.id };
     try {
       const res = await apiFetch("/api/colab/cancel", {
@@ -955,6 +968,7 @@ async function initStudio() {
         body: JSON.stringify(target),
       });
       const message = {
+        preparation_pending: "⏳ 正在取消本機生成準備",
         pending: "⏳ 已要求取消，等待遠端確認",
         confirmed: "⏹️ 已確認遠端批次取消",
         idle: "目前沒有符合條件的執行中批次",
@@ -997,6 +1011,8 @@ async function initStudio() {
         body: JSON.stringify({ all: true }),
       });
       const summary = [];
+      if (res.preparation_cancelled) summary.push("⏳ 正在取消本機生成準備");
+      if (res.generation_cancel_pending) summary.push("⏳ 等待尚在確認 Session 的批次取消");
       if (res.verified_gone?.length) summary.push(`✅ 已確認關閉 ${res.verified_gone.join(", ")}`);
       if (res.pending?.length) summary.push(`⏳ 尚待確認 ${res.pending.join(", ")}`);
       if (res.failed?.length) summary.push(`⚠️ 無法確認 ${res.failed.join(", ")}`);
