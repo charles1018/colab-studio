@@ -180,7 +180,9 @@ function formatCountdown(sec) {
 }
 
 async function apiFetch(url, options = {}) {
-  const res = await fetch(url, options);
+  const headers = new Headers(options.headers);
+  headers.set("X-Colab-Studio-Request", "1");
+  const res = await fetch(url, { ...options, headers, mode: "same-origin" });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     let msg = data.detail || data.error || `請求失敗 (${res.status})`;

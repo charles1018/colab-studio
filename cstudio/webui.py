@@ -7,16 +7,18 @@ import io
 import json
 import random
 import re
+import secrets
 import shutil
 import sys
 import threading
 import time
 import uuid
 import webbrowser
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
@@ -571,9 +573,75 @@ class StudioUIState:
 
 STATE = StudioUIState()
 app = FastAPI(title="Colab Studio Local Web UI", version="0.1.0")
+LOCAL_UI_HOSTS = ("127.0.0.1", "localhost", "::1")
+LOCAL_AUTHORITY = re.compile(r"(127\.0\.0\.1|localhost|\[::1\])(?::([0-9]{1,5}))?", re.IGNORECASE | re.ASCII)
+UI_SESSION_TOKEN = secrets.token_urlsafe(32)
 
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+def is_loopback_peer(host: str) -> bool:
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@app.middleware("http")
+async def require_local_ui_access(request: Request, call_next):
+    headers = request.headers
+    if not request.client or not is_loopback_peer(request.client.host) or any(
+        name in ("forwarded", "x-real-ip") or name.startswith("x-forwarded-") for name in headers
+    ):
+        return JSONResponse({"detail": "工作台僅接受直接的本機 loopback 連線"}, status_code=403)
+
+    hosts = headers.getlist("host")
+    authority = LOCAL_AUTHORITY.fullmatch(hosts[0]) if len(hosts) == 1 else None
+    scheme = request.scope["scheme"]
+    default_port = 443 if scheme == "https" else 80
+    if not authority:
+        return JSONResponse({"detail": "不允許此工作台 Host"}, status_code=400)
+    port = int(authority[2]) if authority[2] else default_port
+    if not 1 <= port <= 65535:
+        return JSONResponse({"detail": "不允許此工作台 Host"}, status_code=400)
+
+    expected_origin = f"{scheme}://{authority[1].lower()}"
+    if port != default_port:
+        expected_origin += f":{port}"
+    origins = headers.getlist("origin")
+    if origins and origins != [expected_origin]:
+        return JSONResponse({"detail": "不允許跨來源存取工作台"}, status_code=403)
+
+    path = request.scope["path"]
+    root_path = request.scope.get("root_path", "")
+    if root_path and path.startswith(f"{root_path}/"):
+        path = path[len(root_path):]
+    safe_method = request.method in ("GET", "HEAD")
+    public = safe_method and (path == "/" or path.startswith("/static/"))
+    cookie_name = f"cstudio_ui_{port}"
+    if not public:
+        fetch_sites = headers.getlist("sec-fetch-site")
+        if fetch_sites and fetch_sites not in (["same-origin"], ["none"]):
+            return JSONResponse({"detail": "不允許跨來源存取工作台"}, status_code=403)
+        cookie = request.cookies.get(cookie_name, "")
+        if not secrets.compare_digest(cookie.encode(), UI_SESSION_TOKEN.encode()):
+            return JSONResponse({"detail": "請先開啟 Colab Studio 首頁"}, status_code=401)
+        if not safe_method and not origins:
+            return JSONResponse({"detail": "控制請求需要同源 Origin"}, status_code=403)
+        # Cross-origin browser requests with this header require a CORS preflight.
+        # Require it for slow status too, since that GET contacts Colab.
+        if (not safe_method or path == "/api/colab/status") and headers.getlist("x-colab-studio-request") != ["1"]:
+            return JSONResponse({"detail": "缺少工作台請求標頭"}, status_code=403)
+
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    if not public or path == "/":
+        response.headers["Cache-Control"] = "no-store"
+    if path == "/" and request.method == "GET" and response.status_code == 200:
+        response.set_cookie(cookie_name, UI_SESSION_TOKEN, httponly=True, samesite="strict", secure=scheme == "https")
+    return response
 
 
 def parse_bool_form(val: Any, default: bool = False) -> bool:
@@ -1187,16 +1255,21 @@ async def api_run_start(
 def launch_ui(host: str = "127.0.0.1", port: int = 7860, open_browser: bool = False):
     import uvicorn
 
-    url = f"http://{host}:{port}"
+    host = host.lower()
+    if host not in LOCAL_UI_HOSTS:
+        raise SystemExit("工作台只允許 --host 127.0.0.1、localhost 或 ::1")
+    bind_host = "127.0.0.1" if host == "localhost" else host
+    url_host = "[::1]" if host == "::1" else host
+    url = f"http://{url_host}:{port}"
     print(f"🎨 啟動 Colab Studio 本地輕量 Web UI：{url}", flush=True)
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(app, host=bind_host, port=port, log_level="info", proxy_headers=False)
 
 
 def main():
     ap = argparse.ArgumentParser(prog="cstudio-ui", description="啟動 Colab Studio 本地輕量 Web UI")
-    ap.add_argument("--host", default="127.0.0.1", help="監聽位址 (預設 127.0.0.1)")
+    ap.add_argument("--host", default="127.0.0.1", help="loopback 監聽位址 (127.0.0.1、localhost 或 ::1)")
     ap.add_argument("--port", type=int, default=7860, help="監聽埠號 (預設 7860)")
     ap.add_argument("--open", action="store_true", help="啟動後自動開啟瀏覽器")
     args = ap.parse_args()

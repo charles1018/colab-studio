@@ -203,7 +203,7 @@ def main():
     p_sheet.add_argument("--out", default=None, help="輸出檔案路徑")
 
     p_ui = sub.add_parser("ui", help="啟動本地輕量 Web UI 介面 (借鏡 Unsloth Studio 雙欄設計)")
-    p_ui.add_argument("--host", default="127.0.0.1", help="監聽位址 (預設 127.0.0.1)")
+    p_ui.add_argument("--host", default="127.0.0.1", help="loopback 監聽位址 (127.0.0.1、localhost 或 ::1)")
     p_ui.add_argument("--port", type=int, default=7860, help="監聽埠號 (預設 7860)")
     p_ui.add_argument("--open", action="store_true", help="啟動後自動開啟瀏覽器")
 
