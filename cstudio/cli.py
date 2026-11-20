@@ -68,16 +68,17 @@ def cmd_keep(args):
             sys.exit(f"請用 --session 指定名稱（目前開啟中：{names}）")
     if session not in names:
         sys.exit(f"找不到開啟中的 session：{session}（目前開啟中：{names}）")
-    info = C.keep_info(session) or {}
+    record = C.keep_info(session)
+    info = record or {}
     if info.get("release_pending"):
         sys.exit(f"{session} 正在關機，無法延長待命")
     try:
         target = C.keep_target(session, info, account)
+        mins = max(1.0, min(240.0, float(args.minutes)))
+        C.set_keep(session, time.time() + mins * 60, expected=record, **target)
+        C.start_watchdog(session)
     except (OSError, RuntimeError) as exc:
         sys.exit(str(exc))
-    mins = max(1.0, min(240.0, float(args.minutes)))
-    C.set_keep(session, time.time() + mins * 60, **target)
-    C.start_watchdog(session)
     print(f"⏸️ 已將 {session} 的自動關機時間設為 {mins:g} 分鐘後", flush=True)
 
 
@@ -208,6 +209,7 @@ def main():
 
     p_wd = sub.add_parser("_watchdog", add_help=False)
     p_wd.add_argument("--session", required=True)
+    p_wd.add_argument("--ticket")
 
     args = ap.parse_args()
 
@@ -255,7 +257,7 @@ def main():
 
         W.launch_ui(host=args.host, port=args.port, open_browser=args.open)
     elif args.cmd == "_watchdog":
-        C.watchdog_loop(args.session)
+        C.watchdog_loop(args.session, args.ticket)
 
 
 if __name__ == "__main__":

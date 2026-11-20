@@ -16,6 +16,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
+from filelock import FileLock, Timeout as LockTimeout
+
 from .colab_login import account_scope
 
 HERE = Path(__file__).resolve().parent
@@ -24,8 +26,13 @@ REMOTE = ROOT / "remote"
 GPUS = ("L4", "G4", "A100", "H100", "T4")
 PREFIX = "cstudio-"
 ASSIGN_TIMEOUT = 900
+RECOVERY_TIMEOUT = 30
+WATCHDOG_TICK = 30
+WATCHDOG_START_TIMEOUT = 10
+IDLE_ACTIVE_GRACE = 10 * 60
 ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
 KEEP = Path.home() / ".config" / "colab-studio" / "keep"
+_ANY_LEASE = object()
 
 
 def colab_exe() -> str:
@@ -49,9 +56,22 @@ class ColabTimeout(RuntimeError):
     """The command timed out before its outcome could be observed."""
 
 
+class ColabDeadline(ColabTimeout):
+    """The time budget for the operation is exhausted."""
+
+
+def remaining_time(limit: float, deadline: float | None) -> float:
+    if deadline is None:
+        return limit
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ColabDeadline("已到達 Colab 批次時間上限")
+    return min(limit, remaining)
+
+
 def colab(
     *args, timeout: int = 600, check: bool = True,
-    account: str | None = None, endpoint: str | None = None,
+    account: str | None = None, endpoint: str | None = None, deadline: float | None = None,
 ) -> str:
     env = ENV
     command = [colab_exe()] if account is None else [sys.executable, "-m", "cstudio._colab"]
@@ -60,6 +80,7 @@ def colab(
         env.pop("CSTUDIO_COLAB_ENDPOINT", None)
         if endpoint is not None:
             env["CSTUDIO_COLAB_ENDPOINT"] = endpoint
+    timeout_left = remaining_time(timeout, deadline)
     try:
         p = subprocess.run(
             [*command, *map(str, args)],
@@ -68,10 +89,12 @@ def colab(
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=timeout,
+            timeout=timeout_left,
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
+        if deadline is not None and (timeout_left < timeout or time.monotonic() >= deadline):
+            raise ColabDeadline("已到達 Colab 批次時間上限，遠端結果待確認") from None
         if check:
             raise ColabTimeout(f"colab {' '.join(map(str, args))} 超過 {timeout} 秒沒有回應") from None
         return ""
@@ -101,15 +124,14 @@ def new_runtime(
     for attempt in range(retries + 1):
         if check_abort:
             check_abort()
-        if deadline is not None and time.time() >= deadline:
-            raise RuntimeError("已到達 Colab GPU 配置時間上限")
         try:
-            out = colab("new", "-s", session, "--gpu", gpu, timeout=ASSIGN_TIMEOUT, account=account)
+            timeout = remaining_time(ASSIGN_TIMEOUT, deadline)
+            out = colab("new", "-s", session, "--gpu", gpu, timeout=timeout, account=account, deadline=deadline)
         except RuntimeError as e:
             # Only the upstream explicit 412 rejection proves this request did not allocate.
             refused = any(line.startswith("[colab] Allocation refused (precondition failed).")
                           for line in str(e).splitlines())
-            if isinstance(e, ColabTimeout) or attempt == retries or not refused or runtime_endpoint(session):
+            if isinstance(e, ColabTimeout) or attempt == retries or not refused or runtime_endpoint(session, deadline=deadline):
                 raise
             print(
                 f"⏳ Colab 拒絕配置 {gpu}，{wait:g} 秒後再試（第 {attempt + 1}/{retries} 次重試）",
@@ -117,8 +139,7 @@ def new_runtime(
             )
             if check_abort:
                 check_abort()
-            delay = min(wait, max(0, deadline - time.time())) if deadline is not None else wait
-            time.sleep(delay)
+            time.sleep(remaining_time(wait, deadline))
         else:
             receipts = re.findall(r"^CSTUDIO_ASSIGNED (\S+)$", out, re.M)
             if len(receipts) == 1:
@@ -130,12 +151,12 @@ def token_ok() -> bool:
     return (Path.home() / ".config" / "colab-cli" / "token.json").is_file()
 
 
-def usage(*, account: str | None = None) -> tuple[float | None, str]:
+def usage(*, account: str | None = None, deadline: float | None = None) -> tuple[float | None, str]:
     account = account or account_scope()
     if not account:
         return None, "無法確認 Colab 登入身分"
     try:
-        out = colab("usage", timeout=120, check=False, account=account)
+        out = colab("usage", timeout=120, check=False, account=account, deadline=deadline)
     except Exception as e:
         out = f"（讀取失敗：{e}）"
     m = re.search(r"([\d.]+)\s*(?:compute units|運算單元|units)", out, re.I)
@@ -183,12 +204,14 @@ def listed_assignments(out: str) -> dict[str, str] | None:
     return assignments or None
 
 
-def sessions(*, check: bool = False, account: str | None = None) -> tuple[list[str], str]:
+def sessions(
+    *, check: bool = False, account: str | None = None, deadline: float | None = None,
+) -> tuple[list[str], str]:
     account = account or account_scope()
     try:
         if not account:
             raise RuntimeError("無法確認 Colab 登入身分")
-        out = colab("sessions", timeout=120, check=True, account=account).strip()
+        out = colab("sessions", timeout=120, check=True, account=account, deadline=deadline).strip()
         if account_scope() != account:
             raise RuntimeError("Colab 登入身分已變更")
         assignments = listed_assignments(out)
@@ -210,18 +233,25 @@ def session_gone(session: str, names: list[str] | None, out: str, endpoint: str 
     return session not in assignments.values() and "?" not in assignments.values()
 
 
-def sessions_checked(tries: int = 2, *, account: str | None = None) -> tuple[list[str] | None, str]:
+def sessions_checked(
+    tries: int = 2, *, account: str | None = None, deadline: float | None = None,
+) -> tuple[list[str] | None, str]:
     account = account or account_scope()
     out = ""
     for i in range(max(1, tries)):
         try:
-            names, out = sessions(check=True, account=account)
+            names, out = sessions(check=True, account=account, deadline=deadline)
             if listed_assignments(out) is not None:
                 return names, out
+        except ColabDeadline:
+            return None, ""
         except (OSError, RuntimeError, SystemExit):
             out = ""
         if i + 1 < tries:
-            time.sleep(2)
+            try:
+                time.sleep(remaining_time(2, deadline))
+            except ColabDeadline:
+                break
     return None, out
 
 
@@ -244,16 +274,24 @@ def keep_info(session: str) -> dict | None:
         return None
 
 
-def runtime_endpoint(session: str) -> str | None:
+def runtime_endpoint(session: str, *, deadline: float | None = None) -> str | None:
     """Read the endpoint from the pinned Colab CLI's local store without an API call."""
     from colab_cli.state import StateStore
 
-    state = StateStore().get(session)
-    return state.endpoint if state else None
+    store = StateStore()
+    path = Path(store.path)
+    if not path.exists():
+        return None
+    # The pinned store's public get() waits on its reader lock without a time budget.
+    with store._rwlock.read_lock(timeout=remaining_time(5, deadline)):
+        with path.open(encoding="utf-8") as stream:
+            state = store._load_raw(stream).get(session)
+        return state.endpoint if state else None
 
 
 def is_owned_session(
     name: str, *, account: str | None = None, assignments: dict[str, str] | None = None,
+    deadline: float | None = None,
 ) -> bool:
     try:
         name = sanitize_session_name(name)
@@ -272,7 +310,7 @@ def is_owned_session(
     if "account_scope" not in info and assignments is None:
         return False
     try:
-        return runtime_endpoint(name) == endpoint
+        return runtime_endpoint(name, deadline=deadline) == endpoint
     except OSError:
         return False
 
@@ -296,6 +334,22 @@ def has_pending_allocation(account: str) -> bool:
     )
 
 
+class KeepChanged(RuntimeError):
+    """Another local operation changed the Session lease."""
+
+
+def _session_lock(session: str, purpose: str, timeout: float = 5) -> FileLock:
+    return FileLock(keep_file(session).with_suffix(f".{purpose}.lock"), timeout=timeout)
+
+
+def same_lease(current: dict | None, snapshot: dict | None) -> bool:
+    if current is None or snapshot is None:
+        return current is snapshot
+    watchdog_fields = {"watchdog_pid", "watchdog_ticket", "watchdog_start_until"}
+    return ({key: value for key, value in current.items() if key not in watchdog_fields}
+            == {key: value for key, value in snapshot.items() if key not in watchdog_fields})
+
+
 def set_keep(
     session: str,
     expires: float | None,
@@ -304,21 +358,32 @@ def set_keep(
     extra: dict | None = None,
     *,
     reserve: bool = False,
+    expected: dict | None | object = _ANY_LEASE,
 ):
     session = sanitize_session_name(session)
-    KEEP.mkdir(parents=True, exist_ok=True)
-    old = keep_info(session) or {}
-    owner = owner or old.get("created_by")
-    if old.get("release_pending") and not (extra and "release_pending" in extra):
-        # A late runner update or watchdog PID write must not postpone a queued shutdown.
-        expires = old.get("expires")
-    if owner is None and not keep_file(session).exists():
-        owner = "external"
-    data = dict(old, session=session, expires=expires, watchdog_pid=pid or old.get("watchdog_pid"))
-    if owner:
-        data["created_by"] = owner
-    if extra:
-        data.update(extra)
+    with _session_lock(session, "lease"):
+        previous = keep_info(session)
+        if expected is not _ANY_LEASE and not same_lease(previous, expected):
+            raise KeepChanged(f"Session {session} 的待命紀錄已變更，請重新確認")
+        if expected is None and keep_file(session).exists():
+            raise KeepChanged(f"無法讀取 Session {session} 的待命紀錄")
+        if reserve and keep_file(session).exists():
+            raise FileExistsError(keep_file(session))
+        old = previous or {}
+        if old.get("release_pending") and not (extra and extra.get("release_pending") is True):
+            if expected is not _ANY_LEASE:
+                raise KeepChanged(f"Session {session} 正在關機")
+            return old
+        data = dict(old, session=session, expires=expires, watchdog_pid=pid or old.get("watchdog_pid"),
+                    created_by=owner or old.get("created_by", "external"))
+        if extra:
+            data.update(extra)
+        data["lease_id"] = uuid.uuid4().hex
+        _write_keep(session, data, reserve=reserve)
+        return data
+
+
+def _write_keep(session: str, data: dict, *, reserve: bool = False):
     kf = keep_file(session)
     stream = tempfile.NamedTemporaryFile(dir=KEEP, mode="w", suffix=".tmp", encoding="utf-8", delete=False)
     tmp = Path(stream.name)
@@ -334,8 +399,15 @@ def set_keep(
         tmp.unlink(missing_ok=True)
 
 
-def drop_keep(session: str):
-    keep_file(session).unlink(missing_ok=True)
+def drop_keep(session: str, *, expected: dict | None | object = _ANY_LEASE) -> bool:
+    with _session_lock(session, "lease"):
+        current = keep_info(session)
+        if expected is not _ANY_LEASE and not same_lease(current, expected):
+            return False
+        if expected is None and keep_file(session).exists():
+            return False
+        keep_file(session).unlink(missing_ok=True)
+        return True
 
 
 class ReleaseState(StrEnum):
@@ -352,13 +424,31 @@ def release_runtime(
     account: str | None = None,
     owned_only: bool = False,
     watchdog_keep: dict | None = None,
+    deadline: float | None = None,
 ) -> ReleaseState:
     """Request release and verify the assignment independently of the command reply."""
     session = sanitize_session_name(session)
+    lock = _session_lock(session, "release", timeout=0)
+    try:
+        lock.acquire()
+    except LockTimeout:
+        info = keep_info(session) or {}
+        scope = account_scope()
+        if (scope and (account is None or account == scope) and info.get("account_scope") == scope
+                and info.get("release_pending")):
+            return ReleaseState.PENDING
+        return ReleaseState.FAILED
+    try:
+        return _release_runtime(session, owner, endpoint, account, owned_only, watchdog_keep, deadline)
+    finally:
+        lock.release()
+
+
+def _release_runtime(session, owner, endpoint, account, owned_only, watchdog_keep, deadline) -> ReleaseState:
     keep = keep_info(session)
     if keep is None and keep_file(session).exists():
         return ReleaseState.FAILED
-    if watchdog_keep is not None and keep != watchdog_keep:
+    if watchdog_keep is not None and not same_lease(keep, watchdog_keep):
         return ReleaseState.PENDING
     info = keep or {}
     supplied_identity = account is not None and endpoint is not None
@@ -378,11 +468,11 @@ def release_runtime(
     same_record = not (registered and registered != endpoint)
     retrying = watchdog_keep is not None
     already_requested = (
-        owner == "owned" and not retrying and same_record and info.get("release_pending")
+        owner == "owned" and same_record and info.get("release_pending")
         and isinstance(info.get("expires"), (int, float)) and time.time() < info["expires"]
     )
 
-    names, out = sessions_checked(account=account)
+    names, out = sessions_checked(account=account, deadline=deadline)
     assignments = listed_assignments(out) if names is not None else None
     listed = next((ep for ep, alias in (assignments or {}).items() if alias == session), None)
     if explicit_name and registered and listed and listed != registered:
@@ -397,68 +487,73 @@ def release_runtime(
     def confirm_absence() -> bool:
         if not session_gone(session, names, out, endpoint) or account_scope() != account:
             return False
-        if same_record and keep_info(session) == keep:
-            drop_keep(session)
+        if same_record:
+            drop_keep(session, expected=keep)
         return True
 
     if confirm_absence():
         return ReleaseState.CONFIRMED
 
     scheduled = retrying
-    if retrying and "account_scope" not in info:
-        if keep_info(session) != keep:
-            return ReleaseState.PENDING
-        set_keep(session, info.get("expires"), extra={"account_scope": account})
-        keep = keep_info(session)
-    elif owner == "owned" and same_record and not retrying:
-        try:
-            if keep_info(session) != keep:
-                return ReleaseState.FAILED
-            if not already_requested:
-                set_keep(
-                    session, time.time() + 30, owner=owner,
-                    extra={"busy_until": None, "release_pending": True,
+    if owner == "owned" and same_record:
+        # Commit the shutdown intent against the checked lease before dispatching stop.
+        if not already_requested:
+            try:
+                keep = set_keep(
+                    session, time.time() + WATCHDOG_TICK, owner=owner, expected=keep,
+                    extra={"busy_until": None, "active_run_id": None, "release_pending": True,
                            "runtime_endpoint": endpoint, "account_scope": account},
                 )
-            start_watchdog(session)
+            except KeepChanged:
+                return ReleaseState.PENDING if retrying else ReleaseState.FAILED
+            except OSError as exc:
+                print(f"⚠️ 無法登記 {session} 的關機要求（{type(exc).__name__}）", flush=True)
+                return ReleaseState.PENDING if retrying else ReleaseState.FAILED
+        try:
+            if not retrying:
+                start_watchdog(session)
             scheduled = True
         except Exception as exc:
             print(f"⚠️ 無法登記 {session} 的關機重試（{type(exc).__name__}）", flush=True)
-        keep = keep_info(session)
-    if not already_requested and same_record and listed == endpoint and keep_info(session) == keep:
+    if not already_requested and same_record and listed == endpoint and same_lease(keep_info(session), keep):
         try:
-            colab("stop", "-s", session, timeout=300, account=account, endpoint=endpoint)
+            colab("stop", "-s", session, timeout=300, account=account, endpoint=endpoint, deadline=deadline)
         except (OSError, RuntimeError, SystemExit) as exc:
             print(f"⚠️ 無法送出 {session} 的關機請求（{type(exc).__name__}）", flush=True)
-        names, out = sessions_checked(account=account)
+        names, out = sessions_checked(account=account, deadline=deadline)
         if confirm_absence():
             return ReleaseState.CONFIRMED
     return ReleaseState.PENDING if scheduled else ReleaseState.FAILED
 
 
-def pid_alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    if os.name == "nt":
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
-        return str(pid) in out
+def _watchdog_locked(session: str) -> bool:
     try:
-        os.kill(pid, 0)
+        with _session_lock(session, "watchdog", timeout=0):
+            return False
+    except LockTimeout:
         return True
-    except OSError:
+
+
+def watchdog_alive(session: str) -> bool:
+    try:
+        with _session_lock(session, "lease", timeout=0):
+            info = keep_info(session)
+            return bool(info and not info.get("watchdog_ticket") and _watchdog_locked(session))
+    except LockTimeout:
         return False
 
 
 def remote_exec(
     session: str, code: str, timeout: int = 120, tries: int = 3,
-    *, account: str, endpoint: str,
+    *, account: str, endpoint: str, deadline: float | None = None,
 ) -> str:
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
         f.write(code.rstrip("\n") + "\nprint('CSTUDIO_EXEC_OK')\n")
     try:
         for k in range(tries):
-            out = colab("exec", "-s", session, "-f", f.name, "--timeout", timeout,
-                        timeout=timeout + 30, check=False, account=account, endpoint=endpoint)
+            kernel_timeout = remaining_time(timeout, deadline)
+            out = colab("exec", "-s", session, "-f", f.name, "--timeout", kernel_timeout,
+                        timeout=timeout + 30, check=False, account=account, endpoint=endpoint, deadline=deadline)
             if "CSTUDIO_EXEC_OK" in out:
                 return out.replace("CSTUDIO_EXEC_OK", "").strip()
             print(f"…exec 沒有回應，重試（{k + 1}/{tries}）", flush=True)
@@ -467,10 +562,13 @@ def remote_exec(
         os.unlink(f.name)
 
 
-def poll_remote_status(session: str, timeout: int = 60, *, account: str, endpoint: str) -> dict | None:
+def poll_remote_status(
+    session: str, timeout: int = 60, *, account: str, endpoint: str, deadline: float | None = None,
+) -> dict | None:
     status_py = REMOTE / "status.py"
-    out = colab("exec", "-s", session, "-f", status_py, "--timeout", timeout,
-                timeout=timeout + 20, check=False, account=account, endpoint=endpoint)
+    kernel_timeout = remaining_time(timeout, deadline)
+    out = colab("exec", "-s", session, "-f", status_py, "--timeout", kernel_timeout,
+                timeout=timeout + 20, check=False, account=account, endpoint=endpoint, deadline=deadline)
     for line in reversed(out.splitlines()):
         if "CSTUDIO_STATUS " in line:
             try:
@@ -480,15 +578,15 @@ def poll_remote_status(session: str, timeout: int = 60, *, account: str, endpoin
     return None
 
 
-def active_endpoint(session: str, account: str) -> str:
+def active_endpoint(session: str, account: str, *, deadline: float | None = None) -> str:
     """Resolve a selected alias in the active account without adopting stale keep data."""
-    names, out = sessions_checked(account=account)
+    names, out = sessions_checked(account=account, deadline=deadline)
     assignments = listed_assignments(out) if names is not None else None
     endpoint = next((ep for ep, alias in (assignments or {}).items() if alias == session), None)
     info = keep_info(session)
     keep = info or {}
     if (
-        not endpoint or runtime_endpoint(session) != endpoint or account_scope() != account
+        not endpoint or runtime_endpoint(session, deadline=deadline) != endpoint or account_scope() != account
         or (info is None and keep_file(session).exists())
         or keep.get("account_scope", account) != account or keep.get("runtime_endpoint") not in (None, endpoint)
         or keep.get("created_by") == "pending"
@@ -502,7 +600,7 @@ def keep_target(session: str, info: dict, account: str | None) -> dict:
     if not account:
         raise RuntimeError("無法確認 Colab 登入身分")
     endpoint = active_endpoint(session, account)
-    if (keep_info(session) or {}) != info:
+    if not same_lease(keep_info(session) or {}, info):
         raise RuntimeError("Colab Session 記錄已變更，請重新確認")
     matched = info.get("runtime_endpoint") == endpoint
     return {
@@ -514,7 +612,7 @@ def keep_target(session: str, info: dict, account: str | None) -> dict:
 
 def request_cancel(
     session: str, run_id: str | None = None, *, allow_start: bool = False,
-    account: str | None = None, endpoint: str | None = None,
+    account: str | None = None, endpoint: str | None = None, deadline: float | None = None,
 ) -> dict:
     session = sanitize_session_name(session)
     if run_id is not None and not re.fullmatch(r"[0-9a-f]{12}", run_id):
@@ -522,13 +620,13 @@ def request_cancel(
     account = account or account_scope()
     if not account:
         raise RuntimeError("無法確認 Colab 登入身分")
-    endpoint = endpoint or active_endpoint(session, account)
+    endpoint = endpoint or active_endpoint(session, account, deadline=deadline)
     source = (REMOTE / "cancel.py").read_text(encoding="utf-8")
     code = source + (
         f"\nprint('CSTUDIO_CANCEL ' + json.dumps("
         f"request_cancel(Path('/content/cstudio'), {run_id!r}, allow_start={allow_start!r})))\n"
     )
-    out = remote_exec(session, code, timeout=15, tries=1, account=account, endpoint=endpoint)
+    out = remote_exec(session, code, timeout=15, tries=1, account=account, endpoint=endpoint, deadline=deadline)
     for line in reversed(out.splitlines()):
         if line.startswith("CSTUDIO_CANCEL "):
             result = json.loads(line.partition(" ")[2])
@@ -541,20 +639,65 @@ def request_cancel(
     raise RuntimeError("遠端未回傳可確認的取消狀態")
 
 
-def start_watchdog(session: str):
-    info = keep_info(session) or {}
-    if pid_alive(info.get("watchdog_pid")):
-        return
+def start_watchdog(session: str, *, require_ready: bool = False, deadline: float | None = None):
+    _launch_watchdog(session)
+    if require_ready:
+        ready_by = time.monotonic() + remaining_time(WATCHDOG_START_TIMEOUT, deadline)
+        try:
+            while not watchdog_alive(session):
+                time.sleep(remaining_time(0.05, ready_by))
+        except ColabDeadline:
+            raise OSError(f"無法確認 Session {session} 的 watchdog 已啟動") from None
+
+
+def _launch_watchdog(session: str):
     kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
     if os.name == "nt":
         kw["creationflags"] = 0x00000008 | 0x00000200
     else:
         kw["start_new_session"] = True
-    p = subprocess.Popen([sys.executable, "-m", "cstudio.cli", "_watchdog", "--session", session], env=ENV, **kw)
-    set_keep(session, info.get("expires"), p.pid)
+    with _session_lock(session, "lease"):
+        info = keep_info(session)
+        if info is None or _watchdog_locked(session):
+            return
+        now = time.time()
+        starting = info.get("watchdog_start_until")
+        if isinstance(starting, (float, int)) and now < starting <= now + WATCHDOG_START_TIMEOUT:
+            return
+        ticket = uuid.uuid4().hex
+        launching = dict(info, watchdog_ticket=ticket, watchdog_start_until=now + WATCHDOG_START_TIMEOUT)
+        _write_keep(session, launching)
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-m", "cstudio.cli", "_watchdog", "--session", session, "--ticket", ticket],
+                env=ENV, **kw,
+            )
+        except OSError:
+            _write_keep(session, info)
+            raise
+        _write_keep(session, dict(launching, watchdog_pid=child.pid))
 
 
-def watchdog_loop(session: str):
+def watchdog_loop(session: str, ticket: str | None = None):
+    session = sanitize_session_name(session)
+    leader = _session_lock(session, "watchdog", timeout=0.5)
+    try:
+        with _session_lock(session, "lease"):
+            info = keep_info(session)
+            if info is None or (ticket is not None and info.get("watchdog_ticket") != ticket):
+                return
+            leader.acquire()
+            info.pop("watchdog_ticket", None)
+            info.pop("watchdog_start_until", None)
+            _write_keep(session, dict(info, watchdog_pid=os.getpid()))
+        _monitor_keep(session, leader)
+    except LockTimeout:
+        return
+    finally:
+        leader.release()
+
+
+def _monitor_keep(session: str, leader: FileLock):
     log_path = KEEP / f"{session}.log"
 
     def say(msg: str):
@@ -570,16 +713,26 @@ def watchdog_loop(session: str):
         except OverflowError:
             return False
 
+    def exit_if_unchanged(snapshot: dict | None) -> bool:
+        # Coordinate exit with start_watchdog in case the alias just got a new lease.
+        with _session_lock(session, "lease"):
+            if not same_lease(keep_info(session), snapshot):
+                return False
+            leader.release()
+            return True
+
     say("watchdog started")
     loops = 0
     bad_since = None
     while True:
-        time.sleep(30)
+        time.sleep(WATCHDOG_TICK)
         loops += 1
         try:
             if not keep_file(session).exists():
-                say("keep file removed: exit")
-                return
+                if exit_if_unchanged(None):
+                    say("keep file removed: exit")
+                    return
+                continue
             info = keep_info(session)
             if info is None:
                 say("cannot read keep record; waiting for ownership evidence")
@@ -587,42 +740,51 @@ def watchdog_loop(session: str):
             account = account_scope()
             if not account or info.get("account_scope", account) != account:
                 continue
+            deadline = time.monotonic() + RECOVERY_TIMEOUT
             endpoint = info.get("runtime_endpoint")
             if info.get("created_by") == "pending":
                 # An interrupted allocation can lack a local name-to-endpoint mapping.
                 # Confirm absence when possible, but never stop an unclaimed runtime.
                 if "account_scope" not in info:
                     say("allocation is unconfirmed; inspect Colab runtimes for an unmatched assignment")
-                    return
+                    if exit_if_unchanged(info):
+                        return
+                    continue
                 if loops % 10 == 0 and time.time() >= (info.get("busy_until") or 0):
-                    names, lout = sessions_checked(account=account)
+                    names, lout = sessions_checked(account=account, deadline=deadline)
                     assignments = listed_assignments(lout) if names is not None else None
                     if (
                         assignments is not None and session not in assignments.values()
                         and assignments.keys() <= set(info.get("allocation_baseline", []))
-                        and account_scope() == account and keep_info(session) == info
+                        and account_scope() == account and drop_keep(session, expected=info)
                     ):
-                        drop_keep(session)
                         say("no active assignment found for pending allocation")
-                        return
+                        if exit_if_unchanged(None):
+                            return
+                        continue
                     say("allocation is unconfirmed; inspect Colab runtimes for an unmatched assignment")
                 continue
             if loops % 10 == 0 and info.get("account_scope") == account and endpoint:
-                names, lout = sessions_checked(account=account)
-                if session_gone(session, names, lout, endpoint) and keep_info(session) == info and account_scope() == account:
+                names, lout = sessions_checked(account=account, deadline=deadline)
+                if (session_gone(session, names, lout, endpoint) and account_scope() == account
+                        and drop_keep(session, expected=info)):
                     say("session already gone: dropping keep file")
-                    drop_keep(session)
-                    return
+                    if exit_if_unchanged(None):
+                        return
+                    continue
             exp = info.get("expires")
             busy_until = info.get("busy_until")
-            hard_expired = isinstance(busy_until, (int, float)) and time.time() >= busy_until
+            now = time.time()
+            has_busy_limit = isinstance(busy_until, (int, float)) and finite(busy_until)
+            hard_expired = has_busy_limit and now >= busy_until
             release_pending = bool(info.get("release_pending"))
+            if has_busy_limit and not hard_expired and not release_pending:
+                continue
             bad = not (
                 exp is None
                 or (isinstance(exp, (int, float)) and not isinstance(exp, bool) and (finite(exp) or exp == float("-inf")))
             )
-            if bad:
-                now = time.time()
+            if bad and not hard_expired:
                 if bad_since is None:
                     bad_since = now
                 if now - bad_since < 30 * 60:
@@ -630,31 +792,37 @@ def watchdog_loop(session: str):
                 say("keep file unreadable for 30 min: treating as expired")
             else:
                 bad_since = None
-                if not hard_expired and (exp is None or time.time() < exp):
+                if not hard_expired and (exp is None or now < exp):
                     continue
 
             if info.get("created_by") != "owned":
-                say("external session expired: dropping keep file without stopping VM")
-                drop_keep(session)
-                return
+                if info.get("active_run_id"):
+                    continue
+                if drop_keep(session, expected=info):
+                    say("external session expired: dropping keep file without stopping VM")
+                    if exit_if_unchanged(None):
+                        return
+                continue
 
             if not endpoint:
                 say("keep record has no runtime endpoint; ownership is unconfirmed")
-                return
-            if not (hard_expired or release_pending):
-                if "account_scope" not in info and active_endpoint(session, account) != endpoint:
-                    continue
-                st = poll_remote_status(session, account=account, endpoint=endpoint)
-                if st and st.get("alive"):
-                    say("time is up but batch is running: wait")
-                    continue
-            if keep_info(session) != info:
+                if exit_if_unchanged(info):
+                    return
                 continue
+            if not (hard_expired or release_pending or bad) and now < exp + IDLE_ACTIVE_GRACE:
+                if "account_scope" not in info and active_endpoint(session, account, deadline=deadline) != endpoint:
+                    continue
+                st = poll_remote_status(session, account=account, endpoint=endpoint, deadline=deadline)
+                if st is None or st.get("alive"):
+                    say("idle time expired; waiting briefly for the active or unconfirmed batch")
+                    continue
 
             say("time is up: releasing GPU")
-            if release_runtime(session, watchdog_keep=info, account=account) == ReleaseState.CONFIRMED:
+            if release_runtime(session, watchdog_keep=info, account=account, deadline=deadline) == ReleaseState.CONFIRMED:
                 say("confirmed released")
-                return
+                if exit_if_unchanged(None):
+                    return
+                continue
             say("release unconfirmed; will verify on next tick")
         except Exception as e:
             say(f"error (will retry): {type(e).__name__}: {str(e)[:200]}")

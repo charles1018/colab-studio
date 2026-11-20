@@ -139,7 +139,7 @@ def read_local_keeps() -> list[dict[str, Any]]:
                     "remaining_sec": rem_sec,
                     "busy": exp is None and owner not in ("pending", "unverified"),
                     "release_pending": release_pending,
-                    "watchdog_alive": C.pid_alive(d.get("watchdog_pid")),
+                    "watchdog_alive": C.watchdog_alive(sess),
                 }
             )
         except Exception:
@@ -692,18 +692,19 @@ def api_colab_keep(payload: dict[str, Any]):
     account = C.account_scope()
     session = _resolve_target_session(payload.get("session"))
     now = time.time()
-    cur_info = C.keep_info(session) or {}
+    record = C.keep_info(session)
+    cur_info = record or {}
     if cur_info.get("release_pending"):
         raise HTTPException(status_code=409, detail="此 Session 正在關機，無法延長待命")
     try:
         target = C.keep_target(session, cur_info, account)
+        cur_exp = cur_info.get("expires")
+        base_time = max(now, float(cur_exp)) if isinstance(cur_exp, (int, float)) else now
+        new_exp = min(now + 240.0 * 60.0, base_time + minutes * 60.0)
+        C.set_keep(session, new_exp, expected=record, **target)
+        C.start_watchdog(session)
     except (RuntimeError, OSError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    cur_exp = cur_info.get("expires")
-    base_time = max(now, float(cur_exp)) if isinstance(cur_exp, (int, float)) else now
-    new_exp = min(now + 240.0 * 60.0, base_time + minutes * 60.0)
-    C.set_keep(session, new_exp, **target)
-    C.start_watchdog(session)
     rem_sec = max(0, int(round(new_exp - now)))
     STATE.append_log(f"⏸️ 已延長 {session} 自動關機時間（目前剩餘約 {round(rem_sec / 60, 1)} 分鐘）")
     return {

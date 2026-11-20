@@ -5,8 +5,10 @@ import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from pathlib import Path
+from threading import Event
 from unittest.mock import Mock, patch
 
 from fastapi import HTTPException
@@ -30,7 +32,7 @@ class ShutdownTests(unittest.TestCase):
             C,
             KEEP=self.keep,
             account_scope=Mock(return_value="fixture-account"),
-            runtime_endpoint=Mock(side_effect=self.runtimes.get),
+            runtime_endpoint=Mock(side_effect=lambda name, **_: self.runtimes.get(name)),
             colab=Mock(side_effect=self.fake_command),
             start_watchdog=Mock(),
             token_ok=Mock(return_value=False),
@@ -151,6 +153,44 @@ class ShutdownTests(unittest.TestCase):
             self.assertEqual(C.release_runtime("gpu", owned_only=True), C.ReleaseState.PENDING)
         self.assertTrue(C.keep_info("gpu")["release_pending"])
         C.colab.assert_not_called()
+
+    def test_parallel_stop_does_not_dispatch_again_while_first_request_is_in_flight(self):
+        self.session("gpu")
+        dispatching = Event()
+        complete = Event()
+        command = C.colab.side_effect
+
+        def block_stop(op, *args, **options):
+            if op == "stop":
+                dispatching.set()
+                self.assertTrue(complete.wait(timeout=5))
+            return command(op, *args, **options)
+
+        C.colab.side_effect = block_stop
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            started = pool.submit(C.release_runtime, "gpu")
+            try:
+                self.assertTrue(dispatching.wait(timeout=5))
+                self.assertEqual(C.release_runtime("gpu"), C.ReleaseState.PENDING)
+            finally:
+                complete.set()
+            self.assertEqual(started.result(timeout=5), C.ReleaseState.CONFIRMED)
+        self.assertEqual(self.commands.count(("stop", "-s", "gpu")), 1)
+
+    def test_web_keep_refuses_lease_replaced_after_validation(self):
+        self.session("gpu")
+        keep_target = C.keep_target
+
+        def renew(*args):
+            target = keep_target(*args)
+            C.set_keep("gpu", 8_000)
+            return target
+
+        with patch.object(C, "keep_target", side_effect=renew):
+            with self.assertRaises(HTTPException) as response:
+                webui.api_colab_keep({"session": "gpu", "minutes": 30})
+        self.assertEqual(response.exception.status_code, 409)
+        self.assertEqual(C.keep_info("gpu")["expires"], 8_000)
 
     def test_external_named_assignment_without_keep_can_be_stopped_explicitly(self):
         self.runtimes["external"] = "external-endpoint"

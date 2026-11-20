@@ -2,6 +2,7 @@
 import hashlib
 import io
 import json
+import subprocess
 import tempfile
 import time
 import unittest
@@ -35,18 +36,19 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.on_stop = Mock()
         self.reservations = []
         self.commands = []
+        self.real_colab = C.colab
 
         self.log = self.enterContext(redirect_stdout(io.StringIO()))
-        clock = SimpleNamespace(time=lambda: self.now, sleep=self.advance, strftime=time.strftime)
-        self.enterContext(patch.object(R, "time", clock))
+        self.clock = SimpleNamespace(time=lambda: self.now, monotonic=lambda: self.now, sleep=self.advance, strftime=time.strftime)
+        self.enterContext(patch.object(R, "time", self.clock))
         self.enterContext(patch.multiple(
             C,
             KEEP=self.directory / "keep",
             account_scope=Mock(return_value="fixture-account"),
-            time=clock,
+            time=self.clock,
             colab=Mock(side_effect=self.fake_colab),
             token_ok=Mock(return_value=True),
-            runtime_endpoint=Mock(side_effect=self.runtimes.get),
+            runtime_endpoint=Mock(side_effect=lambda name, **_: self.runtimes.get(name)),
             start_watchdog=Mock(side_effect=self.start_fake_watchdog),
             poll_remote_status=Mock(return_value=self.done_status()),
             remote_exec=Mock(return_value='CSTUDIO_PREP {"launched": true, "missing_inputs": []}'),
@@ -55,7 +57,7 @@ class RuntimeAllocationTests(unittest.TestCase):
     def advance(self, seconds):
         self.now += seconds
 
-    def start_fake_watchdog(self, session):
+    def start_fake_watchdog(self, session, **_options):
         self.reservations.append(C.keep_info(session))
 
     def fake_colab(self, command, *args, **options):
@@ -107,7 +109,7 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.assertIsNone(C.keep_info(self.session))
 
     def test_cancel_after_reservation_before_allocation_removes_reservation(self):
-        def arm_and_cancel(session):
+        def arm_and_cancel(session, **_options):
             self.start_fake_watchdog(session)
             self.abort = "cancel"
 
@@ -209,7 +211,7 @@ class RuntimeAllocationTests(unittest.TestCase):
         def fail_promotion(session, expires, **opts):
             if opts.get("owner") == "owned" and expires is None:
                 raise OSError("fixture write failed")
-            write(session, expires, **opts)
+            return write(session, expires, **opts)
 
         with patch.object(C, "set_keep", side_effect=fail_promotion):
             with self.assertRaisesRegex(OSError, "write failed"):
@@ -225,7 +227,7 @@ class RuntimeAllocationTests(unittest.TestCase):
         def fail_idle_write(session, expires, **opts):
             if expires == self.now + 30 * 60:
                 raise OSError("fixture idle write failed")
-            write(session, expires, **opts)
+            return write(session, expires, **opts)
 
         with patch.object(C, "set_keep", side_effect=fail_idle_write):
             with self.assertRaisesRegex(OSError, "idle write failed"):
@@ -376,6 +378,105 @@ class RuntimeAllocationTests(unittest.TestCase):
         C.poll_remote_status.assert_not_called()
         self.assertIsNone(C.keep_info(self.session))
 
+    def test_watchdog_does_not_stop_after_keep_extended_during_listing(self):
+        self.runtimes[self.session] = self.endpoint
+        C.set_keep(self.session, self.now - 1, owner="owned", extra={
+            "runtime_endpoint": self.endpoint, "account_scope": "fixture-account",
+        })
+        snapshot = C.keep_info(self.session)
+
+        def extend(**_options):
+            C.set_keep(self.session, self.now + 600)
+            return [self.session], self.fake_colab("sessions")
+
+        with patch.object(C, "sessions_checked", side_effect=extend):
+            C.release_runtime(self.session, watchdog_keep=snapshot, account="fixture-account")
+        self.assertNotIn("stop", self.commands)
+        self.assertIn(self.session, self.runtimes)
+        self.assertEqual(C.keep_info(self.session)["expires"], self.now + 600)
+
+    def test_watchdog_claim_prevents_extension_once_stop_dispatch_begins(self):
+        self.runtimes[self.session] = self.endpoint
+        C.set_keep(self.session, self.now - 1, owner="owned", extra={
+            "runtime_endpoint": self.endpoint, "account_scope": "fixture-account",
+        })
+        snapshot = C.keep_info(self.session)
+
+        def check_dispatch():
+            C.set_keep(self.session, self.now + 600)
+            record = C.keep_info(self.session)
+            self.assertTrue(record.get("release_pending"))
+            self.assertLess(record["expires"], self.now + 600)
+
+        self.on_stop.side_effect = check_dispatch
+        self.assertEqual(
+            C.release_runtime(self.session, watchdog_keep=snapshot, account="fixture-account"),
+            C.ReleaseState.CONFIRMED,
+        )
+        self.on_stop.assert_called_once()
+
+    def test_idle_watchdog_allows_active_batch_only_through_bounded_grace(self):
+        self.runtimes[self.session] = self.endpoint
+        C.set_keep(self.session, self.now, owner="owned", extra={
+            "runtime_endpoint": self.endpoint, "account_scope": "fixture-account",
+        })
+        C.poll_remote_status.return_value = {"alive": True}
+        limit = self.now + C.IDLE_ACTIVE_GRACE
+        self.on_stop.side_effect = lambda: self.assertEqual(self.now, limit)
+        C.watchdog_loop(self.session)
+        self.assertGreater(C.poll_remote_status.call_count, 0)
+        self.on_stop.assert_called_once()
+
+    def test_extended_keep_does_not_override_hard_deadline_of_active_run(self):
+        self.runtimes[self.session] = self.endpoint
+        hard_limit = self.now + 90
+        C.set_keep(self.session, self.now + 600, owner="owned", extra={
+            "runtime_endpoint": self.endpoint, "account_scope": "fixture-account",
+            "active_run_id": "active-run", "busy_until": hard_limit,
+        })
+        self.on_stop.side_effect = lambda: self.assertEqual(self.now, hard_limit)
+        C.watchdog_loop(self.session)
+        self.on_stop.assert_called_once()
+        C.poll_remote_status.assert_not_called()
+
+    def test_legacy_busy_deadline_protects_run_if_idle_expiry_is_earlier(self):
+        self.runtimes[self.session] = self.endpoint
+        hard_limit = self.now + 90
+        C.set_keep(self.session, self.now + 30, owner="owned", extra={
+            "runtime_endpoint": self.endpoint, "account_scope": "fixture-account", "busy_until": hard_limit,
+        })
+        self.on_stop.side_effect = lambda: self.assertEqual(self.now, hard_limit)
+        C.watchdog_loop(self.session)
+        self.on_stop.assert_called_once()
+        C.poll_remote_status.assert_not_called()
+
+    def test_active_run_record_blocks_reuse_before_it_is_observable_remotely(self):
+        self.runtimes[self.session] = self.endpoint
+        C.set_keep(self.session, None, owner="owned", extra={
+            "runtime_endpoint": self.endpoint, "account_scope": "fixture-account",
+            "active_run_id": "other-run", "busy_until": self.now + 600,
+        })
+        original = C.keep_info(self.session)
+        with self.assertRaisesRegex(RuntimeError, "已有批次的執行紀錄"):
+            self.run_manifest()
+        self.assertEqual(C.keep_info(self.session), original)
+        C.poll_remote_status.assert_not_called()
+        C.remote_exec.assert_not_called()
+
+    def test_runner_preserves_keep_extended_while_it_finishes(self):
+        extended = self.now + 4_000
+
+        def status(_session, **_target):
+            C.set_keep(self.session, extended)
+            return self.done_status()
+
+        C.poll_remote_status.side_effect = status
+        self.run_manifest()
+        keep = C.keep_info(self.session)
+        self.assertEqual(keep["expires"], extended)
+        self.assertIsNone(keep["active_run_id"])
+        self.assertIsNone(keep["busy_until"])
+
     def test_watchdog_waits_for_original_account_before_reconciling(self):
         self.runtimes[self.session] = self.endpoint
         C.set_keep(self.session, None, owner="owned", extra={
@@ -432,14 +533,35 @@ class RuntimeAllocationTests(unittest.TestCase):
         command.assert_called_once()
         self.assertEqual(self.now, 1_003.0)
 
-    def test_allocation_deadline_does_not_shorten_in_flight_request(self):
+    def test_allocation_deadline_bounds_request_and_backoff(self):
         with patch.object(C, "colab", side_effect=RuntimeError(self.allocation_refused)) as command:
-            with self.assertRaisesRegex(RuntimeError, "配置時間上限"):
+            with self.assertRaisesRegex(C.ColabDeadline, "批次時間上限"):
                 C.new_runtime(self.session, "L4", wait=120, deadline=self.now + 12)
         self.assertEqual(command.call_args_list, [
-            call("new", "-s", self.session, "--gpu", "L4", timeout=C.ASSIGN_TIMEOUT, account="fixture-account"),
+            call("new", "-s", self.session, "--gpu", "L4", timeout=12, account="fixture-account", deadline=1_012),
         ])
         self.assertEqual(self.now, 1_012.0)
+
+    def test_subprocess_timeout_is_clipped_by_monotonic_deadline(self):
+        error = subprocess.TimeoutExpired(["fake-colab"], timeout=3)
+        with patch.object(C, "colab", self.real_colab), patch.object(C.subprocess, "run", side_effect=error) as run:
+            with self.assertRaises(C.ColabDeadline):
+                C.colab("download", timeout=600, check=False, account="fixture-account", deadline=self.now + 3)
+        self.assertEqual(run.call_args.kwargs["timeout"], 3)
+
+    def test_work_deadline_ignores_wall_clock_rewind_and_cleanup_has_own_budget(self):
+        def rewind_and_finish_allocation():
+            self.now += 61
+            self.clock.time = lambda: self.now - 10_000
+
+        self.on_allocate.side_effect = rewind_and_finish_allocation
+        with self.assertRaisesRegex(RuntimeError, "分鐘上限"):
+            self.run_manifest(max_minutes=1)
+        new = next(item for item in C.colab.call_args_list if item.args[0] == "new")
+        stop = next(item for item in C.colab.call_args_list if item.args[0] == "stop")
+        self.assertEqual(new.kwargs["deadline"], 1_060)
+        self.assertEqual(stop.kwargs["deadline"], 1_061 + C.RECOVERY_TIMEOUT)
+        self.assertIsNone(C.keep_info(self.session))
 
     def test_unconfirmed_timeout_never_retries_the_allocation(self):
         # The timeout text may contain the Session's name and numerical status substrings.
@@ -484,7 +606,7 @@ class RuntimeAllocationTests(unittest.TestCase):
                 self.run_manifest(progress_cb=progress)
         cancelled = progress.call_args.args[0]
         send.assert_called_once_with(self.session, cancelled["run_id"], allow_start=True,
-                                     account="fixture-account", endpoint=self.endpoint)
+                                     account="fixture-account", endpoint=self.endpoint, deadline=8_200)
         self.assertEqual(cancelled["stage"], "cancelled")
         self.assertEqual(cancelled["_local_synced_jobs"], ["test"])
         self.assertEqual((self.result_path.parent / "test.png").read_bytes(), self.image_bytes)
