@@ -2,7 +2,6 @@
 """Offline self-test and image contact-sheet utility for colab-studio."""
 from __future__ import annotations
 
-import json
 import sys
 import tempfile
 from pathlib import Path
@@ -166,10 +165,15 @@ def run_selftest() -> int:
         )
         fp1 = R.compute_job_fingerprint(manifest["jobs"][1], manifest, tmp_p, versions=versions)
         fp2 = R.compute_job_fingerprint(manifest["jobs"][1], manifest, tmp_p, cli_quant="Q4_K_M", versions=versions)
-        check(fp1 != fp2, "Job 指紋能正確偵測量化等級 (INT8 vs Q4_K_M)、輸入圖片內容與版本變動")
+        changed_versions = dict(versions, comfyui=dict(versions["comfyui"], commit="fixture-commit"))
+        fp3 = R.compute_job_fingerprint(manifest["jobs"][1], manifest, tmp_p, versions=changed_versions)
+        Image.new("RGB", (64, 64), "red").save(img_p)
+        fp4 = R.compute_job_fingerprint(manifest["jobs"][1], manifest, tmp_p, versions=versions)
+        check(fp1 not in (fp2, fp3, fp4), "Job 指紋會隨量化等級、ComfyUI 版本或參考圖內容變更")
 
     # 7. Verify Local Web UI (FastAPI routes, static assets, exit_on_error=False, and gallery scan)
     from . import colab_client as C
+    from . import web_gallery as G
     from . import webui as W
 
     check((W.STATIC_DIR / "index.html").is_file(), "Web UI 靜態檔案 index.html 存在")
@@ -200,12 +204,18 @@ def run_selftest() -> int:
     pruned_parsed = C.parse_sessions("[colab] Pruned 1 stale local session(s).\n[colab] No active sessions found on server.")
     check(pruned_parsed == [], "parse_sessions 正確忽略 [colab] Pruned / No active sessions 系統訊息")
 
-    # Verify scan_gallery executes cleanly and ignores contact_sheet / comparison_sheet
-    gal = W.scan_gallery(limit=50)
-    check(
-        all(not x["filename"].endswith("_sheet.png") for x in gal),
-        f"scan_gallery 成功掃描本地歷史作品且排除拼圖表 (共 {len(gal)} 筆)",
-    )
+    with tempfile.TemporaryDirectory() as tmp:
+        jobs = Path(tmp)
+        out = jobs / "fixture" / "out"
+        out.mkdir(parents=True)
+        with Image.new("RGBA", (8, 8), (0, 0, 255, 127)) as image:
+            image.save(out / "sample.png")
+            image.save(out / "contact_sheet.png")
+        gallery, _ = G.gallery_page(jobs, 50)
+        check(
+            [item["artifact_id"] for item in gallery] == ["fixture/out/sample.png"],
+            "畫廊掃描可讀取暫存成果並排除拼圖表",
+        )
 
     if failures:
         print(f"\n❌ 自我測試失敗（共 {len(failures)} 項錯誤）", flush=True)

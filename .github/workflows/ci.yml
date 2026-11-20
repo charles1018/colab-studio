@@ -1,0 +1,69 @@
+name: Offline checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.8"
+          enable-cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.12.0"
+          package-manager-cache: false
+
+      - name: Install locked Python dependencies and Ruff
+        env:
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/colab-studio-tools
+        run: |
+          uv sync --locked
+          uv tool install ruff==0.15.8
+          printf '%s\n' "$UV_TOOL_BIN_DIR" >> "$GITHUB_PATH"
+
+      - name: Run offline checks with loopback only
+        run: |
+          # Use sudo to bring up loopback, then run the checks as the runner user.
+          sudo --non-interactive unshare --net bash -euc '
+            ip link set lo up
+            exec runuser -u "$1" -- setpriv --no-new-privs \
+              env "PATH=$2" "UV_CACHE_DIR=$3" bash -euo pipefail
+          ' bash "$(id -un)" "$PATH" "$(uv cache dir)" <<'CHECKS'
+          uv run --locked --offline --no-sync python -m unittest discover -s tests
+          uv run --locked --offline --no-sync cstudio test
+          node --test tests/test_webui_frontend.cjs
+          ruff check cstudio remote tests
+          node --check cstudio/static/app.js
+          uv lock --check --offline
+
+          plan_dir=$(mktemp -d)
+          trap 'rm -rf -- "$plan_dir"' EXIT
+          cp jobs/demo_qwen21/manifest.json "$plan_dir/manifest.json"
+          uv run --locked --offline --no-sync cstudio plan "$plan_dir/manifest.json"
+          CHECKS
+
+      - name: Check whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git diff --check "$BASE_SHA" HEAD --
+          else
+            git diff --check HEAD^ HEAD --
+          fi
+          git diff --check
+          git diff --cached --check
