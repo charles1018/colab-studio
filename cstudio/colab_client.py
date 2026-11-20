@@ -11,13 +11,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
+from typing import Callable
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 REMOTE = ROOT / "remote"
 GPUS = ("L4", "G4", "A100", "H100", "T4")
 PREFIX = "cstudio-"
+ASSIGN_TIMEOUT = 900
 ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
 KEEP = Path.home() / ".config" / "colab-studio" / "keep"
 
@@ -39,6 +42,10 @@ def colab_exe() -> str:
     sys.exit("找不到 colab 指令：請先在此 repo 執行 `uv sync && uv run cstudio-patch`")
 
 
+class ColabTimeout(RuntimeError):
+    """The command timed out before its outcome could be observed."""
+
+
 def colab(*args, timeout: int = 600, check: bool = True) -> str:
     try:
         p = subprocess.run(
@@ -53,7 +60,7 @@ def colab(*args, timeout: int = 600, check: bool = True) -> str:
         )
     except subprocess.TimeoutExpired:
         if check:
-            raise RuntimeError(f"colab {' '.join(map(str, args))} 超過 {timeout} 秒沒有回應")
+            raise ColabTimeout(f"colab {' '.join(map(str, args))} 超過 {timeout} 秒沒有回應") from None
         return ""
     out = (p.stdout or "") + (p.stderr or "")
     if check and p.returncode != 0:
@@ -61,12 +68,33 @@ def colab(*args, timeout: int = 600, check: bool = True) -> str:
     return out
 
 
-def new_runtime(session: str, gpu: str, retries: int = 5, wait: int = 120) -> str:
+def new_session_name() -> str:
+    return f"{PREFIX}{time.strftime('%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+def new_runtime(
+    session: str,
+    gpu: str,
+    retries: int = 5,
+    wait: int = 120,
+    check_abort: Callable[[], None] | None = None,
+    deadline: float | None = None,
+) -> str:
     for attempt in range(retries + 1):
+        if check_abort:
+            check_abort()
+        if deadline is not None and time.time() >= deadline:
+            raise RuntimeError("已到達 Colab GPU 配置時間上限")
         try:
-            return colab("new", "-s", session, "--gpu", gpu, timeout=900)
+            # Let a request already in flight return its identity before cleanup.
+            return colab("new", "-s", session, "--gpu", gpu, timeout=ASSIGN_TIMEOUT)
+        except ColabTimeout:
+            raise
         except RuntimeError as e:
             busy = any(k in str(e) for k in ("Service Unavailable", "503", "Too Many Requests", "429"))
+            if busy and runtime_endpoint(session):
+                # A recorded assignment must be reconciled before any further allocation.
+                raise
             if not busy or attempt == retries:
                 if busy:
                     raise RuntimeError(
@@ -78,7 +106,10 @@ def new_runtime(session: str, gpu: str, retries: int = 5, wait: int = 120) -> st
                 f"⏳ Colab 現在分配不到 {gpu}（Service Unavailable），{wait:g} 秒後再試（第 {attempt + 1}/{retries} 次重試）",
                 flush=True,
             )
-            time.sleep(wait)
+            if check_abort:
+                check_abort()
+            delay = min(wait, max(0, deadline - time.time())) if deadline is not None else wait
+            time.sleep(delay)
     return ""
 
 
@@ -101,7 +132,7 @@ def parse_sessions(out: str) -> list[str]:
         m = re.match(r"^\[([^\]]+)\]\s+(.+)$", line)
         if not m:
             continue
-        name, rest = m.group(1), m.group(2)
+        name = m.group(1)
         if name in ("?", "colab"):
             continue
         names.append(name)
@@ -153,16 +184,29 @@ def keep_info(session: str) -> dict | None:
         return None
 
 
+def runtime_endpoint(session: str) -> str | None:
+    """Read the endpoint from the pinned Colab CLI's local store without an API call."""
+    from colab_cli.state import StateStore
+
+    state = StateStore().get(session)
+    return state.endpoint if state else None
+
+
 def is_owned_session(name: str) -> bool:
     try:
         name = sanitize_session_name(name)
     except ValueError:
         return False
+    info = keep_info(name) or {}
+    if info.get("created_by") in ("external", "pending"):
+        return False
+    if endpoint := info.get("runtime_endpoint"):
+        return runtime_endpoint(name) == endpoint
     if name.startswith(PREFIX):
         return True
     if not keep_file(name).exists():
         return False
-    return (keep_info(name) or {}).get("created_by") != "external"
+    return True
 
 
 def owned_sessions() -> list[str]:
@@ -188,13 +232,49 @@ def set_keep(
     if extra:
         data.update(extra)
     kf = keep_file(session)
-    tmp = kf.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(kf)
+    stream = tempfile.NamedTemporaryFile(dir=KEEP, mode="w", suffix=".tmp", encoding="utf-8", delete=False)
+    tmp = Path(stream.name)
+    try:
+        with stream:
+            json.dump(data, stream, ensure_ascii=False)
+        tmp.replace(kf)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def drop_keep(session: str):
     keep_file(session).unlink(missing_ok=True)
+
+
+def release_runtime(session: str, owner: str, endpoint: str | None = None) -> bool:
+    """Persist a retryable release request before stopping a runner's runtime."""
+    try:
+        set_keep(
+            session,
+            time.time() + 30,
+            owner=owner,
+            extra={"busy_until": None, "release_pending": True, "runtime_endpoint": endpoint},
+        )
+        start_watchdog(session)
+    except Exception as exc:
+        print(f"⚠️ 無法登記 {session} 的關機重試（{type(exc).__name__}）", flush=True)
+
+    try:
+        if endpoint and runtime_endpoint(session) != endpoint:
+            print(f"⚠️ {session} 的遠端識別已變更，將僅查詢關機狀態", flush=True)
+        else:
+            colab("stop", "-s", session, timeout=300, check=False)
+    except Exception as exc:
+        print(f"⚠️ 無法送出 {session} 的關機請求（{type(exc).__name__}）", flush=True)
+
+    try:
+        names, out = sessions_checked()
+        if session_gone(session, names, out):
+            drop_keep(session)
+            return True
+    except Exception as exc:
+        print(f"⚠️ 無法確認 {session} 的關機狀態（{type(exc).__name__}）", flush=True)
+    return False
 
 
 def pid_alive(pid: int | None) -> bool:
@@ -275,15 +355,32 @@ def watchdog_loop(session: str):
             if not keep_file(session).exists():
                 say("keep file removed: exit")
                 return
+            info = keep_info(session)
+            if info and info.get("created_by") == "pending":
+                # An interrupted allocation can lack a local name-to-endpoint mapping.
+                # Confirm absence when possible, but never stop an unclaimed runtime.
+                if loops % 10 == 0 and time.time() >= info["busy_until"]:
+                    names, lout = sessions_checked()
+                    if session_gone(session, names, lout) and keep_info(session) == info:
+                        drop_keep(session)
+                        say("no active assignment found for pending allocation")
+                        return
+                    say("allocation is unconfirmed; inspect Colab runtimes for an unmatched assignment")
+                continue
             if loops % 10 == 0:
                 names, lout = sessions_checked()
-                if session_gone(session, names, lout):
+                if session_gone(session, names, lout) and keep_info(session) == info:
                     say("session already gone: dropping keep file")
                     drop_keep(session)
                     return
-            info = keep_info(session)
-            exp = info.get("expires") if info is not None else None
-            bad = info is None or not (
+            if info is None:
+                say("cannot read keep record; waiting for ownership evidence")
+                continue
+            exp = info.get("expires")
+            busy_until = info.get("busy_until")
+            hard_expired = isinstance(busy_until, (int, float)) and time.time() >= busy_until
+            release_pending = bool(info.get("release_pending"))
+            bad = not (
                 exp is None
                 or (isinstance(exp, (int, float)) and not isinstance(exp, bool) and (finite(exp) or exp == float("-inf")))
             )
@@ -296,17 +393,23 @@ def watchdog_loop(session: str):
                 say("keep file unreadable for 30 min: treating as expired")
             else:
                 bad_since = None
-                if exp is None or time.time() < exp:
+                if not hard_expired and (exp is None or time.time() < exp):
                     continue
 
             if not is_owned_session(session):
+                if info.get("runtime_endpoint"):
+                    say("runtime identity cannot be verified; retaining release record")
+                    continue
                 say("external session expired: dropping keep file without stopping VM")
                 drop_keep(session)
                 return
 
-            st = poll_remote_status(session)
-            if st and st.get("alive"):
-                say("time is up but batch is running: wait")
+            if not (hard_expired or release_pending):
+                st = poll_remote_status(session)
+                if st and st.get("alive"):
+                    say("time is up but batch is running: wait")
+                    continue
+            if keep_info(session) != info:
                 continue
 
             say("time is up: releasing GPU")

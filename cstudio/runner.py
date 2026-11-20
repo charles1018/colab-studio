@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import math
 import posixpath
 import re
 import shutil
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -382,6 +381,17 @@ def run_manifest(
 ) -> dict[str, Any]:
     if gpu not in C.GPUS:
         _fail(f"不支援的 GPU {gpu!r}（可用：{', '.join(C.GPUS)}）", exit_on_error)
+    if not math.isfinite(max_minutes * 60) or max_minutes <= 0:
+        _fail("批次時間上限必須為有限正數", exit_on_error)
+    if not math.isfinite(idle_minutes * 60):
+        _fail("GPU 待命時間必須為有限數字", exit_on_error)
+    if assign_retries < 0 or assign_wait < 0:
+        _fail("GPU 配置的重試次數與等待時間必須為非負數", exit_on_error)
+    if session:
+        try:
+            session = C.sanitize_session_name(session)
+        except ValueError as exc:
+            _fail(str(exc), exit_on_error)
     if not C.token_ok():
         _fail("尚未登入 Google Colab：請先執行 `uv run cstudio login url`", exit_on_error)
 
@@ -438,6 +448,7 @@ def run_manifest(
         print(f"⏭️ 略過已完成且指紋相符的任務：{', '.join(done_ids)}", flush=True)
 
     t0 = time.time()
+    deadline = t0 + max_minutes * 60
     run_id = uuid.uuid4().hex[:12]
 
     def _emit(payload: dict[str, Any]):
@@ -465,9 +476,14 @@ def run_manifest(
             return
         if sig == "stop":
             abort_reason = "stop"
-            raise RuntimeError("任務已中斷並立即關閉 Colab GPU (stopped by user)")
+            raise RuntimeError("使用者要求中斷任務並關閉 Colab GPU (stopped by user)")
         abort_reason = "cancel"
         raise RuntimeError("任務已由使用者中斷 (cancelled by user)")
+
+    def _check_active():
+        _check_abort()
+        if time.time() >= deadline:
+            raise RuntimeError(f"超過 {max_minutes} 分鐘上限，中止以保護運算單元")
 
     local_synced: set[str] = set(done_ids)
     results: dict[str, Any] = {
@@ -480,40 +496,16 @@ def run_manifest(
 
     _check_abort()
     cu_before, _ = C.usage()
-    alive, _ = C.sessions()
-    created = False
+    alive, _ = C.sessions_checked()
+    if alive is None:
+        _fail("無法確認開啟中的 Colab Session，請稍後再試", exit_on_error)
 
-    if not session or session not in alive:
-        session = session or f"{C.PREFIX}{time.strftime('%m%d-%H%M%S')}"
-        results["session"] = session
-        print(f"🚀 在 Google Colab 開啟 {gpu}：{session}", flush=True)
-        _emit({"stage": "booting_vm", "done": False, "log": [f"正在 Google Colab 分配並啟動 {gpu} ({session})..."]})
-        try:
-            C.new_runtime(session, gpu, retries=assign_retries, wait=assign_wait)
-            created = True
-            C.set_keep(session, None, owner="owned")
-        except BaseException:
-            print(f"⚠️ 開機過程出錯，嘗試關閉可能已建立的 {session}", flush=True)
-            try:
-                C.colab("stop", "-s", session, timeout=300, check=False)
-                C.drop_keep(session)
-            except Exception:
-                pass
-            raise
-        owned = True
-        _check_abort()
-    else:
-        results["session"] = session
-        owned = C.is_owned_session(session)
-        st_check = C.poll_remote_status(session)
-        if st_check and st_check.get("alive"):
-            _fail(
-                f"⚠️ Session {session} 上已有正在執行的批次任務，請先等待完成或執行 `uv run cstudio cancel --session {session}`",
-                exit_on_error,
-            )
-        print(f"♻️ 沿用開啟中的 Colab Session：{session}（省去安裝與重複下載模型）", flush=True)
-        _emit({"stage": "reusing_vm", "done": False, "log": [f"沿用開啟中的 Colab Session：{session}"]})
-        C.set_keep(session, None, owner="owned" if owned else "external")
+    allocation_reserved = False
+    allocation_attempted = False
+    attached = False
+    created = False
+    owned = False
+    endpoint: str | None = None
 
     short = dict(timeout=45, tries=6)
     got: set[str] = set()
@@ -521,7 +513,60 @@ def run_manifest(
     finished = False
 
     try:
-        _check_abort()
+        _check_active()
+        reuse = session in alive
+        session = session or C.new_session_name()
+        results["session"] = session
+        keep = C.keep_info(session) or {}
+        if keep.get("created_by") == "pending" or keep.get("release_pending"):
+            _fail(f"Session {session} 的配置或關機仍待確認，請先檢查 Colab runtime 狀態", exit_on_error)
+
+        if reuse:
+            owned = keep.get("created_by") == "owned" and C.is_owned_session(session)
+            endpoint = keep.get("runtime_endpoint") if owned else None
+            if keep.get("runtime_endpoint") and not owned:
+                _fail(f"Session {session} 的遠端識別已變更，請先確認目標", exit_on_error)
+            st_check = C.poll_remote_status(session)
+            if st_check and st_check.get("alive"):
+                _fail(
+                    f"⚠️ Session {session} 上已有正在執行的批次任務，請先等待完成或執行 `uv run cstudio cancel --session {session}`",
+                    exit_on_error,
+                )
+            print(f"♻️ 沿用開啟中的 Colab Session：{session}（省去安裝與重複下載模型）", flush=True)
+            _emit({"stage": "reusing_vm", "done": False, "log": [f"沿用開啟中的 Colab Session：{session}"]})
+            _check_active()
+            C.set_keep(
+                session, None, owner="owned" if owned else "external",
+                extra={"busy_until": deadline if endpoint else None, "runtime_endpoint": endpoint},
+            )
+            attached = True
+            if endpoint:
+                C.start_watchdog(session)
+        else:
+            print(f"🚀 在 Google Colab 開啟 {gpu}：{session}", flush=True)
+            _emit({"stage": "booting_vm", "done": False, "log": [f"正在 Google Colab 分配並啟動 {gpu} ({session})..."]})
+            _check_active()
+            if C.runtime_endpoint(session):
+                _fail(f"Session {session} 已有本機配置紀錄，請先確認 Colab runtime 狀態", exit_on_error)
+            C.set_keep(
+                session, None, owner="pending",
+                extra={"busy_until": deadline + C.ASSIGN_TIMEOUT + 30, "runtime_endpoint": None, "bundle_hash": None},
+            )
+            allocation_reserved = True
+            C.start_watchdog(session)
+            _check_active()
+            allocation_attempted = True
+            C.new_runtime(
+                session, gpu, retries=assign_retries, wait=assign_wait,
+                check_abort=_check_active, deadline=deadline,
+            )
+            endpoint = C.runtime_endpoint(session)
+            if not endpoint:
+                raise RuntimeError(f"無法確認 {session} 的遠端識別，配置狀態待確認")
+            attached = created = owned = True
+            C.set_keep(session, None, owner="owned", extra={"busy_until": deadline, "runtime_endpoint": endpoint})
+
+        _check_active()
         # Prepare remote manifest containing only `todo` jobs + metadata flags
         remote_m = dict(
             m,
@@ -567,12 +612,12 @@ def run_manifest(
 
         missing_inputs = prep_info.get("missing_inputs", files)
         for f in missing_inputs:
-            _check_abort()
+            _check_active()
             print(f"⬆️ 上傳參考圖：{f}", flush=True)
             _emit({"stage": "uploading_inputs", "done": False, "log": [f"正在上傳參考圖片：{f}"]})
             C.colab("upload", "-s", session, base / f, f"/content/cstudio/inputs/{f}", timeout=600)
 
-        _check_abort()
+        _check_active()
         if prep_info.get("launched"):
             print(f"▶️ 已單次指令同步並啟動遠端引擎 (pid={prep_info.get('pid')})", flush=True)
             _emit({"stage": "starting", "done": False, "log": [f"已啟動遠端生成引擎 (pid={prep_info.get('pid')})"]})
@@ -587,9 +632,7 @@ def run_manifest(
 
         while True:
             time.sleep(4)
-            _check_abort()
-            if time.time() - t0 > max_minutes * 60:
-                raise RuntimeError(f"超過 {max_minutes} 分鐘上限，中止以保護運算單元")
+            _check_active()
 
             st = C.poll_remote_status(session)
             if not st:
@@ -685,55 +728,50 @@ def run_manifest(
         raise
     finally:
         results["minutes"] = round((time.time() - t0) / 60, 2)
-        try:
-            if abort_reason == "stop" or (stop_after and abort_reason != "cancel") or (not finished and created and abort_reason != "cancel"):
-                print(f"🛑 關閉 Colab GPU：{session}", flush=True)
-                C.colab("stop", "-s", session, timeout=300, check=False)
-                names, lout = C.sessions_checked()
-                if C.session_gone(session, names, lout):
-                    C.drop_keep(session)
-                else:
-                    C.set_keep(session, time.time() - 1, owner="owned" if (owned or created) else "external")
-                    C.start_watchdog(session)
-            elif abort_reason == "cancel":
-                keep_mins = max(30.0, float(idle_minutes))
-                C.set_keep(
-                    session,
-                    time.time() + keep_mins * 60,
-                    owner="owned" if (owned or created) else "external",
+        if attached:
+            owner = "owned" if owned else "external"
+            try:
+                release = abort_reason == "stop" or (
+                    abort_reason != "cancel" and (stop_after or (created and not finished))
                 )
-                C.start_watchdog(session)
-                print(f"⏹️ 已中斷任務，{session} 保留 {keep_mins:g} 分鐘待命（模型免重新下載）", flush=True)
-            elif not finished:
-                if owned or created:
-                    C.set_keep(session, time.time() + idle_minutes * 60, owner="owned")
-                    C.start_watchdog(session)
+                if release:
+                    print(f"🛑 關閉 Colab GPU：{session}", flush=True)
+                    if not C.release_runtime(session, owner, endpoint):
+                        results["shutdown_pending"] = True
+                        results.setdefault("error", f"尚未確認 {session} 已關閉，請檢查 Colab runtime 狀態")
+                        print(f"⚠️ 尚未確認 {session} 已關閉", flush=True)
+                elif finished or owned or abort_reason == "cancel":
+                    keep_mins = max(30.0, float(idle_minutes)) if abort_reason == "cancel" else idle_minutes
+                    try:
+                        C.set_keep(session, time.time() + keep_mins * 60, owner=owner, extra={"busy_until": None})
+                        C.start_watchdog(session)
+                    except OSError:
+                        if created:
+                            results["shutdown_pending"] = not C.release_runtime(session, owner, endpoint)
+                        raise
+                    print(f"⏸️ {session} 保留待命 {keep_mins:g} 分鐘", flush=True)
+                    if owned:
+                        print("   到期且無執行中任務時，watchdog 將回收 GPU。", flush=True)
                 else:
                     C.drop_keep(session)
-                print(
-                    f"⚠️ 批次未完成，{session} 仍在運行。"
-                    f"若不再使用請執行：uv run cstudio stop --session {session}",
-                    flush=True,
-                )
+                    print(f"⚠️ 批次未完成，外部 Session {session} 仍在運行。", flush=True)
+            finally:
+                cu_after, _ = C.usage()
+                cu_used = round(cu_before - cu_after, 2) if (cu_before is not None and cu_after is not None) else None
+                results.update(cu_before=cu_before, cu_after=cu_after, cu_used=cu_used)
+                save_results(res_file, results)
+                if cu_used is not None:
+                    print(f"💳 本批預估消耗 {cu_used} 運算單元（{cu_before} → {cu_after}；Colab 用量可能延遲更新）", flush=True)
+        elif allocation_reserved:
+            if allocation_attempted:
+                try:
+                    review_at = time.time() + 30
+                    C.set_keep(session, None, owner="pending", extra={"busy_until": review_at})
+                except OSError:
+                    pass  # The reservation was already persisted before allocation.
+                print(f"⚠️ 尚未確認 {session} 的配置結果。請檢查 Colab runtime，含未命名的機器。", flush=True)
             else:
-                C.set_keep(
-                    session,
-                    time.time() + idle_minutes * 60,
-                    owner="owned" if (owned or created) else "external",
-                )
-                C.start_watchdog(session)
-                print(f"⏸️ Colab GPU 保留待命中：{session}（模型已快取在雲端，下一批免重新下載）", flush=True)
-                print(f"   👉 若 {idle_minutes:g} 分鐘內無新任務，背景守護進程將自動關機以保護點數。", flush=True)
-                print(f"   續跑下一批：uv run cstudio run <manifest.json> --session {session}", flush=True)
-                print(f"   延長保留  ：uv run cstudio keep --session {session} --minutes 60", flush=True)
-                print(f"   立即關機  ：uv run cstudio stop --session {session}", flush=True)
-        finally:
-            cu_after, _ = C.usage()
-            cu_used = round(cu_before - cu_after, 2) if (cu_before is not None and cu_after is not None) else None
-            results.update(cu_before=cu_before, cu_after=cu_after, cu_used=cu_used)
-            save_results(res_file, results)
-            if cu_used is not None:
-                print(f"💳 本批預估消耗 {cu_used} 運算單元（{cu_before} → {cu_after}；Colab 用量可能延遲更新）", flush=True)
+                C.drop_keep(session)
 
     expected_ids = [j["id"] for j in m["jobs"]]
     bad = [

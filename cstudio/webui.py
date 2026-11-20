@@ -119,14 +119,15 @@ def read_local_keeps() -> list[dict[str, Any]]:
                 continue
             sess = str(d.get("session") or p.stem)
             exp = d.get("expires")
+            owner = d.get("created_by", "owned" if sess.startswith(C.PREFIX) else "external")
             rem_sec = max(0, int(round(exp - now))) if isinstance(exp, (int, float)) else None
             out.append(
                 {
                     "session": sess,
-                    "owner": d.get("created_by", "owned" if sess.startswith(C.PREFIX) else "external"),
+                    "owner": owner,
                     "expires": exp,
                     "remaining_sec": rem_sec,
-                    "busy": exp is None,
+                    "busy": exp is None and owner != "pending",
                     "watchdog_alive": C.pid_alive(d.get("watchdog_pid")),
                 }
             )
@@ -975,14 +976,14 @@ async def api_run_start(
             shutil.rmtree(job_folder, ignore_errors=True)
             raise HTTPException(status_code=400, detail=str(e)) from e
     elif req_sess == "__new__":
-        target_session = f"{C.PREFIX}{time.strftime('%m%d-%H%M%S')}"
+        target_session = C.new_session_name()
     else:
         keeps = read_local_keeps()
         owned_keeps = [k["session"] for k in keeps if k["owner"] == "owned"]
         if owned_keeps:
             target_session = owned_keeps[0]
         else:
-            target_session = f"{C.PREFIX}{time.strftime('%m%d-%H%M%S')}"
+            target_session = C.new_session_name()
 
     with STATE.lock:
         if STATE.running:
