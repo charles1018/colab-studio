@@ -1,15 +1,36 @@
 """Check diagnostic redaction against synthetic Colab protocol and transport output."""
+import io
 import json
 import unittest
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import quote
 
-from cstudio import colab_client as C
+from cstudio import cli, colab_client as C
 from cstudio.redact import REDACTED, redact
 
 
 class ColabDiagnosticTests(unittest.TestCase):
+    def test_check_reports_the_scoped_interpreters_patch_status(self):
+        status = {"version": "0.7.4", "package": "fixture/site-packages/colab_cli",
+                  "files": {"client.py": "patched", "console.py": "legacy"}}
+        with (
+            patch.object(cli, "patch_status", return_value=(status, 1)),
+            patch.object(C, "token_ok", return_value=False),
+            patch.object(C, "usage") as usage,
+            patch.object(C, "sessions") as sessions,
+            redirect_stdout(io.StringIO()) as out,
+            self.assertRaises(SystemExit) as result,
+        ):
+            cli.cmd_check(None)
+        self.assertEqual(result.exception.code, 1)
+        self.assertIn("0.7.4", out.getvalue())
+        self.assertIn(status["package"], out.getvalue())
+        self.assertIn("client.py=patched, console.py=legacy", out.getvalue())
+        usage.assert_not_called()
+        sessions.assert_not_called()
+
     def test_masks_headers_urls_serialized_values_and_known_secrets(self):
         payload = {
             "Authorization": "Basic fixture-http-auth",

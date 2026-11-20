@@ -10,11 +10,17 @@ from . import colab_client as C
 from . import colab_login as L
 from . import runner as R
 from . import selftest as T
+from .patch_colab_cli import patch_status
 from .redact import redact
 
 def cmd_check(_args):
-    exe = C.colab_exe()
-    print(f"🔧 colab-cli：{exe}", flush=True)
+    status, _ = patch_status()
+    if "error" in status:
+        print(f"🔧 colab-cli：{status['error']}", flush=True)
+    else:
+        print(f"🔧 colab-cli {status['version']}：{status['package']}", flush=True)
+        states = ", ".join(f"{name}={state}" for name, state in status["files"].items())
+        print(f"   補丁狀態：{states}（詳見 `cstudio-patch --status`）", flush=True)
     if not C.token_ok():
         print("❌ 尚未登入 Google Colab。請執行：`uv run cstudio login url`", flush=True)
         sys.exit(1)
