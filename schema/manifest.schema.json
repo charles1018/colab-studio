@@ -1,128 +1,321 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Studio also checks unique and portable job IDs, file paths and availability, integer JSON literals, and sigma order and range.",
   "title": "Colab Studio Batch Manifest",
   "type": "object",
-  "required": ["jobs"],
+  "required": [
+    "jobs"
+  ],
+  "allOf": [
+    {
+      "$ref": "#/$defs/shared"
+    }
+  ],
   "properties": {
+    "$schema": {
+      "$ref": "#/$defs/nonblank"
+    },
+    "_gpu": {
+      "$ref": "#/$defs/nonblank",
+      "description": "GPU label saved by the Web UI."
+    },
     "model": {
-      "type": "string",
-      "default": "qwen-image-2.1-turbo",
-      "enum": ["qwen-image-2.1-turbo", "qwen-image-2.1-turbo-gguf", "qwen21"]
-    },
-    "quant": {
-      "type": "string",
-      "default": "INT8",
-      "enum": ["INT8", "BF16", "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_XL", "Q4_K_S", "Q4_K_M", "Q5_K_S", "Q5_K_M", "Q6_K", "Q6_K_XL", "Q8_0", "F16"]
-    },
-    "refine_prompt": {
-      "type": "boolean",
-      "default": false,
-      "description": "Enable official Qwen 3.5 9B Prompt Enhancer for all jobs unless overridden per job."
-    },
-    "pe_variant": {
-      "type": "string",
-      "default": "int8",
-      "enum": ["int8", "w4a8"]
-    },
-    "text_encoder_variant": {
-      "type": "string",
-      "default": "int8",
-      "enum": ["int8", "w4a8"]
-    },
-    "aspect_ratio": {
-      "type": "string",
-      "default": "1:1",
-      "enum": ["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"]
-    },
-    "resolution": {
-      "type": "string",
-      "default": "1K",
-      "enum": ["1K", "2K"]
+      "$ref": "#/$defs/model"
     },
     "jobs": {
       "type": "array",
       "minItems": 1,
       "items": {
-        "type": "object",
-        "required": ["id", "prompt"],
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^[A-Za-z0-9_-]{1,60}$"
+        "$ref": "#/$defs/job"
+      }
+    }
+  },
+  "unevaluatedProperties": false,
+  "$defs": {
+    "model": {
+      "type": "string",
+      "pattern": "^\\s*(?:[qQ][wW][eE][nN]\\-[iI][mM][aA][gG][eE]\\-2\\.1\\-[tT][uU][rR][bB][oO]|[qQ][wW][eE][nN]\\-[iI][mM][aA][gG][eE]\\-2\\.1\\-[tT][uU][rR][bB][oO]\\-[gG][gG][uU][fF]|[qQ][wW][eE][nN]21)\\s*$",
+      "default": "qwen-image-2.1-turbo"
+    },
+    "quant": {
+      "type": "string",
+      "pattern": "^\\s*(?:[qQ]2_[kK]|[qQ]3_[kK]_[sS]|[qQ]3_[kK]_[mM]|[qQ]3_[kK]_[xX][lL]|[qQ]4_[kK]_[sS]|[qQ]4_[kK]_[mM]|[qQ]5_[kK]_[sS]|[qQ]5_[kK]_[mM]|[qQ]6_[kK]|[qQ]6_[kK]_[xX][lL]|[qQ]8_0|[fF]16|[iI][nN][tT]8|[bB][fF]16)\\s*$",
+      "examples": [
+        "INT8",
+        "BF16",
+        "Q4_K_M"
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "pattern": "^\\s*(?:[tT]2[iI]|[eE][dD][iI][tT])\\s*$",
+      "default": "t2i"
+    },
+    "aspect_ratio": {
+      "type": "string",
+      "pattern": "^\\s*(?:1:1|4:3|3:4|3:2|2:3|16:9|9:16)\\s*$"
+    },
+    "resolution": {
+      "type": "string",
+      "pattern": "^\\s*(?:1[kK]|1024|1[mM][pP]|2[kK]|2048|4[mM][pP])\\s*$",
+      "examples": [
+        "1K",
+        "2K"
+      ],
+      "description": "1024 and 1MP mean 1K. 2048 and 4MP mean 2K."
+    },
+    "variant": {
+      "type": "string",
+      "pattern": "^\\s*(?:[iI][nN][tT]8|[wW]4[aA]8)\\s*$",
+      "examples": [
+        "int8",
+        "w4a8"
+      ]
+    },
+    "cache_device": {
+      "type": "string",
+      "pattern": "^\\s*(?:[aA][uU][tT][oO]|[gG][pP][uU]|[cC][pP][uU]|[oO][fF][fF])\\s*$"
+    },
+    "cache_dtype": {
+      "type": "string",
+      "pattern": "^\\s*(?:[dD][eE][fF][aA][uU][lL][tT]|[iI][nN][tT]8|[iI][nN][tT]4)\\s*$"
+    },
+    "sampler": {
+      "type": "string",
+      "pattern": "^\\s*(?:euler|euler_cfg_pp|euler_ancestral|euler_ancestral_cfg_pp|heun|heunpp2|exp_heun_2_x0|exp_heun_2_x0_sde|dpm_2|dpm_2_ancestral|lms|dpm_fast|dpm_adaptive|dpmpp_2s_ancestral|dpmpp_2s_ancestral_cfg_pp|dpmpp_sde|dpmpp_sde_gpu|dpmpp_2m|dpmpp_2m_cfg_pp|dpmpp_2m_sde|dpmpp_2m_sde_gpu|dpmpp_2m_sde_heun|dpmpp_2m_sde_heun_gpu|dpmpp_3m_sde|dpmpp_3m_sde_gpu|ddpm|lcm|ipndm|ipndm_v|deis|cfgpp_ud10_ab|res_multistep|res_multistep_cfg_pp|res_multistep_ancestral|res_multistep_ancestral_cfg_pp|gradient_estimation|gradient_estimation_cfg_pp|er_sde|seeds_2|seeds_3|sa_solver|sa_solver_pece|ddim|uni_pc|uni_pc_bh2)\\s*$",
+      "default": "euler"
+    },
+    "nonblank": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "dimension": {
+      "type": "integer",
+      "minimum": 32,
+      "maximum": 4096
+    },
+    "shared": {
+      "type": "object",
+      "properties": {
+        "quant": {
+          "$ref": "#/$defs/quant"
+        },
+        "refine_prompt": {
+          "type": "boolean"
+        },
+        "thinking": {
+          "type": "boolean"
+        },
+        "pe_max_length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32768,
+          "default": 4096
+        },
+        "pe_variant": {
+          "$ref": "#/$defs/variant"
+        },
+        "text_encoder_variant": {
+          "$ref": "#/$defs/variant"
+        },
+        "aspect_ratio": {
+          "$ref": "#/$defs/aspect_ratio"
+        },
+        "resolution": {
+          "$ref": "#/$defs/resolution"
+        },
+        "cache_device": {
+          "$ref": "#/$defs/cache_device"
+        },
+        "cache_dtype": {
+          "$ref": "#/$defs/cache_dtype"
+        }
+      }
+    },
+    "job": {
+      "type": "object",
+      "required": [
+        "id",
+        "prompt"
+      ],
+      "allOf": [
+        {
+          "$ref": "#/$defs/shared"
+        },
+        {
+          "if": {
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "pattern": "^\\s*(?:[eE][dD][iI][tT])\\s*$"
+              }
+            }
           },
-          "mode": {
-            "type": "string",
-            "default": "t2i",
-            "enum": ["t2i", "edit"]
+          "then": {
+            "required": [
+              "inputs"
+            ],
+            "properties": {
+              "inputs": {
+                "minItems": 1
+              }
+            }
           },
-          "prompt": {
+          "else": {
+            "properties": {
+              "inputs": {
+                "maxItems": 0
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "edit_resolution"
+                  ]
+                },
+                {
+                  "required": [
+                    "custom_size"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "custom_size"
+            ],
+            "properties": {
+              "custom_size": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "width"
+                  ]
+                },
+                {
+                  "required": [
+                    "height"
+                  ]
+                },
+                {
+                  "required": [
+                    "aspect_ratio"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "sampler"
+            ],
+            "properties": {
+              "sampler": {
+                "pattern": "^\\s*(?:ddim)\\s*$"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "seed": {
+                "maximum": 18446744073709551614
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,60}$"
+        },
+        "mode": {
+          "$ref": "#/$defs/mode"
+        },
+        "prompt": {
+          "$ref": "#/$defs/nonblank"
+        },
+        "negative_prompt": {
+          "type": "string",
+          "default": ""
+        },
+        "inputs": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
             "type": "string",
             "minLength": 1
           },
-          "negative_prompt": {
-            "type": "string",
-            "default": ""
-          },
-          "inputs": {
-            "type": "array",
-            "items": { "type": "string" },
-            "maxItems": 10
-          },
-          "quant": {
-            "type": "string",
-            "enum": ["INT8", "BF16", "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_XL", "Q4_K_S", "Q4_K_M", "Q5_K_S", "Q5_K_M", "Q6_K", "Q6_K_XL", "Q8_0", "F16"]
-          },
-          "refine_prompt": {
-            "type": "boolean"
-          },
-          "thinking": {
-            "type": "boolean",
-            "default": true
-          },
-          "pe_max_length": {
-            "type": "integer",
-            "default": 4096
-          },
-          "pe_variant": {
-            "type": "string",
-            "enum": ["int8", "w4a8"]
-          },
-          "transparent": {
-            "type": "boolean",
-            "default": false
-          },
-          "aspect_ratio": {
-            "type": "string",
-            "enum": ["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"]
-          },
-          "resolution": {
-            "type": "string",
-            "enum": ["1K", "2K"]
-          },
-          "width": {
-            "type": "integer",
-            "minimum": 32,
-            "maximum": 4096
-          },
-          "height": {
-            "type": "integer",
-            "minimum": 32,
-            "maximum": 4096
-          },
-          "custom_size": {
-            "type": "boolean"
-          },
-          "edit_resolution": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 4096
-          },
-          "seed": {
-            "type": "integer",
-            "default": 42
-          }
+          "description": "Ordered relative paths, confined to the manifest workspace."
+        },
+        "transparent": {
+          "type": "boolean",
+          "default": false
+        },
+        "width": {
+          "$ref": "#/$defs/dimension"
+        },
+        "height": {
+          "$ref": "#/$defs/dimension"
+        },
+        "custom_size": {
+          "type": "boolean"
+        },
+        "edit_resolution": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "default": 42
+        },
+        "cfg": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 1.0
+        },
+        "sampler": {
+          "$ref": "#/$defs/sampler"
+        },
+        "sigmas": {
+          "type": "string",
+          "pattern": "^\\s*(?:[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:(?:\\s*,\\s*|\\s+)[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))+|\\[\\s*[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:(?:\\s*,\\s*|\\s+)[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+))+\\s*\\])\\s*$",
+          "description": "Comma- or space-separated decimal values, non-negative and strictly decreasing in float32."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647,
+          "description": "Maximum wait per prompt, in seconds."
         }
-      }
+      },
+      "dependentRequired": {
+        "width": [
+          "height"
+        ],
+        "height": [
+          "width"
+        ]
+      },
+      "unevaluatedProperties": false
     }
   }
 }

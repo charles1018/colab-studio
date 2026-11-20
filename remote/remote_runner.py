@@ -34,7 +34,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cancel import CANCEL_PROTOCOL, cancel_marker  # noqa: E402
-from job_paths import JOB_ID, SHA256, confined_path, file_sha256  # noqa: E402
+from job_paths import JOB_ID, RUN_ID, SHA256, confined_path, file_sha256  # noqa: E402
+from manifest import normalize_manifest, normalize_quant, parse_manifest  # noqa: E402
 from models import get_model_plugin  # noqa: E402
 
 JOB = Path(os.environ.get("CSTUDIO_DIR", "/content/cstudio"))
@@ -1000,14 +1001,31 @@ def collect_output_image(history_entry: dict, dest_path: Path, *, save_node: str
 def run_batch():
     manifest_path = confined_path(JOB, "manifest.json")
     manifest_bytes = manifest_path.read_bytes()
-    manifest = json.loads(manifest_bytes)
-    if MANAGED_RUN_ID and manifest.get("_run_id") != MANAGED_RUN_ID:
+    data = parse_manifest(manifest_bytes.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("遠端 manifest 頂層必須是 JSON object")
+    run_id = data.pop("_run_id", None)
+    if MANAGED_RUN_ID and run_id != MANAGED_RUN_ID:
         raise RuntimeError("遠端 manifest 與執行中的批次不符")
-    STATE["run_id"] = manifest.get("_run_id")
+    if run_id is not None and (not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id)):
+        raise ValueError("遠端 manifest 的批次 ID 不合法")
+    STATE["run_id"] = run_id
     save()
     check_cancel()
-    jobs = manifest.get("jobs") or []
-    report_execution = manifest.get("_fingerprint_version") == 2
+    cli_quant = data.pop("_cli_quant", None)
+    pin_versions = data.pop("_pin_versions", True)
+    wants_model_pins = data.pop("_pin_models", True)
+    fingerprint_version = data.pop("_fingerprint_version", 1)
+    if type(pin_versions) is not bool or type(wants_model_pins) is not bool:
+        raise ValueError("遠端 manifest 的釘選設定必須是布林值")
+    if type(fingerprint_version) is not int or fingerprint_version not in (1, 2):
+        raise ValueError("遠端 manifest 的指紋版本不受支援")
+    manifest, problems = normalize_manifest(data, JOB / "inputs", cli_quant)
+    if problems:
+        raise ValueError("遠端 manifest 驗證未通過：\n- " + "\n- ".join(problems))
+    cli_quant = normalize_quant(cli_quant)
+    jobs = manifest["jobs"]
+    report_execution = fingerprint_version == 2
     input_shas = {}
     if MANAGED_RUN_ID:
         request = _read_record(confined_path(JOB, "request.json")) or {}
@@ -1022,15 +1040,9 @@ def run_batch():
             digest = input_shas.get(image)
             if not isinstance(digest, str) or not SHA256.fullmatch(digest):
                 raise RuntimeError("遠端批次缺少已驗證的參考圖摘要")
-    for job in jobs:
-        jid = job["id"]
-        if not isinstance(jid, str) or not JOB_ID.fullmatch(jid):
-            raise ValueError("遠端 manifest 含有不合法的任務 ID")
-
-    pins = load_pins(manifest)
-    pin_models = pins is not None and bool(manifest.get("_pin_models", True))
+    pins = load_pins({"_pin_versions": pin_versions})
+    pin_models = pins is not None and wants_model_pins
     plugin = get_model_plugin(manifest.get("model"))
-    cli_quant = manifest.get("_cli_quant")
 
     # 1. Install ComfyUI & ComfyUI-GGUF
     environment = install(pins)

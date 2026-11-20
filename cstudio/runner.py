@@ -17,6 +17,7 @@ from typing import Any, Callable
 from filelock import Timeout as LockTimeout
 
 from remote.job_paths import JOB_ID, RUN_ID, bundle_digest, confined_path, file_sha256, json_digest
+from remote.manifest import normalize_manifest, normalize_quant, parse_manifest
 
 from . import colab_client as C
 from .redact import redact, redact_diagnostics
@@ -29,76 +30,11 @@ ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / "remote"
 OUTPUT_RECOVERY_TIMEOUT = 120
 sys.path.insert(0, str(REMOTE))
-from models import DEFAULT_MODEL, SUPPORTED_MODELS, get_model_plugin  # noqa: E402
-
-
-def check_ref(base: Path, f: str, jid: str = "") -> str | None:
-    who = f"{jid}：" if jid else ""
-    try:
-        confined_path(base, f)
-    except FileNotFoundError:
-        return f"{who}找不到輸入圖片 {f!r}（相對於 {base}）"
-    except (OSError, ValueError) as exc:
-        return f"{who}無法使用輸入圖片 {f!r}：{exc}"
-    return None
+from models import DEFAULT_MODEL, get_model_plugin  # noqa: E402
 
 
 def validate_manifest(manifest: dict[str, Any], base_dir: Path, cli_quant: str | None = None) -> list[str]:
-    problems: list[str] = []
-    if not isinstance(manifest, dict):
-        return ["manifest 頂層必須是 JSON object"]
-    model_name = str(manifest.get("model") or DEFAULT_MODEL).strip().lower()
-    if model_name not in SUPPORTED_MODELS:
-        problems.append(f"不支援的模型 {model_name!r}（可用：{', '.join(SUPPORTED_MODELS)}）")
-        return problems
-
-    plugin = get_model_plugin(model_name)
-    jobs = manifest.get("jobs")
-    if not isinstance(jobs, list) or not jobs:
-        problems.append("manifest 的 jobs 不能為空")
-        return problems
-
-    seen: set[str] = set()
-    for j in jobs:
-        if not isinstance(j, dict):
-            problems.append("jobs 內每個項目都必須是 JSON object")
-            continue
-        raw_id = j.get("id")
-        if not isinstance(raw_id, str) or not JOB_ID.fullmatch(raw_id):
-            problems.append(f"id 必須是字串且只能用英數、- 和 _（1～60 字元）：{raw_id!r}")
-            continue
-        jid = raw_id
-        if jid in seen:
-            problems.append(f"id 重複：{jid}")
-        seen.add(jid)
-
-        mode = str(j.get("mode", "t2i")).strip().lower()
-        if mode not in ("t2i", "edit"):
-            problems.append(f"{jid}：mode 必須是 't2i' 或 'edit'（收到 {mode!r}）")
-
-        if not str(j.get("prompt", "")).strip():
-            problems.append(f"{jid}：缺少 prompt")
-
-        inputs = j.get("inputs") or []
-        if not isinstance(inputs, list):
-            problems.append(f"{jid}：inputs 必須是陣列")
-            inputs = []
-        if mode == "edit" and not (1 <= len(inputs) <= 10):
-            problems.append(f"{jid}：edit 模式需要 1～10 張參考圖片（收到 {len(inputs)} 張）")
-        if mode == "t2i" and inputs:
-            problems.append(f"{jid}：t2i 模式不可提供 inputs（若要改圖請設 mode='edit'）")
-
-        for f in inputs:
-            bad = check_ref(base_dir, f, jid)
-            if bad:
-                problems.append(bad)
-
-        # Test graph building offline to catch invalid quant, aspect_ratio, resolution, or PE variant early
-        try:
-            plugin.build_qwen21_graph(j, manifest=manifest, cli_quant=cli_quant)
-        except Exception as e:
-            problems.append(f"{jid}：{e}")
-
+    _, problems = normalize_manifest(manifest, base_dir, cli_quant)
     return problems
 
 
@@ -122,12 +58,12 @@ def load_manifest(
     except (OSError, RuntimeError, ValueError) as exc:
         _fail(f"無法使用 manifest 檔案 {p}：{exc}", exit_on_error)
     try:
-        m = json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:
-        _fail(f"manifest JSON 格式錯誤（{p}）：{e}", exit_on_error)
-    problems = validate_manifest(m, base, cli_quant=cli_quant)
+        data = parse_manifest(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as exc:
+        _fail(f"manifest JSON 格式錯誤（{p}）：{redact(str(exc))}", exit_on_error)
+    m, problems = normalize_manifest(data, base, cli_quant)
     if problems:
-        _fail("manifest 驗證未通過，沒有開機：\n- " + "\n- ".join(problems), exit_on_error)
+        _fail("manifest 驗證未通過，沒有開機：\n- " + redact("\n- ".join(problems)), exit_on_error)
     return m, base
 
 
@@ -287,6 +223,7 @@ def plan_batch(
     *, pin_versions: bool = True, pin_models: bool = True,
 ) -> dict[str, Any]:
     m, base = load_manifest(manifest_path, cli_quant=cli_quant)
+    cli_quant = normalize_quant(cli_quant)
     plugin = get_model_plugin(m.get("model"))
     try:
         _, todo, done_ids, stale = classify_jobs(m, base, cli_quant=cli_quant, gpu=gpu,
@@ -453,6 +390,7 @@ REMOTE_CODE_FILES = (
     "__init__.py",
     "cancel.py",
     "job_paths.py",
+    "manifest.py",
     "remote_runner.py",
     "versions.json",
     "models/__init__.py",
@@ -555,6 +493,7 @@ def run_manifest(
         except ValueError as exc:
             _fail(str(exc), exit_on_error)
     m, base = load_manifest(manifest_path, cli_quant=cli_quant, exit_on_error=exit_on_error)
+    cli_quant = normalize_quant(cli_quant)
     pin_versions = bool(pin_versions)
     pin_models = pin_versions and bool(pin_models)
     try:

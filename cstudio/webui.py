@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import re
 import secrets
@@ -22,6 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from remote.job_paths import confined_path, relative_parts
+from remote.manifest import MODES, normalize_manifest, normalize_resolution
 
 from . import colab_client as C
 from . import colab_login as L
@@ -640,17 +642,13 @@ async def require_local_ui_access(request: Request, call_next):
     return response
 
 
-def parse_bool_form(val: Any, default: bool = False) -> bool:
-    if isinstance(val, bool):
-        return val
-    if val is None:
-        return default
-    s = str(val).strip().lower()
+def parse_bool_form(val: str, field: str) -> bool:
+    s = val.strip().lower()
     if s in ("1", "true", "yes", "on"):
         return True
     if s in ("0", "false", "no", "off", ""):
         return False
-    return default
+    raise HTTPException(status_code=400, detail=f"{field} 必須是布林值")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -966,7 +964,7 @@ async def api_run_start(
         raise HTTPException(status_code=401, detail="無法確認 Colab 登入身分，請重新登入")
 
     mode_clean = str(mode or "t2i").strip().lower()
-    if mode_clean not in ("t2i", "edit"):
+    if mode_clean not in MODES:
         raise HTTPException(status_code=400, detail=f"不支援的生圖模式：{mode_clean!r}")
 
     prompt_clean = str(prompt or "").strip()
@@ -978,24 +976,22 @@ async def api_run_start(
         raise HTTPException(status_code=400, detail=f"不支援的 GPU：{gpu_clean!r}")
 
     quant_clean = str(quant or Q.DEFAULT_QUANT).strip().upper()
-    if quant_clean not in Q.VALID_QUANTS:
-        raise HTTPException(status_code=400, detail=f"不支援的權重規格：{quant_clean!r}")
-
     pe_var_clean = str(pe_variant or "int8").strip().lower()
-    if pe_var_clean not in ("int8", "w4a8"):
-        raise HTTPException(status_code=400, detail=f"不支援的 Prompt Enhancer 規格：{pe_var_clean!r}")
 
     ar_clean = str(aspect_ratio or "1:1").strip()
     if ar_clean not in Q.ASPECT_RATIOS_2K:
         raise HTTPException(status_code=400, detail=f"不支援的長寬比：{ar_clean!r}")
 
-    res_clean = str(resolution or "1K").strip().upper()
-    if res_clean not in ("1K", "2K"):
-        raise HTTPException(status_code=400, detail=f"不支援的解析度：{res_clean!r}")
+    try:
+        res_clean = normalize_resolution(resolution)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"不支援的解析度：{exc}") from exc
 
-    refine_bool = parse_bool_form(refine_prompt, False)
-    transparent_bool = parse_bool_form(transparent, False)
-    stop_after_bool = parse_bool_form(stop_after, False)
+    refine_bool = parse_bool_form(refine_prompt, "refine_prompt")
+    transparent_bool = parse_bool_form(transparent, "transparent")
+    stop_after_bool = parse_bool_form(stop_after, "stop_after")
+    if not math.isfinite(idle_minutes):
+        raise HTTPException(status_code=400, detail="idle_minutes 必須是有限數字")
     idle_mins = max(1.0, min(240.0, float(idle_minutes or 15.0)))
 
     seed_str = str(seed or "").strip()
@@ -1004,8 +1000,6 @@ async def api_run_start(
             seed_int = int(seed_str)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"種子碼 (Seed) 必須為整數：{seed_str!r}") from e
-        if not (0 <= seed_int <= 2**63 - 1):
-            raise HTTPException(status_code=400, detail=f"種子碼 (Seed) 必須為 0 ～ {2**63 - 1} 之間的正整數")
     else:
         seed_int = random.randint(1, 2_147_483_647)
 
@@ -1016,14 +1010,15 @@ async def api_run_start(
     folder_name = f"webui_{ts_str}_{custom_slug}_{short_uid}" if custom_slug else f"webui_{ts_str}_{short_uid}"
 
     resolved_sources: list[UploadFile | Path] = []
+    try:
+        order_spec = json.loads(ref_order or "[]")
+    except (ValueError, RecursionError) as exc:
+        raise HTTPException(status_code=400, detail="ref_order 必須是參考圖順序陣列") from exc
+    if not isinstance(order_spec, list):
+        raise HTTPException(status_code=400, detail="ref_order 必須是參考圖順序陣列")
+    if mode_clean == "t2i" and (order_spec or ref_files):
+        raise HTTPException(status_code=400, detail="T2I 不接受參考圖")
     if mode_clean == "edit":
-        try:
-            order_spec = json.loads(ref_order or "[]")
-            if not isinstance(order_spec, list):
-                order_spec = []
-        except Exception:
-            order_spec = []
-
         # Map uploaded files by their client-side key or index
         upload_idx = 0
         if order_spec:
@@ -1031,13 +1026,17 @@ async def api_run_start(
                 raise HTTPException(status_code=400, detail=f"改圖最多接受 {MAX_REFERENCES} 張參考圖片")
             for item in order_spec:
                 if not isinstance(item, dict):
-                    continue
+                    raise HTTPException(status_code=400, detail="ref_order 包含無效的參考圖項目")
                 kind = item.get("kind")
                 if kind == "upload" and upload_idx < len(ref_files):
                     resolved_sources.append(ref_files[upload_idx])
                     upload_idx += 1
-                elif kind == "artifact" and item.get("artifact_id"):
+                elif kind == "artifact" and isinstance(item.get("artifact_id"), str) and item["artifact_id"]:
                     resolved_sources.append(resolve_artifact_to_path(item["artifact_id"]))
+                else:
+                    raise HTTPException(status_code=400, detail="ref_order 與提供的參考圖不符")
+            if upload_idx != len(ref_files):
+                raise HTTPException(status_code=400, detail="ref_order 與提供的參考圖不符")
         else:
             resolved_sources.extend(ref_files)
 
@@ -1077,9 +1076,11 @@ async def api_run_start(
             job_spec["custom_size"] = True
             job_spec["aspect_ratio"] = ar_clean
             job_spec["resolution"] = res_clean
-        else:
+        elif sizing == "match_1k":
             job_spec["edit_resolution"] = 1024
             job_spec["custom_size"] = False
+        else:
+            raise HTTPException(status_code=400, detail="不支援的 Edit 尺寸策略")
 
     manifest_data: dict[str, Any] = {
         "model": "qwen-image-2.1-turbo",
@@ -1087,6 +1088,9 @@ async def api_run_start(
         "_gpu": gpu_clean,
         "jobs": [job_spec],
     }
+    manifest_data, problems = normalize_manifest(manifest_data, None)
+    if problems:
+        raise HTTPException(status_code=400, detail=redact("任務設定驗證未通過：\n- " + "\n- ".join(problems)))
 
     # The runner selects automatic reuse from the authenticated assignment listing.
     req_sess = str(session or "").strip()
@@ -1111,7 +1115,7 @@ async def api_run_start(
                 await prepare_reference_images(resolved_sources, inputs_folder)
             problems = R.validate_manifest(manifest_data, staged_job)
             if problems:
-                raise HTTPException(status_code=400, detail="任務設定驗證未通過：\n- " + "\n- ".join(problems))
+                raise HTTPException(status_code=400, detail=redact("任務設定驗證未通過：\n- " + "\n- ".join(problems)))
             (staged_job / "manifest.json").write_text(
                 json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8",
             )

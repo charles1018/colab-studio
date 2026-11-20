@@ -17,8 +17,9 @@ from PIL import Image
 from starlette.concurrency import run_in_threadpool
 from starlette.formparsers import MultiPartException, MultiPartParser, parse_options_header
 
+from remote.manifest import MAX_REFERENCES
+
 MIB = 1024 * 1024
-MAX_REFERENCES = 10
 MAX_REFERENCE_BYTES = 35 * MIB
 MAX_FORM_BYTES = 2 * MIB
 MAX_REQUEST_BYTES = MAX_REFERENCES * MAX_REFERENCE_BYTES + MAX_FORM_BYTES

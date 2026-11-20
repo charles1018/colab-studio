@@ -9,11 +9,13 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.parse import urlencode
 
 from PIL import Image
 
 from cstudio import web_inputs as U
 from cstudio import webui as W
+from remote.manifest import MAX_SEED
 
 
 HOST = "127.0.0.1:7860"
@@ -390,6 +392,61 @@ class WebUIAccessTests(unittest.IsolatedAsyncioTestCase):
             reply = await self.request("/api/run/start", method="POST", headers=headers, body=b"prompt=Synthetic+scene")
         self.assertEqual(reply.status, 202, reply.body)
         self.run_manifest.assert_called_once()
+
+    async def test_invalid_form_fields_do_not_create_a_manifest_or_start_a_worker(self):
+        cookie = await self.open_ui()
+        headers = (cookie, ("origin", ORIGIN), UI_HEADER, ("content-type", "application/x-www-form-urlencoded"))
+        for bad, field in (
+            ({"seed": str(MAX_SEED + 1)}, "seed"), ({"seed": "-1"}, "seed"),
+            ({"seed": "1.0"}, "種子碼"), ({"refine_prompt": "maybe"}, "refine_prompt"),
+            ({"quant": "typo"}, "quant"), ({"pe_variant": "typo"}, "pe_variant"),
+            ({"idle_minutes": "nan"}, "idle_minutes"),
+        ):
+            with self.subTest(bad=bad):
+                response = await self.request(
+                    "/api/run/start", method="POST", headers=headers,
+                    body=urlencode({"prompt": "Synthetic scene", **bad}).encode(),
+                )
+                self.assertEqual(response.status, 400, response.body)
+                self.assertIn(field, json.loads(response.body)["detail"])
+                self.assert_no_effects()
+
+    async def test_form_normalizes_aliases_and_preserves_full_unsigned_seed(self):
+        cookie = await self.open_ui()
+        self.enterContext(patch.object(W, "threading", SimpleNamespace(
+            Thread=lambda *, target, **_: SimpleNamespace(start=target),
+        )))
+        headers = (cookie, ("origin", ORIGIN), UI_HEADER, ("content-type", "application/x-www-form-urlencoded"))
+        response = await self.request(
+            "/api/run/start", method="POST", headers=headers, body=urlencode({
+                "prompt": "Synthetic scene", "seed": str(MAX_SEED), "quant": " q4_k_m ",
+                "resolution": " 4mp ", "refine_prompt": "on", "pe_variant": "W4A8",
+            }).encode(),
+        )
+        self.assertEqual(response.status, 202, response.body)
+        reply = json.loads(response.body)
+        self.assertEqual(reply["seed"], str(MAX_SEED))
+        manifest = self.jobs / reply["job_dir"] / "manifest.json"
+        job = json.loads(manifest.read_text())["jobs"][0]
+        self.assertEqual((job["seed"], job["quant"], job["resolution"], job["pe_variant"]),
+                         (MAX_SEED, "Q4_K_M", "2K", "w4a8"))
+        self.assertIs(job["refine_prompt"], True)
+        self.run_manifest.assert_called_once()
+
+    async def test_edit_rejects_unknown_sizing_and_incomplete_reference_order(self):
+        cookie = await self.open_ui()
+        image = image_bytes()
+        for files, fields, message in (
+            ((image,), (("edit_sizing", "typo"),), "尺寸策略"),
+            ((image,), (("ref_order", '{"kind":"upload"}'),), "ref_order"),
+            ((image, image), (("ref_order", '[{"kind":"upload"}]'),), "ref_order"),
+            ((image,), (("ref_order", '[{"kind":"upload"},{"kind":"upload"}]'),), "ref_order"),
+        ):
+            with self.subTest(fields=fields, files=len(files)):
+                response = await self.submit_form(cookie, edit_form(files, fields=fields))
+                self.assertEqual(response.status, 400, response.body)
+                self.assertIn(message, json.loads(response.body)["detail"])
+                self.assert_no_effects()
 
     async def test_empty_truncated_and_unsupported_images_leave_no_job(self):
         cookie = await self.open_ui()

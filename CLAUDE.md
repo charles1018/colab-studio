@@ -113,6 +113,11 @@ uv run cstudio sheet jobs/demo_qwen21/out/*.png
   ]
 }
 ```
+
+CLI、工作台與 Colab worker 使用共用的 [manifest 驗證規則](schema/manifest.schema.json)。布林值與數字請用 JSON 原生型別，`width` 與 `height` 要成對指定（32～4096，生成時對齊 32）。欄位拼錯、重複或用在錯誤層級時會收到錯誤。量化、模型與解析度接受既有別名，例如 `qwen21`、`q4_k_m`、`1MP` 和 `2048`。
+
+進階任務可指定 `cfg`、`sampler`、`sigmas` 與單張等待秒數 `timeout`。自訂 `sigmas` 使用逗號或空白分隔的十進位數字，至少兩項，依序遞減且非負。模型快取與 PE 設定可放在頂層作預設值，再由各任務覆寫。
+
 - **改圖 (`mode: "edit"`) 提示詞規則**：
   - `inputs` 每項使用相對於 manifest 資料夾的路徑，以 `/` 分隔。可用同一資料夾的檔案與巢狀子目錄。跨 Job 沿用圖片時，可從網頁畫廊選取作品，工作台會複製到新 Job 的 `inputs/`。
   - 單張參考圖時直接描述如何修改該圖（或使用 `<image1>`）。
