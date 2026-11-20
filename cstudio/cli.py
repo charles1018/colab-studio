@@ -10,6 +10,7 @@ from . import colab_client as C
 from . import colab_login as L
 from . import runner as R
 from . import selftest as T
+from .redact import redact
 
 def cmd_check(_args):
     exe = C.colab_exe()
@@ -145,6 +146,26 @@ def cmd_cancel(args):
         sys.exit(f"無法確認 {session} 的批次 {run_id} 已停止（{state}）")
 
 
+def cmd_recover(args):
+    try:
+        report = R.recover_outputs(args.manifest, args.run_id)
+    except (OSError, RuntimeError, ValueError) as exc:
+        sys.exit(redact(str(exc)))
+    print(f"批次 {args.run_id} 的成果補抓", flush=True)
+    for key, label in (
+        ("synced", "已補抓"), ("already_synced", "已在本機並通過驗證"), ("pending", "待確認或待完成"),
+        ("unavailable", "遠端已無法補抓"), ("superseded", "本機已有其他批次的成果"),
+    ):
+        if report[key]:
+            print(f"  {label}：{', '.join(report[key])}", flush=True)
+    if report.get("remote_error"):
+        print(report["remote_error"], flush=True)
+    for jid, error in report["errors"].items():
+        print(f"  {jid}：{error}", flush=True)
+    if report["pending"] or report["unavailable"] or report["errors"]:
+        sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="cstudio",
@@ -178,6 +199,10 @@ def main():
     p_run.add_argument("--no-pin-models", action="store_true", help="略過 Hugging Face 模型的 revision、大小與 SHA-256 釘選")
     p_run.add_argument("--assign-retries", type=int, default=5)
     p_run.add_argument("--assign-wait", type=int, default=120)
+
+    p_recover = sub.add_parser("recover", help="從原 Colab runtime 補抓指定批次已完成的成果")
+    p_recover.add_argument("manifest", help="原工作目錄的 manifest.json 路徑")
+    p_recover.add_argument("--run-id", required=True, help="執行時顯示的批次 ID")
 
     sub.add_parser("sessions", help="列出目前帳號上開啟中的 Colab GPU 與自動關機倒數")
 
@@ -239,6 +264,8 @@ def main():
             )
         except R.RunCancelled as exc:
             sys.exit(str(exc))
+    elif args.cmd == "recover":
+        cmd_recover(args)
     elif args.cmd == "sessions":
         cmd_sessions(args)
     elif args.cmd == "keep":

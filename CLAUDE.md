@@ -30,6 +30,7 @@ uv run cstudio run jobs/demo_qwen21/manifest.json --gpu L4 [--quant Q4_K_M] [--s
 uv run cstudio sessions                          # 查看開啟中的 GPU 與自動關機倒數
 uv run cstudio keep --session NAME --minutes 60  # 延長保留 GPU
 uv run cstudio cancel --session NAME             # 中斷雲端執行中的任務，但保留 GPU 與已載入模型
+uv run cstudio recover jobs/demo_qwen21/manifest.json --run-id RUN_ID  # 補抓該批次已完成的圖
 uv run cstudio stop --session NAME               # 立即關閉指定 GPU（或加 --all 關閉所有本工具開啟的機器）
 
 # 啟動本地輕量 Web UI 工作台（預設 http://127.0.0.1:7860）
@@ -41,6 +42,8 @@ uv run cstudio sheet jobs/demo_qwen21/out/*.png
 ```
 
 `cancel` 先送出指定批次的取消要求，確認遠端任務停止後才回報完成。CLI 回報等待確認時，可用 `cancel --session NAME --run-id RUN_ID` 再查同一批次。取消確認前，原有的 GPU 回收期限繼續適用。
+
+批次中斷後，可使用當時 CLI 或工作台日誌中的批次 ID 和原工作目錄執行 `recover`。每次會補抓原 runtime 已完成且通過大小及 SHA-256 驗證的圖片。仍在執行或暫時失聯時可以重試。補抓沿用原 Colab 授權及 runtime，並受原回收期限約束。原 runtime 已消失時，仍可完成中斷前已驗證並寫入本機發布紀錄的圖片。此功能適用於已保存 `out/.runs/<run_id>/request.json` 的批次。
 
 `stop --all` 只關閉 Colab Studio 已登記的 Session。要關閉外部 Session，請明確指定 `--session NAME`。CLI 只有在所有目標均確認已關閉時才回傳成功，未確認的自有 Session 會保留 watchdog 重試紀錄。
 

@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -10,6 +11,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
+
+from PIL import Image
 
 from cstudio import colab_client as C
 from cstudio import runner as R
@@ -108,6 +111,7 @@ class RuntimeAllocationTests(unittest.TestCase):
             "stage": "done",
             "jobs": {"test": {
                 "status": "done", "file": "out/test.png",
+                "bytes": len(self.image_bytes),
                 "sha256": hashlib.sha256(self.image_bytes).hexdigest(),
             }},
         }
@@ -480,6 +484,278 @@ class RuntimeAllocationTests(unittest.TestCase):
         self.assertEqual(result["jobs"]["test"]["status"], "sync_error")
         self.assertNotIn("download", self.commands)
         self.assertFalse((self.result_path.parent / "test.png").exists())
+
+    def test_disconnect_recovers_only_completed_jobs_from_the_original_run(self):
+        with io.BytesIO() as image:
+            Image.new("RGB", (4, 4), "blue").save(image, format="PNG")
+            self.image_bytes = image.getvalue()
+        self.manifest.write_text(json.dumps({"jobs": [
+            {"id": jid, "prompt": jid} for jid in ("first", "second", "third")
+        ]}), encoding="utf-8")
+        first = dict(self.done_status()["jobs"]["test"], file="out/first.png")
+        second = dict(first, file="out/second.png")
+        self.status.side_effect = [
+            {"done": False, "jobs": {"first": first}},
+            OSError("disconnected"),
+            {"done": False, "jobs": {"first": first, "second": second, "unexpected": second}},
+            {"done": True, "jobs": {"first": first, "second": second}},
+        ]
+        with self.assertRaisesRegex(OSError, "disconnected"):
+            self.run_manifest()
+        old = json.loads(self.result_path.read_text())
+        run_id = old["run_id"]
+        self.assertEqual(set(old["jobs"]), {"first"})
+        self.assertEqual(C.keep_info(self.session)["busy_until"], 8_200)
+        self.assertNotIn("stop", self.commands)
+        self.assertIn(run_id, self.log.getvalue())
+        self.manifest.unlink()  # Recovery uses the saved job snapshot and fingerprints.
+
+        self.commands.clear()
+        recovered = R.recover_outputs(self.manifest, run_id)
+        self.assertEqual(recovered["synced"], ["second"])
+        self.assertEqual(recovered["already_synced"], ["first"])
+        self.assertEqual(recovered["pending"], ["third"])
+        self.assertEqual(self.commands, ["sessions", "download"])
+        _, _, _, remote_file, _ = C.colab.call_args.args
+        self.assertEqual(remote_file, f"{C.REMOTE_ROOT}/runs/{run_id}/out/second.png")
+        self.assertEqual(C.colab.call_args.kwargs["endpoint"], self.endpoint)
+        results = json.loads(self.result_path.read_text())
+        self.assertEqual(results["jobs"]["first"], old["jobs"]["first"])
+        self.assertEqual(results["jobs"]["second"]["bundle_hash"], self.bundle_hash)
+        self.assertTrue(results["jobs"]["second"]["local_synced"])
+        self.assertEqual((self.result_path.parent / "second.png").read_bytes(), self.image_bytes)
+        self.assertFalse((self.result_path.parent / "unexpected.png").exists())
+        self.commands.clear()
+        repeat = R.recover_outputs(self.manifest, run_id)
+        self.assertEqual(repeat["already_synced"], ["first", "second"])
+        self.assertIn("原批次已結束", repeat["errors"]["third"])
+        self.assertEqual(self.commands, ["sessions"])
+
+    def test_recovery_refuses_wrong_account_runtime_run_and_bundle(self):
+        self.status.return_value = {"done": True, "alive": False, "jobs": {}}
+        run_id = self.run_manifest()["run_id"]
+
+        def recover():
+            self.commands.clear()
+            C.poll_remote_status.reset_mock()
+            report = R.recover_outputs(self.manifest, run_id)
+            self.assertNotIn("download", self.commands)
+            return report
+
+        C.account_scope.return_value = "foreign"
+        self.assertIn("登入身分", recover()["remote_error"])
+        self.assertEqual(self.commands, [])
+        C.account_scope.return_value = "fixture-account"
+        self.runtimes[self.session] = "replacement"
+        self.assertEqual(recover()["unavailable"], ["test"])
+        C.poll_remote_status.assert_not_called()
+        with patch.object(C, "sessions", return_value=([], "")):
+            unknown = recover()
+        self.assertEqual(unknown["pending"], ["test"])
+        self.assertIn("無法確認", unknown["remote_error"])
+        self.runtimes[self.session] = self.endpoint
+
+        for wrong in ({"run_id": "f" * 12}, {"bundle_hash": "f" * 64}):
+            with self.subTest(wrong=wrong):
+                self.status.return_value = dict(self.done_status(), **wrong)
+                self.assertIn("批次 ID 或程式版本不符", recover()["remote_error"])
+        self.status.return_value = {"stage": "not started", "jobs": {}, "bundle_hash": None}
+        self.assertEqual(recover()["unavailable"], ["test"])
+        self.status.return_value = None
+        self.assertEqual(recover()["pending"], ["test"])
+        C.set_keep(self.session, self.now + 30, extra={"release_pending": True})
+        self.assertIn("正在關機", recover()["remote_error"])
+        C.poll_remote_status.assert_not_called()
+
+    def test_bad_receipts_and_bytes_preserve_the_previous_pair(self):
+        old = self.run_manifest()["jobs"]["test"]
+        old_image = self.image_bytes
+        self.image_bytes = b"new fixture image"
+        good = self.done_status()["jobs"]["test"]
+        cases = (
+            ({key: value for key, value in good.items() if key != "sha256"}, 0, "缺少有效的 SHA-256"),
+            (dict(good, sha256="wrong"), 0, "缺少有效的 SHA-256"),
+            (dict(good, sha256="f" * 64), 3, "SHA-256 不符"),
+            (dict(good, bytes=True), 0, "缺少有效的檔案大小"),
+            (dict(good, bytes=1), 3, "檔案大小不符"),
+        )
+        for info, attempts, message in cases:
+            with self.subTest(message=message, info=info):
+                self.commands.clear()
+                self.status.return_value = dict(self.done_status(), jobs={"test": info})
+                failed = self.run_manifest(force=True)
+                self.assertEqual(self.commands.count("download"), attempts)
+                self.assertIn(message, failed["job_errors"]["test"]["error"])
+                self.assertEqual(failed["jobs"]["test"], old)
+                self.assertEqual((self.result_path.parent / "test.png").read_bytes(), old_image)
+                self.assertIn(message, R.recover_outputs(self.manifest, failed["run_id"])["errors"]["test"])
+                self.assertEqual(self.commands.count("download"), attempts + bool(attempts))
+
+    def test_interrupted_download_retries_with_an_independent_file(self):
+        destinations = []
+
+        def download(command, *args, **options):
+            if command == "download":
+                path = Path(args[-1])
+                destinations.append(path)
+                self.assertFalse(path.exists())
+                if len(destinations) <= 3:
+                    path.write_bytes(b"partial")
+                    raise OSError("download interrupted")
+            return self.fake_colab(command, *args, **options)
+
+        C.colab.side_effect = download
+        result = self.run_manifest()
+        self.assertEqual(result["jobs"]["test"]["status"], "sync_error")
+        self.assertFalse((self.result_path.parent / "test.png").exists())
+        report = R.recover_outputs(self.manifest, result["run_id"])
+        self.assertEqual(report["synced"], ["test"])
+        self.assertEqual(len(set(destinations)), 4)
+        self.assertFalse(any(path.exists() for path in destinations))
+        self.commands.clear()
+        self.assertEqual(R.recover_outputs(self.manifest, result["run_id"])["already_synced"], ["test"])
+        self.assertEqual(self.commands, [])
+
+    def test_failed_metadata_replace_rolls_back_picture_and_replays_without_runtime(self):
+        previous = self.run_manifest()["jobs"]["test"]
+        old_image = self.image_bytes
+        self.image_bytes = b"new fixture image"
+        self.status.return_value = self.done_status()
+        replace = Path.replace
+
+        def fail_metadata(path, dest):
+            if dest == self.result_path:
+                jobs = json.loads(path.read_text())["jobs"]
+                if jobs["test"]["sha256"] != previous["sha256"]:
+                    raise OSError("results.json replace interrupted")
+            return replace(path, dest)
+
+        self.commands.clear()
+        with patch.object(Path, "replace", fail_metadata):
+            result = self.run_manifest(force=True)
+        self.assertEqual(self.commands.count("download"), 1)
+        self.assertEqual(json.loads(self.result_path.read_text())["jobs"]["test"], previous)
+        self.assertEqual((self.result_path.parent / "test.png").read_bytes(), old_image)
+        self.runtimes.clear()
+        self.commands.clear()
+        self.assertEqual(R.recover_outputs(self.manifest, result["run_id"])["synced"], ["test"])
+        self.assertEqual(self.commands, [])
+        stored = json.loads(self.result_path.read_text())["jobs"]["test"]
+        self.assertEqual(stored["run_id"], result["run_id"])
+        self.assertEqual((self.result_path.parent / "test.png").read_bytes(), self.image_bytes)
+
+    def test_worker_exit_after_image_replace_can_finish_from_local_journal(self):
+        previous = self.run_manifest()["jobs"]["test"]
+        old_image = self.image_bytes
+        self.image_bytes = b"new fixture image"
+        self.status.return_value = self.done_status()
+        replace = Path.replace
+        image_path = self.result_path.with_name("test.png")
+
+        def fail_image(path, dest):
+            if dest == image_path:
+                raise OSError("image replace interrupted")
+            return replace(path, dest)
+
+        self.manifest.write_text(json.dumps({"jobs": [{"id": "test", "prompt": "a different tree"}]}))
+        with patch.object(Path, "replace", fail_image):
+            result = self.run_manifest(remake_stale=True)
+        self.assertEqual(image_path.read_bytes(), old_image)
+        run_id = result["run_id"]
+        child = subprocess.run(
+            [sys.executable, "-c", """
+import os
+import sys
+from pathlib import Path
+from cstudio import results as store
+
+base = Path(sys.argv[1])
+run_id = sys.argv[2]
+request = store.read_object(base / 'out' / '.runs' / run_id / 'request.json')
+outputs = store.RunOutputs(base, run_id, request)
+with outputs.lock():
+    results = store.read_object(outputs.results_path)
+    store.save_results = lambda *_: os._exit(73)
+    outputs.publish('test', results, lambda: None)
+""", str(self.directory), run_id],
+            check=False,
+        )
+        self.assertEqual(child.returncode, 73)
+        self.assertEqual(image_path.read_bytes(), self.image_bytes)
+        self.assertEqual(json.loads(self.result_path.read_text())["jobs"]["test"], previous)
+        self.assertEqual((self.result_path.parent / "_stale" / f"test_{run_id}.png").read_bytes(), old_image)
+        self.runtimes.clear()
+        self.commands.clear()
+        self.assertEqual(R.recover_outputs(self.manifest, run_id)["synced"], ["test"])
+        self.assertEqual(self.commands, [])
+        self.assertEqual(json.loads(self.result_path.read_text())["jobs"]["test"]["run_id"], run_id)
+
+    def test_old_recovery_cannot_replace_a_newer_successful_job(self):
+        self.status.return_value = {"done": True, "alive": False, "jobs": {}}
+        missed = self.run_manifest()["run_id"]
+        self.status.return_value = self.done_status()
+        new = self.run_manifest()["jobs"]["test"]
+        self.commands.clear()
+        self.assertEqual(R.recover_outputs(self.manifest, missed)["superseded"], ["test"])
+        self.assertEqual(self.commands, [])
+        self.assertEqual(json.loads(self.result_path.read_text())["jobs"]["test"], new)
+
+    def test_recovery_rechecks_runtime_identity_after_download(self):
+        self.status.return_value = {"done": True, "alive": False, "jobs": {}}
+        run_id = self.run_manifest()["run_id"]
+        self.status.return_value = self.done_status()
+
+        def download(command, *args, **options):
+            result = self.fake_colab(command, *args, **options)
+            if command == "download":
+                self.runtimes[self.session] = "replacement"
+            return result
+
+        C.colab.side_effect = download
+        report = R.recover_outputs(self.manifest, run_id)
+        self.assertIn("識別不符", report["errors"]["test"])
+        self.assertFalse((self.result_path.parent / "test.png").exists())
+        self.assertFalse((self.result_path.parent / ".runs" / run_id / ".result-test.json").exists())
+
+    def test_confirmed_cancel_limits_the_total_time_spent_on_downloads(self):
+        self.manifest.write_text(json.dumps({"jobs": [
+            {"id": jid, "prompt": jid} for jid in ("first", "second")
+        ]}), encoding="utf-8")
+        info = self.done_status()["jobs"]["test"]
+        self.status.return_value = dict(self.done_status(), stage="cancelled", cancel_protocol=1, jobs={
+            jid: dict(info, file=f"out/{jid}.png") for jid in ("first", "second")
+        })
+
+        def download(command, *args, **options):
+            if command == "download":
+                self.assertEqual(options["deadline"], self.now + C.RECOVERY_TIMEOUT)
+                self.advance(C.RECOVERY_TIMEOUT)
+                self.commands.append(command)
+                raise C.ColabDeadline("download deadline")
+            return self.fake_colab(command, *args, **options)
+
+        C.colab.side_effect = download
+        with self.assertRaises(R.RunCancelled):
+            self.run_manifest()
+        self.assertEqual(self.commands.count("download"), 1)
+        self.assertNotIn("stop", self.commands)
+        self.assertEqual(C.keep_info(self.session)["expires"], self.now + 30 * 60)
+
+    def test_stop_during_download_does_not_publish_the_picture(self):
+        def download(command, *args, **options):
+            result = self.fake_colab(command, *args, **options)
+            if command == "download":
+                self.abort = "stop"
+            return result
+
+        C.colab.side_effect = download
+        with self.assertRaises(R.RunStopped) as stopped:
+            self.run_manifest()
+        self.assertEqual(stopped.exception.outcome, C.ReleaseState.CONFIRMED)
+        self.assertFalse((self.result_path.parent / "test.png").exists())
+        self.assertEqual(self.commands.count("download"), 1)
+        run_id = json.loads(self.result_path.read_text())["run_id"]
+        self.assertEqual(R.recover_outputs(self.manifest, run_id)["unavailable"], ["test"])
 
     def test_reuse_owned_runtime_keeps_its_bundle_cache(self):
         self.runtimes[self.session] = self.endpoint

@@ -5,21 +5,24 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import shutil
+import shlex
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from remote.job_paths import JOB_ID, bundle_digest, confined_path
+from filelock import Timeout as LockTimeout
+
+from remote.job_paths import JOB_ID, RUN_ID, bundle_digest, confined_path
 
 from . import colab_client as C
 from .redact import redact, redact_diagnostics
+from .results import RunOutputs, SupersededResult, done_revision, is_sha256, read_object, save_results
 
 ROOT = Path(__file__).resolve().parent.parent
 REMOTE = ROOT / "remote"
+OUTPUT_RECOVERY_TIMEOUT = 120
 sys.path.insert(0, str(REMOTE))
 from models import DEFAULT_MODEL, SUPPORTED_MODELS, get_model_plugin  # noqa: E402
 
@@ -253,17 +256,109 @@ def plan_batch(manifest_path: str | Path, gpu: str = "L4", cli_quant: str | None
     }
 
 
-def save_results(path: Path, data: dict[str, Any]):
-    confined_path(path.parent, path.name, missing_ok=True)
-    tmp = None
+def recover_outputs(manifest_path: str | Path, run_id: str) -> dict:
+    """Resume local publication and fetch completed jobs from the saved runtime."""
+    if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+        raise ValueError("不合法的批次 ID")
+    base = Path(manifest_path).absolute().parent.resolve()
+    path = confined_path(base, f"out/.runs/{run_id}/request.json", missing_ok=True)
+    request = read_object(path)
+    if not request:
+        raise RuntimeError("找不到此批次的補抓紀錄，請核對工作目錄與批次 ID")
+    session, account, endpoint = (request.get(key) for key in ("session", "account_scope", "runtime_endpoint"))
+    jobs = request.get("jobs")
+    if (
+        type(request.get("schema")) is not int or request["schema"] != 1 or request.get("run_id") != run_id
+        or not is_sha256(request.get("bundle_hash"))
+        or not all(isinstance(value, str) and value for value in (session, account, endpoint))
+        or C.sanitize_session_name(session) != session or not isinstance(jobs, dict) or not jobs
+        or any(
+            not JOB_ID.fullmatch(jid) or not isinstance(job, dict) or not is_sha256(job.get("fingerprint"))
+            or (job.get("previous") is not None and not is_sha256(job["previous"]))
+            or type(job.get("archive")) is not bool
+            for jid, job in jobs.items()
+        )
+    ):
+        raise ValueError("批次補抓紀錄格式或識別不符")
+    outputs = RunOutputs(base, run_id, request)
     try:
-        with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as fp:
-            tmp = Path(fp.name)
-            json.dump(data, fp, ensure_ascii=False, indent=2)
-        tmp.replace(path)
-    finally:
-        if tmp is not None:
-            tmp.unlink(missing_ok=True)
+        with outputs.lock():
+            return _recover_outputs(outputs, session, account, endpoint)
+    except LockTimeout:
+        raise RuntimeError("此批次正在本機執行或補抓，請稍後重試") from None
+
+
+def _recover_outputs(outputs: RunOutputs, session: str, account: str, endpoint: str) -> dict:
+    results = read_object(outputs.results_path)
+    if not results:
+        results.update(session=session, run_id=outputs.run_id, bundle_hash=outputs.request["bundle_hash"])
+    jobs = results.setdefault("jobs", {})
+    if not isinstance(jobs, dict):
+        raise ValueError("results.json 的成果清單格式錯誤")
+    report = {"synced": [], "already_synced": [], "pending": [], "unavailable": [], "errors": {}, "superseded": []}
+    deadline = time.monotonic() + OUTPUT_RECOVERY_TIMEOUT
+
+    def check_local():
+        C.remaining_time(OUTPUT_RECOVERY_TIMEOUT, deadline)
+
+    def check_remote():
+        check_local()
+        C.check_recovery_target(session, account, endpoint, deadline=deadline)
+
+    def download(file, dest):
+        C.colab("download", "-s", session, f"{C.REMOTE_ROOT}/runs/{outputs.run_id}/{file}", dest, **target)
+
+    remaining = []
+    for jid in outputs.request["jobs"]:
+        try:
+            if outputs.published(jid, results):
+                report["already_synced"].append(jid)
+            elif outputs.publish(jid, results, check_local):
+                report["synced"].append(jid)
+            else:
+                outputs.check_previous(jid, results)
+                remaining.append(jid)
+        except SupersededResult:
+            report["superseded"].append(jid)
+        except (OSError, RuntimeError, ValueError) as exc:
+            report["errors"][jid] = redact(str(exc))
+    if not remaining:
+        return report
+
+    target = dict(account=account, endpoint=endpoint, deadline=deadline)
+    try:
+        C.verify_recovery_runtime(session, **target)
+        st = C.poll_remote_status(session, run_id=outputs.run_id, **target)
+        check_remote()
+        if not isinstance(st, dict):
+            raise RuntimeError("無法讀取原批次的遠端狀態，請稍後重試")
+        if st.get("run_id") == outputs.run_id and st.get("stage") == "not started" and not st.get("bundle_hash"):
+            raise C.RuntimeUnavailable("原 Colab runtime 缺少這個批次的遠端紀錄")
+        if st.get("run_id") != outputs.run_id or st.get("bundle_hash") != outputs.request["bundle_hash"]:
+            raise RuntimeError("遠端狀態的批次 ID 或程式版本不符")
+        remote_jobs = st.get("jobs")
+        if not isinstance(remote_jobs, dict):
+            raise RuntimeError("遠端成果清單格式錯誤")
+    except (OSError, RuntimeError, ValueError) as exc:
+        report["remote_error"] = redact(str(exc))
+        report["unavailable" if isinstance(exc, C.RuntimeUnavailable) else "pending"] = remaining
+        return report
+
+    for jid in remaining:
+        info = remote_jobs.get(jid)
+        if isinstance(info, dict) and info.get("status") == "done":
+            try:
+                outputs.pull(jid, redact_diagnostics(info), download, check_remote)
+                outputs.publish(jid, results, check_remote)
+            except (OSError, RuntimeError, ValueError) as exc:
+                report["errors"][jid] = redact(str(exc))
+            else:
+                report["synced"].append(jid)
+        elif st.get("done"):
+            report["errors"][jid] = "原批次已結束，沒有此任務已完成的成果"
+        else:
+            report["pending"].append(jid)
+    return report
 
 
 REMOTE_CODE_FILES = (
@@ -372,18 +467,15 @@ def run_manifest(
 
     m, base = load_manifest(manifest_path, cli_quant=cli_quant, exit_on_error=exit_on_error)
     try:
-        fps, todo, done_ids, stale = classify_jobs(m, base, cli_quant=cli_quant, use_fingerprint=use_fingerprint)
         out_dir = confined_path(base, "out", directory=True, missing_ok=True)
-        out_dir.mkdir(exist_ok=True)
         res_file = confined_path(base, "out/results.json", missing_ok=True)
+        prev_results = read_object(res_file)
+        if not isinstance(prev_results.get("jobs", {}), dict):
+            raise ValueError("results.json 的成果清單格式錯誤")
+        fps, todo, done_ids, stale = classify_jobs(m, base, cli_quant=cli_quant, use_fingerprint=use_fingerprint)
+        out_dir.mkdir(exist_ok=True)
     except (OSError, ValueError) as exc:
         _fail(f"無法使用任務檔案：{exc}", exit_on_error)
-    prev_results = {}
-    if res_file.is_file():
-        try:
-            prev_results = json.loads(res_file.read_text(encoding="utf-8"))
-        except Exception:
-            prev_results = {}
 
     if force:
         todo = list(m["jobs"])
@@ -393,19 +485,6 @@ def run_manifest(
         msg = "發現已存在的輸出與目前設定不符（過期）：\n" + "\n".join(f"  - {jid}: {reason}" for jid, reason in stale)
         msg += "\n👉 若要重做過期項目（舊檔會移至 out/_stale/），請加上 `--remake-stale`；若要全部重做請加 `--force`。"
         _fail(msg, exit_on_error)
-
-    if stale and remake_stale:
-        try:
-            stale_dir = confined_path(base, "out/_stale", directory=True, missing_ok=True)
-            stale_dir.mkdir(exist_ok=True)
-            ts = int(time.time())
-            for jid, _ in stale:
-                old_f = confined_path(base, f"out/{jid}.png", missing_ok=True)
-                if old_f.is_file():
-                    backup = confined_path(base, f"out/_stale/{jid}_{ts}.png", missing_ok=True)
-                    shutil.move(old_f, backup)
-        except (OSError, ValueError) as exc:
-            _fail(f"無法備份舊成果：{exc}", exit_on_error)
 
     if not todo:
         print(f"✅ 全部 {len(m['jobs'])} 個任務皆已完成且指紋相符，無需啟動 Colab GPU！（輸出位於 {out_dir}）", flush=True)
@@ -498,8 +577,16 @@ def run_manifest(
         "gpu": gpu,
         "run_id": run_id,
         "model": m.get("model", DEFAULT_MODEL),
-        "jobs": dict((prev_results.get("jobs") or {}) if not force else {}),
+        "jobs": dict(prev_results.get("jobs") or {}),
     }
+
+    def _record_job_error(jid: str, info: dict, status: str, message: str):
+        rec = dict(info, run_id=run_id, bundle_hash=results["bundle_hash"],
+                   status=status, local_synced=False, error=message)
+        results.setdefault("job_errors", {})[jid] = rec
+        if done_revision(results["jobs"].get(jid)) is None:
+            results["jobs"][jid] = rec
+        got.add(jid)
 
     _check_abort()
     account = account or C.account_scope()
@@ -522,6 +609,8 @@ def run_manifest(
     got: set[str] = set()
     expected_todo_ids = {j["id"] for j in todo}
     finished = False
+    run_lock = None
+    cancel_sync_deadline = None
 
     try:
         _check_active()
@@ -626,6 +715,21 @@ def run_manifest(
         files = sorted({f for j in todo for f in (j.get("inputs") or [])})
         input_shas = {f: hashlib.sha256(confined_path(base, f).read_bytes()).hexdigest() for f in files}
         remote_run = f"{C.REMOTE_ROOT}/runs/{run_id}"
+        archived = {jid for jid, _ in stale}
+        request = {
+            "schema": 1, "run_id": run_id, "session": session, "account_scope": account,
+            "runtime_endpoint": endpoint, "bundle_hash": bundle_hash,
+            "jobs": {jid: {"fingerprint": fps[jid], "previous": done_revision(results["jobs"].get(jid)),
+                           "archive": jid in archived} for jid in sorted(expected_todo_ids)},
+        }
+        outputs = RunOutputs(base, run_id, request)
+        outputs.directory.mkdir(mode=0o700, parents=True)
+        run_lock = outputs.lock()
+        run_lock.acquire()
+        save_results(outputs.directory / "request.json", request)
+        results["bundle_hash"] = bundle_hash
+        recover_hint = f"uv run cstudio recover {shlex.quote(str(Path(manifest_path).absolute()))} --run-id {run_id}"
+        print(f"📋 批次 {run_id}（成果補抓：{recover_hint}）", flush=True)
 
         def request_preparation(code: str) -> dict:
             nonlocal remote_attempted, remote_conflict
@@ -639,7 +743,8 @@ def run_manifest(
                 raise RuntimeError(f"Session {session} 已有執行中的批次，遠端拒絕本批啟動")
             return reply
 
-        _emit({"stage": "syncing_code", "done": False, "log": [f"正在同步遠端程式與任務設定至 {session}..."]})
+        _emit({"stage": "syncing_code", "done": False,
+               "log": [f"正在同步遠端程式與任務設定至 {session}...", f"成果補抓：{recover_hint}"]})
         _check_active()
         prep = request_preparation(bundle_and_launch_code(sources if need_code else None, bundle_hash, manifest_json, input_shas))
         if prep["state"] == "bundle_required" and not need_code:
@@ -667,7 +772,6 @@ def run_manifest(
             prep = request_preparation(launch)
             if not remote_attempted:
                 raise RuntimeError("遠端尚未啟動本批，程式版本或參考圖片未通過驗證")
-        results["bundle_hash"] = bundle_hash
         _emit({"stage": "starting", "done": False, "log": ["已確認遠端接受本批次"]})
 
         shown_log: set[str] = set()
@@ -719,72 +823,63 @@ def run_manifest(
                 st_for_ui["stage"] = "syncing_outputs"
             _emit(st_for_ui)
 
-            # Pull newly completed images immediately via atomic temporary file + sha256 verification
-            r_jobs = st.get("jobs") or {}
+            r_jobs = st.get("jobs", {})
             if not isinstance(r_jobs, dict):
                 raise RuntimeError("遠端成果清單格式錯誤")
+            if (cancel_pending or st.get("stage") == "cancelled") and cancel_sync_deadline is None:
+                cancel_sync_deadline = min(deadline, time.monotonic() + C.RECOVERY_TIMEOUT)
+            sync_deadline = cancel_sync_deadline if cancel_sync_deadline is not None else deadline
+
+            def check_sync():
+                _check_active()
+                C.remaining_time(C.RECOVERY_TIMEOUT, sync_deadline)
+
+            def download(file, dest):
+                C.colab("download", "-s", session, f"{remote_run}/{file}", dest,
+                        account=account, endpoint=endpoint, deadline=sync_deadline)
+
             synced_any = False
             for jid, jinfo in r_jobs.items():
                 if jid not in expected_todo_ids or jid in got or not isinstance(jinfo, dict):
                     continue
                 if jinfo.get("status") == "done":
-                    expected_file = f"out/{jid}.png"
-                    if jinfo.get("file") != expected_file:
-                        if st.get("done"):
-                            results["jobs"][jid] = {"status": "sync_error", "run_id": run_id, "error": "遠端成果路徑與當批任務不符"}
-                            save_results(res_file, results)
-                            got.add(jid)
-                        continue
-                    tmp_pull = confined_path(base, f"out/.{jid}_{run_id}.png.tmp", missing_ok=True)
-                    final_dst = confined_path(base, expected_file, missing_ok=True)
-                    max_pull_tries = 3 if st.get("done") else 1
-                    pull_err = None
+                    max_pull_tries = 3 if st.get("done") and cancel_sync_deadline is None else 1
                     for pull_try in range(max_pull_tries):
-                        _check_active()
+                        _check_abort()
                         try:
-                            C.colab("download", "-s", session, f"{remote_run}/{expected_file}", tmp_pull,
-                                    timeout=600, **target)
-                            pulled = confined_path(base, f"out/{tmp_pull.name}")
-                            if pulled.stat().st_size == 0:
-                                raise RuntimeError("下載的暫存檔為空")
-                            exp_sha = jinfo.get("sha256")
-                            got_sha = hashlib.sha256(pulled.read_bytes()).hexdigest()
-                            if exp_sha and got_sha != exp_sha:
-                                raise RuntimeError(f"SHA256 校驗不符 (expected {exp_sha[:10]}, got {got_sha[:10]})")
-                            pulled.replace(final_dst)
-                            rec = dict(jinfo, run_id=run_id, fingerprint=fps.get(jid), local_synced=True)
-                            results["jobs"][jid] = rec
-                            save_results(res_file, results)
-                            got.add(jid)
-                            local_synced.add(jid)
-                            synced_any = True
-                            print(f"⬇️ 已同步回本地：{final_dst} ({final_dst.stat().st_size / 1024:.1f} KB)", flush=True)
-                            if rec.get("refined_prompt"):
-                                print(f"   ✨ Prompt Enhancer 擴寫結果：{redact(rec['refined_prompt'])[:160]}...", flush=True)
-                            pull_err = None
-                            break
-                        except C.ColabDeadline:
-                            tmp_pull.unlink(missing_ok=True)
+                            check_sync()
+                            if not outputs.publish(jid, results, check_sync):
+                                outputs.pull(jid, jinfo, download, check_sync)
+                                outputs.publish(jid, results, check_sync)
+                        except (RunStopped, RunCancelled, C.KeepChanged):
                             raise
-                        except Exception as e:
-                            pull_err = redact(str(e))
-                            tmp_pull.unlink(missing_ok=True)
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            _check_active()
+                            pull_err = redact(str(exc))
                             if pull_try + 1 < max_pull_tries:
                                 print(f"⚠️ 拉回 {jid}.png 失敗，重試中 ({pull_try + 1}/{max_pull_tries})：{pull_err}", flush=True)
-                                time.sleep(C.remaining_time(2, deadline))
+                                time.sleep(C.remaining_time(2, sync_deadline))
                             else:
                                 print(f"⚠️ 拉回 {jid}.png 失敗：{pull_err}", flush=True)
-                    if pull_err and st.get("done"):
-                        results["jobs"][jid] = dict(jinfo, run_id=run_id, status="sync_error", error=f"遠端已生成但下載回本地失敗：{pull_err}")
-                        save_results(res_file, results)
+                            continue
+
                         got.add(jid)
+                        local_synced.add(jid)
                         synced_any = True
+                        rec = results["jobs"][jid]
+                        print(f"⬇️ 已同步回本地：{out_dir / f'{jid}.png'} ({rec['bytes'] / 1024:.1f} KB)", flush=True)
+                        if isinstance(rec.get("refined_prompt"), str) and rec["refined_prompt"]:
+                            print(f"   ✨ Prompt Enhancer 擴寫結果：{redact(rec['refined_prompt'])[:160]}...", flush=True)
+                        break
+                    else:
+                        if st.get("done"):
+                            _record_job_error(jid, jinfo, "sync_error", f"遠端成果同步失敗：{pull_err}")
+                            synced_any = True
                 elif jinfo.get("status") == "error":
-                    results["jobs"][jid] = dict(jinfo, run_id=run_id)
-                    save_results(res_file, results)
-                    got.add(jid)
+                    msg = str(jinfo.get("error") or "遠端任務失敗")
+                    _record_job_error(jid, jinfo, "error", msg)
                     synced_any = True
-                    print(f"❌ 任務 {jid} 失敗：{jinfo.get('error')}", flush=True)
+                    print(f"❌ 任務 {jid} 失敗：{msg}", flush=True)
 
             if synced_any and not st.get("done"):
                 _emit(st_for_ui)
@@ -799,6 +894,11 @@ def run_manifest(
                 cancel_failed = stage == "cancel_failed"
                 if st.get("error") and stage in ("error", "crashed", "cancel_failed"):
                     results["error"] = st["error"]
+                if expected_todo_ids - local_synced:
+                    errors = results.get("job_errors", {})
+                    details = [f"{jid} ({errors[jid]['error']})" if jid in errors else jid
+                               for jid in sorted(expected_todo_ids - local_synced)]
+                    results.setdefault("error", f"部分任務未成功完成：{', '.join(details)}")
                 finished = True
                 _emit(st)
                 break
@@ -817,8 +917,9 @@ def run_manifest(
                 same_keep = _run_lease(current)
                 release = abort_reason == "stop" or (
                     not remote_conflict and abort_reason != "cancel" and (
-                        (stop_after and (finished or (owned and not remote_attempted)))
-                        or (not finished and (created or (owned and time.monotonic() >= deadline)))
+                        (stop_after and (finished or created or (owned and not remote_attempted)))
+                        or (not finished and ((created and not remote_attempted)
+                                              or (owned and time.monotonic() >= deadline)))
                     )
                 )
                 if release:
@@ -867,12 +968,16 @@ def run_manifest(
                     C.drop_keep(session, expected=current)
                     print(f"⚠️ 批次未完成，外部 Session {session} 仍在運行。", flush=True)
             finally:
-                cu_after, _ = C.usage(account=account, deadline=cleanup_deadline)
-                cu_used = round(cu_before - cu_after, 2) if (cu_before is not None and cu_after is not None) else None
-                results.update(cu_before=cu_before, cu_after=cu_after, cu_used=cu_used)
-                save_results(res_file, results)
-                if cu_used is not None:
-                    print(f"💳 本批預估消耗 {cu_used} 運算單元（{cu_before} → {cu_after}；Colab 用量可能延遲更新）", flush=True)
+                try:
+                    cu_after, _ = C.usage(account=account, deadline=cleanup_deadline)
+                    cu_used = round(cu_before - cu_after, 2) if (cu_before is not None and cu_after is not None) else None
+                    results.update(cu_before=cu_before, cu_after=cu_after, cu_used=cu_used)
+                    save_results(res_file, results)
+                    if cu_used is not None:
+                        print(f"💳 本批預估消耗 {cu_used} 運算單元（{cu_before} → {cu_after}；Colab 用量可能延遲更新）", flush=True)
+                finally:
+                    if run_lock is not None:
+                        run_lock.release()
         elif allocation_reserved:
             current = C.keep_info(session)
             if not _run_lease(current or {}):
@@ -887,21 +992,7 @@ def run_manifest(
             elif current:
                 C.drop_keep(session, expected=current)
 
-    expected_ids = [j["id"] for j in m["jobs"]]
-    bad = [
-        jid
-        for jid in expected_ids
-        if (results["jobs"].get(jid) or {}).get("status") != "done" or not (out_dir / f"{jid}.png").is_file()
-    ]
-    print(f"✅ 批次結束：成功 {len(expected_ids) - len(bad)}/{len(expected_ids)}，耗時 {results['minutes']} 分鐘 → {out_dir}", flush=True)
-    if bad or results.get("error"):
-        if not results.get("error"):
-            err_details = []
-            for jid in bad:
-                j_err = (results["jobs"].get(jid) or {}).get("error")
-                err_details.append(f"{jid} ({j_err})" if j_err else jid)
-            results["error"] = f"部分任務未成功完成：{', '.join(err_details)}"
-            save_results(res_file, results)
-        if exit_on_error:
-            sys.exit(1)
+    print(f"✅ 批次結束：成功 {len(local_synced)}/{len(m['jobs'])}，耗時 {results['minutes']} 分鐘 → {out_dir}", flush=True)
+    if results.get("error") and exit_on_error:
+        sys.exit(1)
     return results

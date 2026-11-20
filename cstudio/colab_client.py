@@ -63,6 +63,10 @@ class ColabDeadline(ColabTimeout):
     """The time budget for the operation is exhausted."""
 
 
+class RuntimeUnavailable(RuntimeError):
+    """The saved runtime or its remote run is confirmed absent."""
+
+
 def remaining_time(limit: float, deadline: float | None) -> float:
     if deadline is None:
         return limit
@@ -627,6 +631,34 @@ def active_endpoint(session: str, account: str, *, deadline: float | None = None
     ):
         raise RuntimeError("無法確認 Colab Session 的帳號及遠端識別")
     return endpoint
+
+
+def check_recovery_target(session: str, account: str, endpoint: str, *, deadline: float):
+    """Recheck local identity and shutdown intent between recovery operations."""
+    if account_scope() != account:
+        raise RuntimeError("目前的 Colab 登入身分與原批次不符")
+    info = keep_info(session) or {}
+    if info.get("release_pending") and info.get("runtime_endpoint") == endpoint:
+        raise RuntimeError("原 Colab runtime 正在關機")
+    if runtime_endpoint(session, deadline=deadline) != endpoint:
+        raise RuntimeError("本機 Session 與原 Colab runtime 識別不符")
+
+
+def verify_recovery_runtime(session: str, account: str, endpoint: str, *, deadline: float):
+    """Require positive evidence for the saved assignment before accessing it."""
+    if account_scope() != account:
+        raise RuntimeError("目前的 Colab 登入身分與原批次不符")
+    names, out = sessions_checked(account=account, deadline=deadline)
+    assignments = listed_assignments(out) if names is not None else None
+    if account_scope() != account:
+        raise RuntimeError("目前的 Colab 登入身分與原批次不符")
+    if assignments is None:
+        raise RuntimeError("無法確認原 Colab runtime 是否仍可用，請稍後重試")
+    if endpoint not in assignments:
+        raise RuntimeUnavailable("原 Colab runtime 已不存在，無法補抓遠端成果")
+    if assignments[endpoint] != session:
+        raise RuntimeError("原 Colab runtime 仍存在，但 Session 名稱與原批次不符")
+    check_recovery_target(session, account, endpoint, deadline=deadline)
 
 
 def keep_target(session: str, info: dict, account: str | None) -> dict:
