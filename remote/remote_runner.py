@@ -256,14 +256,33 @@ def _install_plan(pins: dict | None) -> tuple[list[tuple[Path, str, str | None]]
             raise ValueError("missing package specs")
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("versions.json 含有不完整的 ComfyUI、節點或 Python 釘選資料") from exc
+    return repos, extra
 
-    managed = {path for path, _, _ in repos[1:]}
+
+def _verify_custom_nodes(managed: set[Path], comfy_head: str | None):
+    nodes_dir = COMFY / "custom_nodes"
+    git = ["git", "-C", str(COMFY)]
+    tracked = {}
+    if comfy_head is not None:
+        tree = setup_command([*git, "ls-tree", "-z", comfy_head, "--", "custom_nodes/"], read_stdout=True)
+        for entry in tree.stdout.split("\0"):
+            metadata, _, relative = entry.partition("\t")
+            mode, _, blob = metadata.partition(" blob ")
+            if mode in ("100644", "100755"):
+                tracked[relative] = blob
+
     for path in nodes_dir.glob("*"):
         if path in managed or path.name.endswith(".disabled") or path.name == "__pycache__":
             continue
-        if path.suffix == ".py" or any((path / name).is_file() for name in ("__init__.py", "prestartup_script.py")):
-            raise RuntimeError(f"釘選模式發現未列入 versions.json 的 ComfyUI 節點：{path.name}")
-    return repos, extra
+        if path.suffix != ".py" and not any((path / name).is_file() for name in ("__init__.py", "prestartup_script.py")):
+            continue
+        relative = path.relative_to(COMFY).as_posix()
+        if relative in tracked and not path.is_symlink() and path.is_file():
+            # Compare the worktree bytes to the commit, even if Git status skips the file.
+            actual = setup_command([*git, "hash-object", "--no-filters", "--", relative], read_stdout=True)
+            if actual.stdout.strip() == tracked[relative]:
+                continue
+        raise RuntimeError(f"釘選模式發現未列入 versions.json 的 ComfyUI 節點：{path.name}")
 
 
 def _requirements_versions(requirements: list[Path], extra: list[str]) -> dict[str, str] | None:
@@ -309,6 +328,9 @@ def install(pins: dict | None = None) -> str:
     save()
 
     heads = {str(path): _installed_checkout(path, url) for path, url, _ in repos}
+    managed_nodes = {path for path, _, _ in repos[1:]}
+    if pins is not None:
+        _verify_custom_nodes(managed_nodes, heads[str(COMFY)])
     updates = [
         (path, url, commit) for path, url, commit in repos
         if heads[str(path)] is None or (commit is not None and heads[str(path)] != commit)
@@ -318,6 +340,8 @@ def install(pins: dict | None = None) -> str:
         for path, url, commit in updates:
             log(f"install: updating {path.name} ({(commit or 'HEAD')[:10]})")
             heads[str(path)] = clone(url, path, commit)
+        if pins is not None:
+            _verify_custom_nodes(managed_nodes, heads[str(COMFY)])
     requirements = [path / "requirements.txt" for path, _, _ in repos]
     requirements = [path for path in requirements if path.is_file()]
     packages = _requirements_versions(requirements, extra)

@@ -78,7 +78,18 @@ class EnvironmentTests(unittest.TestCase):
         self.git(repo, "commit", "-qm", "fixture")
         return repo
 
+    def commit_upstream_node(self, content):
+        rel = Path("custom_nodes/websocket_image_save.py")
+        node = self.comfy_origin / rel
+        node.parent.mkdir(exist_ok=True)
+        node.write_text(content, encoding="utf-8")
+        self.git(self.comfy_origin, "add", "-f", str(rel))
+        self.git(self.comfy_origin, "commit", "-qm", "upstream node fixture")
+        self.pins["comfyui"]["commit"] = self.head(self.comfy_origin)
+        return self.comfy / rel
+
     def test_cold_then_warm_setup_verifies_actual_checkouts_and_versions(self):
+        node = self.commit_upstream_node("# Stock ComfyUI node\n")
         signature = remote.install(self.pins)
         marker = json.loads(self.marker.read_text(encoding="utf-8"))
         self.assertEqual(marker["schema"], 2)
@@ -86,8 +97,36 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(marker["environment"]["packages"], self.versions)
         self.assertEqual(self.head(self.node), self.pins["custom_nodes"][0]["commit"])
         self.assertEqual(self.head(self.comfy), self.pins["comfyui"]["commit"])
+        self.assertEqual(node.read_text(encoding="utf-8"), "# Stock ComfyUI node\n")
         self.assertEqual(remote.install(self.pins), signature)
         self.stop.assert_called_once()
+        self.pip.assert_not_called()
+
+    def test_pinned_update_revalidates_the_stock_node_at_the_new_revision(self):
+        node = self.commit_upstream_node("# Original upstream node\n")
+        first = remote.install(self.pins)
+        self.stop.reset_mock()
+
+        self.commit_upstream_node("# Updated upstream node\n")
+        updated = remote.install(self.pins)
+        self.assertNotEqual(updated, first)
+        self.assertEqual(node.read_text(encoding="utf-8"), "# Updated upstream node\n")
+        self.assertEqual(remote.install(self.pins), updated)
+        self.stop.assert_called_once()
+        self.pip.assert_not_called()
+
+    def test_changed_stock_node_is_rejected_even_when_git_status_is_clean(self):
+        node = self.commit_upstream_node("# Stock ComfyUI node\n")
+        remote.install(self.pins)
+        self.stop.reset_mock()
+        self.git(self.comfy, "update-index", "--assume-unchanged", node.relative_to(self.comfy).as_posix())
+        node.write_text("# Local change\n", encoding="utf-8")
+        self.assertEqual(self.git(self.comfy, "status", "--porcelain"), "")
+
+        with self.assertRaisesRegex(RuntimeError, "未列入.*websocket_image_save.py"):
+            remote.install(self.pins)
+        self.assertEqual(node.read_text(encoding="utf-8"), "# Local change\n")
+        self.stop.assert_not_called()
         self.pip.assert_not_called()
 
     def test_legacy_marker_and_reenabled_pins_use_real_head(self):
@@ -161,6 +200,11 @@ class EnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Git origin"):
             remote.install(self.pins)
         self.git(self.node, "remote", "set-url", "origin", str(self.node_origin))
+        extra_file = self.node.parent / "unlisted.py"
+        extra_file.touch()
+        with self.assertRaisesRegex(RuntimeError, "未列入.*unlisted.py"):
+            remote.install(self.pins)
+        extra_file.rename(extra_file.with_suffix(".disabled"))
         extra = self.node.parent / "extra"
         extra.mkdir()
         (extra / "prestartup_script.py").touch()
