@@ -47,6 +47,27 @@ def evaluate_reference(graph, link, input_dir):
 
 
 class EditAlphaTests(unittest.TestCase):
+    def test_pe_sends_textgenerate_dynamic_combo_with_dotted_sampling_fields(self):
+        for mode, presence_penalty in (("t2i", 1.5), ("edit", 0.0)):
+            with self.subTest(mode=mode):
+                job = {"id": mode, "mode": mode, "prompt": "Generate", "seed": 41, "refine_prompt": True}
+                if mode == "edit":
+                    job["inputs"] = ["ref.png"]
+                graph = QWEN.build_qwen21_graph(job)
+                textgen = graph["32"]
+                self.assertEqual(textgen["class_type"], "TextGenerate")
+                self.assertEqual({key: value for key, value in textgen["inputs"].items()
+                                  if key.split(".", 1)[0] == "sampling_mode"}, {
+                    "sampling_mode": "on",
+                    "sampling_mode.temperature": 1.0,
+                    "sampling_mode.top_k": 20,
+                    "sampling_mode.top_p": 0.95,
+                    "sampling_mode.min_p": 0.0,
+                    "sampling_mode.repetition_penalty": 1.0,
+                    "sampling_mode.presence_penalty": presence_penalty,
+                    "sampling_mode.seed": 41,
+                })
+
     def test_staged_png_preserves_alpha_in_edit_and_flattens_white_for_pe(self):
         with tempfile.TemporaryDirectory() as tmp:
             job_dir = Path(tmp)

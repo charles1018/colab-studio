@@ -894,17 +894,27 @@ def fit_names(graph: dict):
     return changes
 
 
-def queue_prompt(graph: dict, *, pin_models: bool = False) -> str:
+def _remaining_prompt_time(deadline: float, what: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError(f"{what}: 已達單項時間上限")
+    return remaining
+
+
+def queue_prompt(graph: dict, *, pin_models: bool = False, deadline: float | None = None) -> str:
     fitted = fit_names(graph)
     if pin_models and fitted:
         raise RuntimeError("ComfyUI 模型路徑偏離已驗證的檔名：" + ", ".join(new for _, _, _, new in fitted))
     check_cancel()
+    request_options = ({"timeout": min(60, _remaining_prompt_time(deadline, "ComfyUI 排程"))}
+                       if deadline is not None else {})
     pid = str(uuid.uuid4())
     IN_FLIGHT[pid] = False
     STATE["prompt_ids"].append(pid)
     save()
     try:
-        resp = call(COMFY_URL + "/prompt", {"prompt": graph, "client_id": "cstudio", "prompt_id": pid})
+        resp = call(COMFY_URL + "/prompt", {"prompt": graph, "client_id": "cstudio", "prompt_id": pid},
+                    **request_options)
     except ComfyHTTPError as exc:
         if exc.code == 400:
             IN_FLIGHT.pop(pid)
@@ -924,15 +934,16 @@ def queue_prompt(graph: dict, *, pin_models: bool = False) -> str:
     return active_pid
 
 
-def wait_history(pid: str, timeout: int, what: str) -> dict:
-    t0, last = time.time(), time.time()
+def wait_history(pid: str, timeout: float, what: str) -> dict:
+    t0 = last = time.monotonic()
+    deadline = t0 + timeout
     fails = 0
-    while time.time() - t0 < timeout:
+    while (remaining := deadline - time.monotonic()) > 0:
         cancelling = cancellation_requested()
         if cancelling:
             cancel_prompts()
         try:
-            h = call(COMFY_URL + f"/history/{pid}").get(pid)
+            h = call(COMFY_URL + f"/history/{pid}", timeout=min(60, remaining)).get(pid)
             fails = 0
         except Exception as e:
             if cancelling:
@@ -940,7 +951,7 @@ def wait_history(pid: str, timeout: int, what: str) -> dict:
             fails += 1
             if fails > 5:
                 raise RuntimeError(f"{what}: 輪詢 ComfyUI 連續失敗 {fails} 次：{e}")
-            time.sleep(2)
+            time.sleep(max(0, min(2, deadline - time.monotonic())))
             continue
 
         if h and h.get("status", {}).get("completed") is not None:
@@ -956,11 +967,11 @@ def wait_history(pid: str, timeout: int, what: str) -> dict:
             return h
         if cancelling:
             raise BatchCancelled()
-        if time.time() - last > 30:
-            last = time.time()
-            log(f"{what}: generating ({time.time() - t0:.0f}s)")
-        time.sleep(1.5)
-    raise RuntimeError(f"{what}: 超過 {timeout} 秒未完成")
+        if time.monotonic() - last > 30:
+            last = time.monotonic()
+            log(f"{what}: generating ({time.monotonic() - t0:.0f}s)")
+        time.sleep(max(0, min(1.5, deadline - time.monotonic())))
+    raise RuntimeError(f"{what}: 超過 {timeout:.0f} 秒未完成")
 
 
 def stage_input_image(rel_path: str, job_id: str, idx: int, *, expected_sha: str | None = None) -> str:
@@ -1090,6 +1101,10 @@ def run_batch():
         check_cancel()
         jid = job["id"]
         t_job = time.time()
+        separate_pe = plugin.uses_separate_edit_pe(job, manifest)
+        refine_on = bool(job.get("refine_prompt", manifest.get("refine_prompt", False)))
+        timeout_s = int(job.get("timeout", 1200 if refine_on else 600))
+        deadline = time.monotonic() + timeout_s
         STATE["jobs"][jid] = {"status": "running", "started": t_job}
         save()
         log(f"job [{idx}/{len(jobs)}] {jid}: preparing ({job.get('mode', 't2i')})")
@@ -1106,20 +1121,35 @@ def run_batch():
                 uploaded_inputs=staged_inputs,
             )
             save_node = next(nid for nid, node in graph.items() if node["class_type"] == "SaveImage")
-            if MANAGED_RUN_ID:
-                graph[save_node]["inputs"]["filename_prefix"] = f"cstudio_{MANAGED_RUN_ID}_{jid}"
-            pid = queue_prompt(graph, pin_models=pin_models)
-            refine_on = bool(job.get("refine_prompt", manifest.get("refine_prompt", False)))
-            timeout_s = int(job.get("timeout", 1200 if refine_on else 600))
-            h = wait_history(pid, timeout=timeout_s, what=jid)
-
+            prefix = f"cstudio_{run_id}_{jid}" if MANAGED_RUN_ID else graph[save_node]["inputs"]["filename_prefix"]
             refined_text = None
-            if refine_on:
+            pe_receipt = None
+            if separate_pe:
+                pe_graph = plugin.build_edit_pe_graph(graph, prefix)
+                pe_pid = queue_prompt(pe_graph, pin_models=pin_models, deadline=deadline)
+                pe_history = wait_history(pe_pid, timeout=_remaining_prompt_time(deadline, jid), what=f"{jid} PE")
+                raw = extract_refined_prompt(pe_history)
+                refined_text = plugin.normalize_edit_pe_answer(raw, job["prompt"], len(staged_inputs))
+                pe_receipt = {"prompt_id": pe_pid, "raw_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                              "answer_sha256": hashlib.sha256(refined_text.encode()).hexdigest()}
+                graph = plugin.build_qwen21_graph(
+                    {**job, "prompt": refined_text, "refine_prompt": False}, manifest=manifest,
+                    cli_quant=cli_quant, uploaded_inputs=staged_inputs,
+                )
+            graph[save_node]["inputs"]["filename_prefix"] = prefix
+            if separate_pe:
+                pid = queue_prompt(graph, pin_models=pin_models, deadline=deadline)
+                h = wait_history(pid, timeout=_remaining_prompt_time(deadline, jid), what=f"{jid} image")
+            else:
+                pid = queue_prompt(graph, pin_models=pin_models)
+                h = wait_history(pid, timeout=timeout_s, what=jid)
+            if refine_on and not separate_pe:
                 refined_text = extract_refined_prompt(h)
                 if not refined_text:
                     raise RuntimeError(
                         f"{jid}: refine_prompt=True 但 Prompt Enhancer 輸出為空（可能 thinking 耗盡 token 上限，請調高 pe_max_length 或設 thinking=false）"
                     )
+            if refined_text is not None:
                 log(f"job {jid}: prompt enhanced ({len(refined_text)} chars)")
 
             out_file = confined_path(JOB, f"{OUT.name}/{jid}.png", missing_ok=True)
@@ -1145,8 +1175,10 @@ def run_batch():
                     "pin_versions": pins is not None, "pin_models": pin_models,
                     "environment": STATE["environment"], "gpu": STATE["gpu_info"], "comfy": comfy,
                     "models": [prepared_models[model] for model in job_models],
-                    "fitted_models": FITTED.get(pid, []),
+                    "fitted_models": (FITTED.get(pe_pid, []) if pe_receipt is not None else []) + FITTED.get(pid, []),
                 }
+                if pe_receipt is not None:
+                    job_rec["execution"]["pe"] = {**pe_receipt, "image_prompt_id": pid}
             STATE["jobs"][jid] = job_rec
             save()
             log(f"job [{idx}/{len(jobs)}] {jid}: done in {elapsed:.1f}s -> {out_file.name}")
@@ -1162,6 +1194,9 @@ def run_batch():
             }
             save()
             log(f"job [{idx}/{len(jobs)}] {jid}: FAILED - {e}")
+            if separate_pe and IN_FLIGHT:
+                cancel_prompts()
+                log(f"job {jid}: 已核對逾時或未確認的 prompt 結束", "running")
 
     bad = [k for k, v in STATE["jobs"].items() if v.get("status") != "done"]
     if bad or IN_FLIGHT:

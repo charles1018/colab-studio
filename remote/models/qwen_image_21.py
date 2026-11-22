@@ -8,6 +8,8 @@ Builds flat ComfyUI API prompt graphs for:
 """
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
 
 from .qwen_prompts import QWEN21_EDIT_SYSTEM_PROMPT, QWEN21_T2I_SYSTEM_PROMPT
@@ -181,6 +183,57 @@ def required_models_for_batch(manifest: dict[str, Any], cli_quant: str | None = 
     return files
 
 
+_IMAGE_TAG = re.compile(r"<image[0-9]+>")
+
+
+def uses_separate_edit_pe(job: dict[str, Any], manifest: dict[str, Any]) -> bool:
+    return (str(job.get("mode", "t2i")).strip().lower() == "edit" and len(job.get("inputs", [])) > 1
+            and bool(job.get("refine_prompt", manifest.get("refine_prompt", False))))
+
+
+def build_edit_pe_graph(full_graph: dict, prefix: str) -> dict:
+    """Select only the ancestor nodes of the raw Prompt Enhancer preview."""
+    selected = {}
+    pending = ["33"]
+    while pending:
+        node_id = pending.pop()
+        if node_id in selected:
+            continue
+        node = full_graph[node_id]
+        selected[node_id] = node
+        for value in node["inputs"].values():
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str) and type(value[1]) is int:
+                pending.append(value[0])
+    selected["33"] = {**selected["33"], "_meta": {"title": prefix}}
+    return selected
+
+
+def normalize_edit_pe_answer(raw: str | None, requested: str, reference_count: int) -> str:
+    """Use the answer text and validate the reference numbers it carries."""
+    if not raw or not raw.strip():
+        raise ValueError("Prompt Enhancer 輸出為空")
+    answer = raw.strip()
+    if answer.startswith(("{", "[")):
+        try:
+            response = json.loads(answer)
+        except ValueError:
+            raise ValueError("Prompt Enhancer 回覆的 JSON 格式無效") from None
+        fields = response if isinstance(response, dict) else {}
+        field = "output" if "rewritten_prompt" not in fields and "output" in fields else "rewritten_prompt"
+        answer = fields.get(field)
+        if not isinstance(answer, str) or not answer.strip():
+            raise ValueError(f"Prompt Enhancer 的 {field} 為空或格式不符")
+        answer = answer.strip()
+    expected = set(_IMAGE_TAG.findall(requested))
+    actual = set(_IMAGE_TAG.findall(answer))
+    allowed = {f"<image{n}>" for n in range(1, reference_count + 1)}
+    if actual - allowed:
+        raise ValueError("Prompt Enhancer 回覆含未提供的參考圖標記")
+    if (expected & allowed) - actual:
+        raise ValueError("Prompt Enhancer 回覆缺少請求指定的參考圖標記")
+    return answer
+
+
 def build_qwen21_graph(
     job: dict[str, Any],
     manifest: dict[str, Any] | None = None,
@@ -329,16 +382,15 @@ def build_qwen21_graph(
             "clip": ["30", 0],
             "prompt": prompt_text,
             "max_length": max_length,
-            "sampling_mode": {
-                "sampling_mode": "on",
-                "temperature": 1.0,
-                "top_k": 20,
-                "top_p": 0.95,
-                "min_p": 0.0,
-                "repetition_penalty": 1.0,
-                "presence_penalty": pres_pen,
-                "seed": seed,
-            },
+            # ComfyUI expands DynamicCombo options from dotted API input names.
+            "sampling_mode": "on",
+            "sampling_mode.temperature": 1.0,
+            "sampling_mode.top_k": 20,
+            "sampling_mode.top_p": 0.95,
+            "sampling_mode.min_p": 0.0,
+            "sampling_mode.repetition_penalty": 1.0,
+            "sampling_mode.presence_penalty": pres_pen,
+            "sampling_mode.seed": seed,
             "thinking": thinking,
             "use_default_template": True,
             "mtp": "auto",
