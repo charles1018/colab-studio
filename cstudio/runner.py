@@ -105,6 +105,8 @@ def compute_job_fingerprint(
     }
     if plugin.uses_separate_edit_pe(job, manifest):
         payload["pe_execution"] = "edit_prepass_v1"
+    elif plugin.uses_separate_transparent_t2i_pe(job, manifest):
+        payload["pe_execution"] = "transparent_t2i_prepass_v2"
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 

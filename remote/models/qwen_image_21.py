@@ -12,7 +12,11 @@ import json
 import re
 from typing import Any
 
-from .qwen_prompts import QWEN21_EDIT_SYSTEM_PROMPT, QWEN21_T2I_SYSTEM_PROMPT
+from .qwen_prompts import (
+    QWEN21_EDIT_SYSTEM_PROMPT,
+    QWEN21_T2I_SYSTEM_PROMPT,
+    QWEN21_TRANSPARENT_T2I_SYSTEM_PROMPT,
+)
 
 GRAPH_VERSION = "qwen21_turbo_gguf_v1"
 
@@ -126,13 +130,16 @@ def resolve_dimensions(job: dict[str, Any], manifest: dict[str, Any] | None = No
     raise ValueError(f"不支援的解析度等級 {res!r}（可用：1K, 2K，或直接指定 width 與 height）")
 
 
+_RGBA_PREFIX = "This is an RGBA format image with transparency."
+_RGBA_SUFFIX = "The image has an alpha channel and a transparent background."
+
+
 def wrap_transparent_prompt(prompt: str) -> str:
     """Official Qwen-Image-2.1 RGBA transparent prompt wrapper."""
     p = prompt.strip()
-    prefix = "This is an RGBA format image with transparency."
-    if p.startswith(prefix):
+    if p.startswith(_RGBA_PREFIX):
         return p
-    return f"This is an RGBA format image with transparency. {p}. The image has an alpha channel and a transparent background."
+    return f"{_RGBA_PREFIX} {p}. {_RGBA_SUFFIX}"
 
 
 def required_models_for_batch(manifest: dict[str, Any], cli_quant: str | None = None) -> list[tuple[str, str, str]]:
@@ -184,6 +191,16 @@ def required_models_for_batch(manifest: dict[str, Any], cli_quant: str | None = 
 
 
 _IMAGE_TAG = re.compile(r"<image[0-9]+>")
+_BACKDROP_FILL = r"(?:white|checkerboard|transparency grid)"
+_BACKDROP_MODIFIERS = r"(?:a|an|bright|clean|flat|nearly|plain|pure|solid|uniform)"
+_VISIBLE_BACKDROP = re.compile(
+    rf"\b{_BACKDROP_FILL}(?:\s+(?:studio|tiled|patterned|transparency-style))?\s+(?:background|backdrop)\b"
+    rf"|\b(?:background|backdrop)\s+(?:is|appears|remains)\s+(?:{_BACKDROP_MODIFIERS},?\s+)*{_BACKDROP_FILL}\b"
+    r"|\b(?:open|blank)\s+white space\b",
+    re.IGNORECASE,
+)
+_SUBJECT_SENTENCE_BREAK = re.compile(r"(?<=[.!?。！？])\s+|(?<=[。！？])|\n+")
+_SUBJECT_SENTENCE_LIMIT = 220
 
 
 def uses_separate_edit_pe(job: dict[str, Any], manifest: dict[str, Any]) -> bool:
@@ -191,7 +208,12 @@ def uses_separate_edit_pe(job: dict[str, Any], manifest: dict[str, Any]) -> bool
             and bool(job.get("refine_prompt", manifest.get("refine_prompt", False))))
 
 
-def build_edit_pe_graph(full_graph: dict, prefix: str) -> dict:
+def uses_separate_transparent_t2i_pe(job: dict[str, Any], manifest: dict[str, Any]) -> bool:
+    return (str(job.get("mode", "t2i")).strip().lower() == "t2i" and bool(job.get("transparent"))
+            and bool(job.get("refine_prompt", manifest.get("refine_prompt", False))))
+
+
+def build_pe_graph(full_graph: dict, prefix: str) -> dict:
     """Select only the ancestor nodes of the raw Prompt Enhancer preview."""
     selected = {}
     pending = ["33"]
@@ -208,8 +230,11 @@ def build_edit_pe_graph(full_graph: dict, prefix: str) -> dict:
     return selected
 
 
-def normalize_edit_pe_answer(raw: str | None, requested: str, reference_count: int) -> str:
-    """Use the answer text and validate the reference numbers it carries."""
+# Keep the Edit helper available to existing history readers.
+build_edit_pe_graph = build_pe_graph
+
+
+def _pe_answer_text(raw: str | None) -> str:
     if not raw or not raw.strip():
         raise ValueError("Prompt Enhancer 輸出為空")
     answer = raw.strip()
@@ -224,6 +249,12 @@ def normalize_edit_pe_answer(raw: str | None, requested: str, reference_count: i
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError(f"Prompt Enhancer 的 {field} 為空或格式不符")
         answer = answer.strip()
+    return answer
+
+
+def normalize_edit_pe_answer(raw: str | None, requested: str, reference_count: int) -> str:
+    """Use the answer text and validate the reference numbers it carries."""
+    answer = _pe_answer_text(raw)
     expected = set(_IMAGE_TAG.findall(requested))
     actual = set(_IMAGE_TAG.findall(answer))
     allowed = {f"<image{n}>" for n in range(1, reference_count + 1)}
@@ -232,6 +263,42 @@ def normalize_edit_pe_answer(raw: str | None, requested: str, reference_count: i
     if (expected & allowed) - actual:
         raise ValueError("Prompt Enhancer 回覆缺少請求指定的參考圖標記")
     return answer
+
+
+def _unwrap_transparent_prompt(text: str) -> str:
+    subject = text.strip()
+    if subject.startswith(_RGBA_PREFIX):
+        subject = subject.removeprefix(_RGBA_PREFIX).strip()
+        if subject.endswith(_RGBA_SUFFIX):
+            subject = subject.removesuffix(_RGBA_SUFFIX).rstrip().removesuffix(".").rstrip()
+    return subject
+
+
+def normalize_transparent_t2i_pe_answer(raw: str | None, requested: str) -> str:
+    """Keep a concise subject description and exclude newly introduced visible backdrops."""
+    answer = _unwrap_transparent_prompt(_pe_answer_text(raw))
+    if not answer.strip(".").strip():
+        raise ValueError("Prompt Enhancer 的透明主體描述為空")
+    subject = _unwrap_transparent_prompt(requested)
+    original = " ".join(subject.casefold().split())
+    sentences = [sentence.strip() for sentence in _SUBJECT_SENTENCE_BREAK.split(answer) if sentence.strip()]
+    clean = [
+        sentence for sentence in sentences
+        if all(" ".join(match.group().casefold().split()) in original
+               for match in _VISIBLE_BACKDROP.finditer(sentence))
+    ]
+    if clean == sentences and len(answer) <= _SUBJECT_SENTENCE_LIMIT:
+        return answer
+    if not clean:
+        raise ValueError("Prompt Enhancer 在透明 T2I 擴寫中加入可見背景")
+
+    detail = next((sentence for sentence in clean
+                   if len(sentence) <= _SUBJECT_SENTENCE_LIMIT and any(char.isalnum() for char in sentence)), None)
+    if detail is None:
+        raise ValueError("Prompt Enhancer 未提供可用的簡短透明主體描述")
+    # Keep the brief when dropping text, including subjects the retained sentence might not name.
+    separator = " " if subject.endswith((".", "!", "?", "。", "！", "？")) else ". "
+    return f"{subject}{separator}{detail}"
 
 
 def build_qwen21_graph(
@@ -366,7 +433,13 @@ def build_qwen21_graph(
     if refine:
         pe_file = resolve_pe_filename(mode, pe_var)
         pe_clip_type = "qwen_image" if mode == "edit" else "stable_diffusion"
+        pe_prompt = prompt_text
         sys_prompt = QWEN21_EDIT_SYSTEM_PROMPT if mode == "edit" else QWEN21_T2I_SYSTEM_PROMPT
+        if transparent and mode == "t2i":
+            pe_prompt = _unwrap_transparent_prompt(raw_prompt)
+            if not pe_prompt:
+                raise ValueError(f"job {job.get('id')!r}: 透明主體描述不能為空")
+            sys_prompt = QWEN21_TRANSPARENT_T2I_SYSTEM_PROMPT
         pres_pen = 0.0 if mode == "edit" else 1.5
 
         graph["30"] = {
@@ -380,7 +453,7 @@ def build_qwen21_graph(
 
         tg_inputs: dict[str, Any] = {
             "clip": ["30", 0],
-            "prompt": prompt_text,
+            "prompt": pe_prompt,
             "max_length": max_length,
             # ComfyUI expands DynamicCombo options from dotted API input names.
             "sampling_mode": "on",

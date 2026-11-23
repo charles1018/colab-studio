@@ -60,7 +60,69 @@ class EditPEGraphTests(unittest.TestCase):
         self.assertTrue({"10", "13", "40", "54", "60", "61"}.isdisjoint(pe))
 
 
-class EditPEWorkerTests(unittest.TestCase):
+CUTOUT = {"id": "cutout", "mode": "t2i", "prompt": "An isolated red ceramic mug",
+          "transparent": True, "refine_prompt": True, "timeout": 240}
+SUBJECT = "An isolated glossy crimson ceramic mug with a rounded handle"
+
+
+class TransparentPEGraphTests(unittest.TestCase):
+    def test_uses_job_setting_and_inherits_the_manifest_default(self):
+        inherited = {key: value for key, value in CUTOUT.items() if key != "refine_prompt"}
+        self.assertTrue(model.uses_separate_transparent_t2i_pe(inherited, {"refine_prompt": True}))
+        self.assertFalse(model.uses_separate_transparent_t2i_pe({**CUTOUT, "refine_prompt": False}, {"refine_prompt": True}))
+        self.assertFalse(model.uses_separate_transparent_t2i_pe({**CUTOUT, "transparent": False}, {}))
+
+    def test_capture_contains_only_pe_nodes_and_takes_the_unwrapped_request(self):
+        raw_prompt = CUTOUT["prompt"]
+        initial = model.build_qwen21_graph({**CUTOUT, "prompt": model.wrap_transparent_prompt(raw_prompt)})
+        prepass = model.build_pe_graph(initial, f"cstudio_{RUN}_cutout")
+        self.assertEqual(set(prepass), {"30", "32", "33"})
+        self.assertEqual(prepass["33"]["_meta"]["title"], f"cstudio_{RUN}_cutout")
+        self.assertEqual(prepass["32"]["inputs"]["prompt"], raw_prompt)
+        self.assertEqual(prepass["32"]["inputs"]["system_prompt"], model.QWEN21_TRANSPARENT_T2I_SYSTEM_PROMPT)
+        rgb = model.build_qwen21_graph({**CUTOUT, "transparent": False})
+        self.assertEqual(rgb["32"]["inputs"]["system_prompt"], model.QWEN21_T2I_SYSTEM_PROMPT)
+        self.assertEqual(rgb["40"]["inputs"]["prompt"], ["33", 0])
+
+    def test_preserves_requested_pattern_and_quoted_visible_text(self):
+        for visible in ("a black and white checkerboard mug", 'A badge that reads "white background"'):
+            with self.subTest(visible=visible):
+                self.assertEqual(model.normalize_transparent_t2i_pe_answer(visible, visible), visible)
+
+    def test_rejects_empty_rgba_wrapper_and_preserves_transparent_wording(self):
+        with self.assertRaisesRegex(ValueError, "透明主體描述為空"):
+            model.normalize_transparent_t2i_pe_answer(model.wrap_transparent_prompt(""), CUTOUT["prompt"])
+        valid = "A mug with a checkerboard pattern on a transparent background"
+        self.assertEqual(model.normalize_transparent_t2i_pe_answer(valid, CUTOUT["prompt"]), valid)
+        self.assertEqual(model.normalize_transparent_t2i_pe_answer(model.wrap_transparent_prompt(valid), CUTOUT["prompt"]),
+                         valid)
+
+    def test_keeps_the_brief_when_removing_new_white_backdrop_sentences(self):
+        requested = "A blue key left of a brass padlock"
+        detail = "The blue key has a matte finish."
+        raw = json.dumps({"output": (
+            'To the right, separated by open white space, sits a gold padlock. '
+            'The background is clean, plain white with a few gray patches. '
+            f'{detail}'
+        )})
+        self.assertEqual(model.normalize_transparent_t2i_pe_answer(raw, requested), f"{requested}. {detail}")
+        visible = 'A mug that reads "The background is plain white"'
+        self.assertEqual(model.normalize_transparent_t2i_pe_answer(visible, visible), visible)
+        transparent = "The background is transparent with a white mug in the center."
+        self.assertEqual(model.normalize_transparent_t2i_pe_answer(transparent, CUTOUT["prompt"]), transparent)
+
+    def test_bounds_long_expansions_without_changing_the_requested_subjects(self):
+        requested = "藍鑰匙在黃銅鎖左側。"
+        detail = "The blue key has a matte finish."
+        raw = f'{detail} ' + ("The metal surfaces have small scratches. " * 8)
+        self.assertEqual(model.normalize_transparent_t2i_pe_answer(raw, requested), f"{requested} {detail}")
+
+    def test_rgba_wrapper_without_subject_fails_during_graph_planning(self):
+        with self.assertRaisesRegex(ValueError, "透明主體描述不能為空"):
+            model.build_qwen21_graph({**CUTOUT, "prompt": model.wrap_transparent_prompt("")})
+
+
+class PEWorkerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (self.tmp / "inputs").mkdir()
@@ -169,6 +231,53 @@ class EditPEWorkerTests(unittest.TestCase):
         self.assertEqual(len(self.submissions), 1)
         self.assertIn("JSON", self.state["jobs"]["edit"]["error"])
         self.collected.assert_not_called()
+
+    def test_transparent_t2i_wraps_validated_subject_and_records_both_histories(self):
+        raw = json.dumps({"rewritten_prompt": SUBJECT, "wh_ratio": "3:2"})
+
+        def wait(pid, *, timeout, what):
+            self.timeouts.append(timeout)
+            self.inflight.pop(pid)
+            self.now += 60
+            return {"outputs": {"33": {"text": [raw]}}} if what.endswith(" PE") else {}
+
+        self.run_jobs([CUTOUT], wait)
+        self.assertEqual(self.timeouts, [240, 180])
+        pe, image = self.submissions
+        self.assertNotIn("61", pe)
+        self.assertNotIn("32", image)
+        self.assertEqual(image["40"]["inputs"]["prompt"], model.wrap_transparent_prompt(SUBJECT))
+        self.assertEqual(image["41"]["inputs"], {"width": 1024, "height": 1024, "batch_size": 1})
+        rec = self.state["jobs"]["cutout"]
+        self.assertEqual(rec["status"], "done")
+        self.assertEqual(rec["refined_prompt"], SUBJECT)
+        self.assertEqual(rec["execution"]["pe"], {
+            "prompt_id": "prompt-1", "image_prompt_id": "prompt-2",
+            "raw_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+            "answer_sha256": hashlib.sha256(SUBJECT.encode()).hexdigest(),
+        })
+        self.collected.assert_called_once()
+
+    def test_invalid_transparent_t2i_answer_stops_before_sampling(self):
+        for answer, reason in (
+            ("", "輸出為空"),
+            ('{"rewritten_prompt":" "}', "rewritten_prompt"),
+            ("The background is plain white.", "加入可見背景"),
+            ("A red mug against a clean white background", "加入可見背景"),
+            ("A red mug against a gray-and-white checkerboard transparency-style background", "加入可見背景"),
+        ):
+            with self.subTest(answer=answer):
+                self.submissions.clear()
+
+                def wait(pid, **kwargs):
+                    self.inflight.pop(pid)
+                    return {"outputs": {"33": {"text": [answer]}}}
+
+                self.run_jobs([CUTOUT], wait)
+                self.assertEqual(len(self.submissions), 1)
+                self.assertEqual(self.state["jobs"]["cutout"]["status"], "error")
+                self.assertIn(reason, self.state["jobs"]["cutout"]["error"])
+                self.collected.assert_not_called()
 
     def test_confirmed_abort_of_timed_out_pe_precedes_next_submit(self):
         cancelled = []

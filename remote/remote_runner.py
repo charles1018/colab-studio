@@ -1101,7 +1101,8 @@ def run_batch():
         check_cancel()
         jid = job["id"]
         t_job = time.time()
-        separate_pe = plugin.uses_separate_edit_pe(job, manifest)
+        transparent_pe = plugin.uses_separate_transparent_t2i_pe(job, manifest)
+        separate_pe = transparent_pe or plugin.uses_separate_edit_pe(job, manifest)
         refine_on = bool(job.get("refine_prompt", manifest.get("refine_prompt", False)))
         timeout_s = int(job.get("timeout", 1200 if refine_on else 600))
         deadline = time.monotonic() + timeout_s
@@ -1125,11 +1126,14 @@ def run_batch():
             refined_text = None
             pe_receipt = None
             if separate_pe:
-                pe_graph = plugin.build_edit_pe_graph(graph, prefix)
+                pe_graph = plugin.build_pe_graph(graph, prefix)
                 pe_pid = queue_prompt(pe_graph, pin_models=pin_models, deadline=deadline)
                 pe_history = wait_history(pe_pid, timeout=_remaining_prompt_time(deadline, jid), what=f"{jid} PE")
                 raw = extract_refined_prompt(pe_history)
-                refined_text = plugin.normalize_edit_pe_answer(raw, job["prompt"], len(staged_inputs))
+                if transparent_pe:
+                    refined_text = plugin.normalize_transparent_t2i_pe_answer(raw, job["prompt"])
+                else:
+                    refined_text = plugin.normalize_edit_pe_answer(raw, job["prompt"], len(staged_inputs))
                 pe_receipt = {"prompt_id": pe_pid, "raw_sha256": hashlib.sha256(raw.encode()).hexdigest(),
                               "answer_sha256": hashlib.sha256(refined_text.encode()).hexdigest()}
                 graph = plugin.build_qwen21_graph(

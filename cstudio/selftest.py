@@ -120,10 +120,13 @@ def run_selftest() -> int:
     check(g_t2i_pe["30"]["inputs"]["clip_name"] == Q.PE_MODELS[("t2i", "int8")], "T2I refine_prompt 載入 pe_t2i 模型")
     check(g_t2i_pe["32"]["class_type"] == "TextGenerate" and g_t2i_pe["33"]["class_type"] == "PreviewAny", "串接 TextGenerate -> PreviewAny")
     check(
-        g_t2i_pe["32"]["inputs"]["prompt"].startswith("This is an RGBA format image with transparency."),
-        "transparent=True 自動套用官方 RGBA 透明背景提示詞格式",
+        g_t2i_pe["32"]["inputs"]["system_prompt"] == Q.QWEN21_TRANSPARENT_T2I_SYSTEM_PROMPT
+        and set(Q.build_pe_graph(g_t2i_pe, "cutout")) == {"30", "32", "33"},
+        "透明 T2I 先擴寫主體，再用 RGBA 包裝出圖",
     )
-    check(g_t2i_pe["40"]["inputs"]["prompt"] == ["33", 0], "TextEncodeQwenImage21 接收 PreviewAny 輸出的擴寫提示詞")
+    cutout = Q.build_qwen21_graph({"id": "cutout", "prompt": "A red mug", "transparent": True})
+    check(cutout["40"]["inputs"]["prompt"] == Q.wrap_transparent_prompt("A red mug"),
+          "TextEncodeQwenImage21 接收 RGBA 包裝後的文字")
 
     # 5. Verify Image Edit with multi-reference + Prompt Enhancer
     g_edit = Q.build_qwen21_graph(
