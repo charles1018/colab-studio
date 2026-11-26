@@ -94,7 +94,9 @@ Linux 離線測試驗證 manifest、生成圖組裝、權重選取、成果同�
 
 Colab L4 搭配 Q2_K 已實測 T2I、RGBA（含透明像素）、提示詞擴寫（PE），以及 1～10 張 Edit 參考圖的有序上傳、SHA-256 驗證、ComfyUI history 和成果同步。參考圖較多時，尤其是 9～10 張，構圖、編號和挖孔位置受模型及量化限制，Studio 不保證精確重現。九張 Edit 的 Q2_K、8 步 Turbo 對照在同 seed 與同提示下重現相同 RGBA 像素，也重現了錯號和多餘挖孔。
 
-L4（22.03 GiB）的混合權重批次以 GPU-only 執行並關閉 PE。Studio 預設的原生 INT8 UNet 與 Q4_K_M 均通過 1024×1024 的 T2I 及雙圖 Edit。INT8 另通過 `edit_resolution: 0` 的 Edit 首圖尺寸（768×512）及 2K T2I（2048×2048）。六張 PNG 都通過 Studio 同步、SHA-256、ComfyUI history 和基本目視檢查。BF16 的 T2I 與雙圖 Edit 在相同批次因 VRAM 不足而失敗。
+L4（22.03 GiB）上，關閉 PE 時，Studio 預設的原生 INT8 UNet 與 Q4_K_M 均通過 1024×1024 的 T2I 及雙圖 Edit。INT8 另通過 `edit_resolution: 0` 的 Edit 首圖尺寸（768×512）及 2K T2I（2048×2048）。這些生成結果都通過 Studio 同步、SHA-256、ComfyUI history 和基本目視檢查。
+
+BF16 搭配預設文字編碼器及 VAE 時，權重合計約 22.6 GiB。L4 的 22.03 GiB 放不下這組權重，先前使用 `--gpu-only` 的 T2I 與雙圖 Edit 因此在載入權重或編碼時耗盡 VRAM。Studio 現在會逐一按實際權重大小及畫布、Edit 參考圖尺寸估算用量，預留執行空間。每項任務都放得下且關閉 PE 時才使用 `--gpu-only`。含 BF16 的 L4 批次及有 PE 的批次會走 normal-vram，允許 ComfyUI 將部分權重移到系統記憶體。L4 的 BF16 切換僅通過離線驗證。
 
 A100 已有單項 Q2_K Edit 實測。
 

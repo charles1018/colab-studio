@@ -756,14 +756,71 @@ def _stop_comfy_for_install():
     _stop_owned_comfy(record)
 
 
-def start_comfy(has_pe: bool = False, *, environment: str) -> dict:
+def _generation_pixels(graph: dict, references: list[str]) -> int | None:
+    latent_id, _ = graph["54"]["inputs"]["latent_image"]
+    latent = graph[latent_id]
+    pixels = 0
+    if latent["class_type"] == "EmptyLatentImage":
+        canvas = latent["inputs"]
+        pixels = canvas["width"] * canvas["height"]
+    if not references:
+        return pixels
+
+    # Edit can encode larger references than its output canvas.
+    resolution = graph["40"]["inputs"]["resolution"]
+    if resolution:
+        return max(pixels, resolution**2)
+
+    from PIL import Image
+
+    for ref in references:
+        check_cancel()
+        try:
+            with Image.open(confined_path(JOB / "inputs", ref)) as image:
+                width, height = image.size
+        except (OSError, ValueError, Image.DecompressionBombError):
+            return None
+        # Round up for the estimate; the graph aligns the original dimensions to 32.
+        aligned_width = ((width + 31) // 32) * 32
+        aligned_height = ((height + 31) // 32) * 32
+        pixels = max(pixels, aligned_width * aligned_height)
+    return pixels
+
+
+def _batch_fits_gpu(plugin, manifest: dict, cli_quant: str | None, prepared_models: dict) -> bool:
+    vram_gib = (STATE.get("gpu_info") or {}).get("vram_gib") or 0
+    if not vram_gib:
+        return False
+    for job in manifest["jobs"]:
+        check_cancel()
+        models = plugin.required_models_for_batch(dict(manifest, jobs=[job]), cli_quant=cli_quant)
+        sizes = [prepared_models.get(model, {}).get("bytes") for model in models]
+        if any(type(size) is not int or size <= 0 for size in sizes):
+            return False
+
+        graph = plugin.build_qwen21_graph(job, manifest=manifest, cli_quant=cli_quant)
+        pixels = _generation_pixels(graph, job.get("inputs", []))
+        if pixels is None:
+            return False
+
+        # L4 peaks: INT8 2K T2I used ~4 GiB more than 1K T2I.
+        # At 1K, the largest measured surplus over weight sizes was
+        # ~1.7 GiB for INT8 Edit and ~5.7 GiB for Q4_K_M Edit.
+        # Reserve 5.5 GiB for native 1K or 7 GiB for GGUF 1K.
+        working_gib = 4 + 1.5 * max(1, pixels / 1024**2)
+        if any(folder == "unet" for _, _, folder in models):
+            working_gib += 1.5
+        if sum(sizes) / 1024**3 + working_gib > vram_gib:
+            return False
+    return True
+
+
+def start_comfy(*, gpu_only: bool, environment: str) -> dict:
     check_cancel()
     port = _comfy_loopback_port()
     if port is None:
         raise RuntimeError("ComfyUI 端點必須使用本機 loopback，才能核對執行環境")
-    # Keep models resident in GPU VRAM when running the 3-model base set (~14.2 GB fits inside L4 22 GiB VRAM)
-    vram_gib = (STATE.get("gpu_info") or {}).get("vram_gib") or 0
-    vram_flags = ["--gpu-only"] if (vram_gib >= 20 and not has_pe) else []
+    vram_flags = ["--gpu-only"] if gpu_only else []
     argv = [str(COMFY.resolve() / "main.py"), "--listen", "127.0.0.1", "--port", str(port), "--disable-auto-launch", *vram_flags]
     running = _comfy_system()
     record = _read_record(COMFY_PROCESS) or {}
@@ -1089,8 +1146,9 @@ def run_batch():
     check_cancel()
 
     # 3. Start ComfyUI
-    has_pe = any(bool(j.get("refine_prompt", manifest.get("refine_prompt", False))) for j in (manifest.get("jobs") or []))
-    comfy = start_comfy(has_pe=has_pe, environment=environment)
+    has_pe = any(job.get("refine_prompt", manifest.get("refine_prompt", False)) for job in jobs)
+    gpu_only = not has_pe and _batch_fits_gpu(plugin, manifest, cli_quant, prepared_models)
+    comfy = start_comfy(gpu_only=gpu_only, environment=environment)
 
     confined_path(JOB, OUT.name, directory=True, missing_ok=True).mkdir(exist_ok=True)
     confined_path(JOB, WORK.name, directory=True, missing_ok=True).mkdir(exist_ok=True)

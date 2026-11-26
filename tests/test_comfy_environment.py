@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from PIL import Image
+
 from remote import remote_runner as remote
 
 
@@ -239,7 +241,7 @@ class ServiceTests(unittest.TestCase):
         self.call = Mock(return_value={"queue_running": [], "queue_pending": []})
         self.enterContext(patch.multiple(
             remote, COMFY=self.comfy, COMFY_PROCESS=self.marker, COMFY_LOG=self.log,
-            STATE={"gpu_info": {"vram_gib": 24}}, COMFY_URL=remote.DEFAULT_COMFY_URL,
+            STATE={}, COMFY_URL=remote.DEFAULT_COMFY_URL,
             log=Mock(), call=self.call, _comfy_system=self.probe_system, _owns_comfy_process=self.owns,
             _comfy_listener_sockets=Mock(return_value={"fixture-socket"}), _process_has_listener=self.listener,
         ))
@@ -249,26 +251,73 @@ class ServiceTests(unittest.TestCase):
         args = self.probe()
         return None if args is None else {"args": args, "versions": {}}
 
+    def test_batch_launch_uses_weights_and_canvas_to_choose_vram_mode(self):
+        root = self.comfy.parent
+        inputs = root / "inputs"
+        inputs.mkdir()
+        for name, size in (("ref.png", (768, 512)), ("large.png", (2048, 2048))):
+            Image.new("RGB", size).save(inputs / name)
+        versions = Path(remote.__file__).with_name("versions.json").read_text(encoding="utf-8")
+        (root / "versions.json").write_text(versions, encoding="utf-8")
+        pins = json.loads(versions)
+        sizes = {(model["repo"], model["file"]): model["bytes"] for model in pins["models"]}
+        t2i = {"id": "t2i", "prompt": "test"}
+        edit = {"id": "edit", "prompt": "edit", "mode": "edit", "inputs": ["ref.png", "ref.png"]}
+        bf16 = dict(t2i, id="bf16", quant="BF16")
+        mixed = [t2i, bf16]
+        cases = (
+            ("L4 1K mixed quantizations", 22, {}, [dict(t2i, id=q.lower(), quant=q) for q in ("Q2_K", "Q4_K_M", "INT8")], True),
+            ("L4 1K Edit", 22, {"quant": "Q4_K_M"}, [edit], True),
+            ("L4 BF16 alone", 22, {}, [bf16], False),
+            ("L4 BF16 in mixed batch", 22, {}, mixed, False),
+            ("L4 CLI quant override", 22, {"_cli_quant": "INT8"}, mixed, True),
+            ("L4 INT8 2K", 22, {"resolution": "2K"}, [t2i], False),
+            ("L4 Edit first image at original size", 22, {}, [dict(edit, edit_resolution=0)], True),
+            ("L4 Edit large original size", 22, {}, [dict(edit, inputs=["large.png"], edit_resolution=0)], False),
+            ("L4 Edit large custom canvas", 22, {}, [dict(edit, width=2048, height=2048)], False),
+            ("24 GiB INT8 2K with W4A8 encoder", 24, {"text_encoder_variant": "w4a8"}, [dict(t2i, resolution="2K")], True),
+            ("24 GiB INT8 2K with default encoder", 24, {}, [dict(t2i, resolution="2K")], False),
+            ("40 GiB BF16", 40, {}, [bf16], True),
+            ("40 GiB BF16 with PE", 40, {"refine_prompt": True}, mixed, False),
+        )
+        for label, vram, settings, jobs, gpu_only in cases:
+            with self.subTest(label=label):
+                (root / "manifest.json").write_text(json.dumps({**settings, "jobs": jobs}), encoding="utf-8")
+                self.spawn.reset_mock()
+                self.spawn.side_effect = RuntimeError("stubbed ComfyUI startup")
+                self.probe.return_value = None
+                with patch.multiple(
+                    remote, JOB=root, MANAGED_RUN_ID=None, STATE={"gpu_info": {"vram_gib": vram}},
+                    save=Mock(), install=Mock(return_value="installed"),
+                    download_models=Mock(side_effect=lambda files, **_: {
+                        model: {"bytes": sizes[model[:2]]} for model in files
+                    }),
+                ), self.assertRaisesRegex(RuntimeError, "stubbed ComfyUI startup"):
+                    remote.run_batch()
+                flags = ["--gpu-only"] if gpu_only else []
+                self.spawn.assert_called_once()
+                self.assertEqual(self.spawn.call_args.args[0], [sys.executable, *self.args, *flags])
+
     def test_matching_owned_service_is_reused(self):
         remote._write_record(self.marker, self.record)
         self.probe.return_value = [*self.args, "--gpu-only"]
-        remote.start_comfy(environment="installed")
+        remote.start_comfy(gpu_only=True, environment="installed")
         self.spawn.assert_not_called()
         self.call.assert_not_called()
 
-    def test_owned_service_restarts_for_pe_in_both_directions_and_environment_change(self):
-        for running, has_pe, environment, flags in (
-            ([*self.args, "--gpu-only"], True, "installed", []),
-            (self.args, False, "installed", ["--gpu-only"]),
-            ([*self.args, "--gpu-only"], False, "changed", ["--gpu-only"]),
+    def test_owned_service_restarts_for_vram_mode_and_environment_changes(self):
+        for running, gpu_only, environment, flags in (
+            ([*self.args, "--gpu-only"], False, "installed", []),
+            (self.args, True, "installed", ["--gpu-only"]),
+            ([*self.args, "--gpu-only"], True, "changed", ["--gpu-only"]),
         ):
-            with self.subTest(has_pe=has_pe, environment=environment), patch.object(remote, "_stop_owned_comfy") as stop:
+            with self.subTest(gpu_only=gpu_only, environment=environment), patch.object(remote, "_stop_owned_comfy") as stop:
                 remote._write_record(self.marker, self.record)
                 self.spawn.reset_mock()
                 self.spawn.return_value.pid = 501
                 self.spawn.return_value.poll.return_value = None
                 self.probe.side_effect = [running, [*self.args, *flags]]
-                remote.start_comfy(has_pe, environment=environment)
+                remote.start_comfy(gpu_only=gpu_only, environment=environment)
                 stop.assert_called_once_with(self.record)
                 self.assertEqual(self.spawn.call_args.args[0], [sys.executable, *self.args, *flags])
                 launch = json.loads(self.marker.read_text(encoding="utf-8"))
@@ -282,7 +331,7 @@ class ServiceTests(unittest.TestCase):
             for queue in ({"queue_running": [[1]], "queue_pending": []}, {"queue_running": []}):
                 with self.subTest(queue=queue), self.assertRaisesRegex(RuntimeError, "佇列"):
                     self.call.return_value = queue
-                    remote.start_comfy(True, environment="installed")
+                    remote.start_comfy(gpu_only=False, environment="installed")
         pidfd.assert_not_called()
         self.spawn.assert_not_called()
 
@@ -292,9 +341,9 @@ class ServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "無法確認程序"):
                 remote._stop_comfy_for_install()
             with self.assertRaisesRegex(RuntimeError, "啟動參數"):
-                remote.start_comfy(True, environment="installed")
+                remote.start_comfy(gpu_only=False, environment="installed")
             with patch.object(remote, "_legacy_comfy_checkout", return_value=True):
-                remote.start_comfy(False, environment="installed")
+                remote.start_comfy(gpu_only=True, environment="installed")
             stop.assert_not_called()
         self.spawn.assert_not_called()
 
@@ -306,7 +355,7 @@ class ServiceTests(unittest.TestCase):
              patch.object(remote.os, "close") as close, \
              patch.object(remote.signal, "pidfd_send_signal", create=True) as send:
             with self.assertRaisesRegex(RuntimeError, "身分已變更"):
-                remote.start_comfy(True, environment="installed")
+                remote.start_comfy(gpu_only=False, environment="installed")
         send.assert_not_called()
         close.assert_called_once_with(17)
         self.spawn.assert_not_called()
@@ -328,7 +377,7 @@ class ServiceTests(unittest.TestCase):
         self.probe.return_value = self.args
         self.listener.return_value = False
         with self.assertRaisesRegex(RuntimeError, "由 Studio 啟動"):
-            remote.start_comfy(True, environment="installed")
+            remote.start_comfy(gpu_only=False, environment="installed")
         self.probe.side_effect = TimeoutError("fixture timeout")
         with self.assertRaises(TimeoutError):
             remote._stop_comfy_for_install()
@@ -392,18 +441,18 @@ class ServiceProbeTests(unittest.TestCase):
         opener = remote.urllib.request.build_opener(remote.urllib.request.ProxyHandler({}))
         with patch.multiple(
             remote, COMFY=root, COMFY_PROCESS=root / "process.json", COMFY_LOG=root / "comfy.log",
-            COMFY_URL=f"http://127.0.0.1:{port}", time=clock, log=Mock(), STATE={"gpu_info": {"vram_gib": 24}},
+            COMFY_URL=f"http://127.0.0.1:{port}", time=clock, log=Mock(), STATE={},
         ), patch.object(subprocess, "Popen", side_effect=launch), \
              patch.object(remote.urllib.request, "urlopen", side_effect=lambda req, **kw: opener.open(req, **kw)):
-            running = remote.start_comfy(environment="fixture")
+            running = remote.start_comfy(gpu_only=True, environment="fixture")
             self.assertEqual(running["versions"], {
                 "comfyui_version": "fixture", "python_version": sys.version, "pytorch_version": "fixture+cu",
             })
             self.assertTrue(running["verified"])
-            remote.start_comfy(environment="fixture")
+            remote.start_comfy(gpu_only=True, environment="fixture")
             self.assertEqual(len(children), 1)
             self.assertIn("--gpu-only", running["args"])
-            remote.start_comfy(True, environment="fixture")
+            remote.start_comfy(gpu_only=False, environment="fixture")
             self.assertEqual(len(children), 2)
             self.assertEqual(children[0].wait(timeout=5), -signal.SIGTERM)
             self.assertNotIn("--gpu-only", remote._comfy_system()["args"])
