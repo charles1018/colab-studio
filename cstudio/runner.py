@@ -258,7 +258,16 @@ def plan_batch(
     stale_reasons = dict(stale)
     for j in m["jobs"]:
         jid = j["id"]
-        w, h = plugin.resolve_dimensions(j, m)
+        graph = plugin.build_qwen21_graph(j, manifest=m, cli_quant=cli_quant)
+        latent_id, _ = graph["54"]["inputs"]["latent_image"]
+        latent = graph[latent_id]
+        canvas = latent["inputs"]
+        if latent["class_type"] == "EmptyLatentImage":
+            size = f"{canvas['width']}x{canvas['height']}"
+        elif canvas["resolution"] == 0:
+            size = "依首圖原尺寸（對齊 32）"
+        else:
+            size = f"依首圖比例（edit_resolution={canvas['resolution']}）"
         q = (cli_quant or j.get("quant") or m.get("quant") or plugin.DEFAULT_QUANT).upper()
         ref = "✨PE擴寫" if j.get("refine_prompt", m.get("refine_prompt", False)) else "直出"
         rgba = " [RGBA透明]" if j.get("transparent") else ""
@@ -269,7 +278,7 @@ def plan_batch(
             st = "✅ 已完成"
         elif jid in stale_reasons:
             st = f"⚠️ 過期（{stale_reasons[jid]}）"
-        print(f"     - {jid}: {st} | mode={j.get('mode', 't2i')}{rgba} | quant={q} | {w}x{h} | {ref}", flush=True)
+        print(f"     - {jid}: {st} | mode={j.get('mode', 't2i')}{rgba} | quant={q} | {size} | {ref}", flush=True)
 
     return {
         "total": len(m["jobs"]),

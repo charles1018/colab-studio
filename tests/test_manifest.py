@@ -82,6 +82,28 @@ class ManifestTests(unittest.TestCase):
                 self.assertEqual(graph["54"]["inputs"]["latent_image"], latent)
                 self.assertEqual(graph["40"]["inputs"]["resolution"], target)
 
+    def test_plan_describes_the_output_size_used_by_the_graph(self):
+        Image.new("RGB", (768, 512)).save(self.base / "ref.png")
+        edit = {"mode": "edit", "inputs": ["ref.png"]}
+        cases = (
+            ({**edit, "custom_size": False, "edit_resolution": 0}, "依首圖原尺寸（對齊 32）"),
+            (edit, "依首圖比例（edit_resolution=1024）"),
+            ({**edit, "resolution": "2K"}, "依首圖比例（edit_resolution=2048）"),
+            ({**edit, "edit_resolution": 1536}, "依首圖比例（edit_resolution=1536）"),
+            ({**edit, "width": 550, "height": 740, "edit_resolution": 0}, "544x736"),
+            ({"resolution": "2K"}, "2048x2048"),
+        )
+        self.write({
+            "jobs": [{**self.job, **settings, "id": f"size_{i}"} for i, (settings, _) in enumerate(cases)],
+        })
+        with redirect_stdout(io.StringIO()) as stdout:
+            R.plan_batch(self.path)
+        rows = stdout.getvalue().splitlines()
+        for i, (_, size) in enumerate(cases):
+            with self.subTest(size=size):
+                row = next(row for row in rows if f"size_{i}:" in row)
+                self.assertIn(f" | {size} | ", row)
+
     def test_invalid_job_fields_issue_no_colab_commands(self):
         cases = {
             "prompt": (None, "    ", 42), "negative_prompt": (None, False), "mode": (None, 2),
