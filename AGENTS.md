@@ -7,6 +7,13 @@
 - `remote/remote_runner.py` 在 Colab VM 內呼叫 ComfyUI。`remote/models/` 是模型選取與 graph 的共用來源。`remote/versions.json` 和 `schema/manifest.schema.json` 分別記錄版本與 manifest 格式。
 - 操作方式和模型背景參考 [CLAUDE.md](CLAUDE.md)。功能與相容性以目前程式、schema、版本表及測試為準。
 
+## 維護與驗收原則
+
+- 每批開工前說明要驗證什麼、如何判定完成，以及最多嘗試幾次。達到完成條件就收尾，達嘗試上限仍未通過就停止並記錄結果。
+- 將確認的模型或平台限制寫入文件，標明適用條件及已驗證範圍。產品行為已驗證時，以已知限制結案。
+- 優先使用 Studio 的 CLI、工作台和既有測試。可重現的產品缺陷用精簡的回歸測試覆蓋，避免為單次驗證另建一套測試工具或控制器。
+- 連續兩批都沒有 repo 變更時，先與使用者檢討方向和已取得的證據。檢討完成前，暫停核准及執行下一批。
+
 ## 開發與離線驗證
 
 - 使用 Python 3.12 與 uv。建立開發環境時用 `uv sync --locked` 依 `uv.lock` 安裝。
