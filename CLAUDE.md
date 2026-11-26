@@ -92,13 +92,13 @@ Linux 已實測 Colab OAuth 與 CLI，也以本機瀏覽器驗證工作台。已
 
 Linux 離線測試驗證 manifest、生成圖組裝、權重選取、成果同步及 Session 契約的替身情境。CLI 與工作台可請求 L4（Studio 預設）、G4、A100、H100、T4，實際可用規格由 Colab 決定。
 
-Colab L4 搭配 Q2_K 已實測 T2I、RGBA（含透明像素）、提示詞擴寫（PE），以及 1～10 張 Edit 參考圖的有序上傳、SHA-256 驗證、ComfyUI history 和成果同步。參考圖較多時，尤其是 9～10 張，構圖、編號和挖孔位置受模型及量化限制，Studio 不保證精確重現。九張 Edit 的 Q2_K、8 步 Turbo 對照在同 seed 與同提示下重現相同 RGBA 像素，也重現了錯號和多餘挖孔。
+Colab L4 搭配 Q2_K 已實測 T2I、RGBA（含透明像素）、提示詞擴寫（PE），以及 1～10 張 Edit 參考圖的有序上傳、SHA-256 驗證、ComfyUI history 和成果同步。參考圖較多時，尤其是 9～10 張，構圖、編號和挖孔位置受模型及量化限制，Studio 不保證精確重現。
 
-L4（22.03 GiB）上，關閉 PE 時，Studio 預設的原生 INT8 UNet 與 Q4_K_M 均通過 1024×1024 的 T2I 及雙圖 Edit。INT8 另通過 `edit_resolution: 0` 的 Edit 首圖尺寸（768×512）及 2K T2I（2048×2048）。這些生成結果都通過 Studio 同步、SHA-256、ComfyUI history 和基本目視檢查。
+L4（22.03 GiB）上，關閉 PE 時，Studio 預設的原生 INT8 UNet 與 Q4_K_M 均通過 1024×1024 的 T2I 及雙圖 Edit。INT8 另通過 `edit_resolution: 0` 的 Edit 首圖尺寸（768×512）。L4 上的預設 INT8 組合先前以 `--gpu-only` 實測通過 2048×2048 的 2K T2I。現行會使用 `normal-vram`，此模式下的 2K 尚未實測。已實測的成果均通過同步、SHA-256、ComfyUI history 和基本目視檢查。
 
-BF16 搭配預設文字編碼器及 VAE 時，權重合計約 22.6 GiB。L4 的 22.03 GiB 放不下這組權重，先前使用 `--gpu-only` 的 T2I 與雙圖 Edit 因此在載入權重或編碼時耗盡 VRAM。Studio 會逐一按實際權重大小及畫布、Edit 參考圖尺寸估算用量，預留執行空間。每項任務都放得下且關閉 PE 時才使用 `--gpu-only`。含 BF16 的 L4 批次及有 PE 的批次會走 normal-vram，允許 ComfyUI 將部分權重移到系統記憶體。
+BF16 搭配預設 INT8 文字編碼器及 VAE 時，權重合計約 22.6 GiB，超過 L4 的 22.03 GiB。Studio 會逐一按實際權重大小及畫布、Edit 參考圖尺寸估算用量，預留執行空間。每項任務都放得下且關閉 PE 時才使用 `--gpu-only`。含 BF16 的 L4 批次及有 PE 的批次會使用 `normal-vram`，讓 ComfyUI 可將部分權重移到系統記憶體。
 
-在 L4 上搭配 BF16 UNet、預設 INT8 文字編碼器及 VAE，關閉 PE 後，1024×1024 的 T2I 與雙圖 Edit 均已用 normal-vram 實測完成。兩張 PNG 都通過 Studio 同步、尺寸與 SHA-256 驗證，批次結束後也確認指定 runtime 已回收。
+L4 上使用這組 BF16 權重並關閉 PE 時，1024×1024 的 T2I 與雙圖 Edit 都通過 `normal-vram` 實測。
 
 A100 已有單項 Q2_K Edit 實測。
 

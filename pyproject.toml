@@ -1,7 +1,7 @@
 [project]
 name = "colab-studio"
 version = "0.1.0"
-description = "Repo-level Google Colab GPU Studio for Qwen-Image-2.1-Turbo-GGUF and open-weight models, managed by uv"
+description = "Google Colab GPU studio for image generation and editing with Qwen-Image-2.1-Turbo, using native INT8 by default and supporting BF16 and GGUF weights"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
