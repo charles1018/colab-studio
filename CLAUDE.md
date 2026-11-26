@@ -96,7 +96,9 @@ Colab L4 搭配 Q2_K 已實測 T2I、RGBA（含透明像素）、提示詞擴寫
 
 L4（22.03 GiB）上，關閉 PE 時，Studio 預設的原生 INT8 UNet 與 Q4_K_M 均通過 1024×1024 的 T2I 及雙圖 Edit。INT8 另通過 `edit_resolution: 0` 的 Edit 首圖尺寸（768×512）及 2K T2I（2048×2048）。這些生成結果都通過 Studio 同步、SHA-256、ComfyUI history 和基本目視檢查。
 
-BF16 搭配預設文字編碼器及 VAE 時，權重合計約 22.6 GiB。L4 的 22.03 GiB 放不下這組權重，先前使用 `--gpu-only` 的 T2I 與雙圖 Edit 因此在載入權重或編碼時耗盡 VRAM。Studio 現在會逐一按實際權重大小及畫布、Edit 參考圖尺寸估算用量，預留執行空間。每項任務都放得下且關閉 PE 時才使用 `--gpu-only`。含 BF16 的 L4 批次及有 PE 的批次會走 normal-vram，允許 ComfyUI 將部分權重移到系統記憶體。L4 的 BF16 切換僅通過離線驗證。
+BF16 搭配預設文字編碼器及 VAE 時，權重合計約 22.6 GiB。L4 的 22.03 GiB 放不下這組權重，先前使用 `--gpu-only` 的 T2I 與雙圖 Edit 因此在載入權重或編碼時耗盡 VRAM。Studio 會逐一按實際權重大小及畫布、Edit 參考圖尺寸估算用量，預留執行空間。每項任務都放得下且關閉 PE 時才使用 `--gpu-only`。含 BF16 的 L4 批次及有 PE 的批次會走 normal-vram，允許 ComfyUI 將部分權重移到系統記憶體。
+
+在 L4 上搭配 BF16 UNet、預設 INT8 文字編碼器及 VAE，關閉 PE 後，1024×1024 的 T2I 與雙圖 Edit 均已用 normal-vram 實測完成。兩張 PNG 都通過 Studio 同步、尺寸與 SHA-256 驗證，批次結束後也確認指定 runtime 已回收。
 
 A100 已有單項 Q2_K Edit 實測。
 
