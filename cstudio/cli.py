@@ -270,8 +270,8 @@ def main():
                 assign_retries=args.assign_retries,
                 assign_wait=args.assign_wait,
             )
-        except R.RunCancelled as exc:
-            sys.exit(str(exc))
+        except (C.AllocationServiceUnavailable, R.RunCancelled) as exc:
+            raise SystemExit(str(exc)) from None
     elif args.cmd == "recover":
         cmd_recover(args)
     elif args.cmd == "sessions":

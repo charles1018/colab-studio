@@ -29,6 +29,7 @@ GPUS = ("L4", "G4", "A100", "H100", "T4")
 PREFIX = "cstudio-"
 ASSIGN_TIMEOUT = 900
 ALLOCATION_REFUSED = "[colab] Allocation refused (precondition failed)."
+ALLOCATION_HTTP_503 = "CSTUDIO_ALLOCATION_HTTP 503"
 RECOVERY_TIMEOUT = 30
 WATCHDOG_TICK = 30
 WATCHDOG_START_TIMEOUT = 10
@@ -65,6 +66,10 @@ class ColabDeadline(ColabTimeout):
 
 class RuntimeUnavailable(RuntimeError):
     """The saved runtime or its remote run is confirmed absent."""
+
+
+class AllocationServiceUnavailable(RuntimeError):
+    """The allocation POST returned 503 and its outcome still needs confirmation."""
 
 
 def remaining_time(limit: float, deadline: float | None) -> float:
@@ -110,6 +115,8 @@ def colab(
         raise RuntimeError(f"無法啟動 colab {operation}") from None
     stdout, stderr = p.stdout or "", p.stderr or ""
     if p.returncode and check:
+        if operation == "new" and account is not None and ALLOCATION_HTTP_503 in stderr.splitlines():
+            raise AllocationServiceUnavailable("Colab GPU 配置收到 HTTP 503，配置結果待確認")
         lines = stdout.splitlines() + stderr.splitlines()
         # Preserve the pinned client's explicit refusal receipt for allocation retry logic.
         refusal = operation == "new" and any(line.startswith(ALLOCATION_REFUSED) for line in lines)

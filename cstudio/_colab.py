@@ -10,11 +10,13 @@ from contextlib import redirect_stderr, redirect_stdout
 
 from colab_cli import cli
 from colab_cli.auth import PUBLIC_SCOPES
-from colab_cli.client import Client, Prod
+from colab_cli.client import TUN_ENDPOINT, Client, ColabRequestError, Prod
 from colab_cli.state import SessionState, StateStore
+from colab_cli.utils import get_status_code
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.credentials import Credentials
 
+from .colab_client import ALLOCATION_HTTP_503
 from .colab_login import TOKEN, credential_scope
 from .redact import redact
 
@@ -83,7 +85,8 @@ def main():
 
     # A single credential snapshot backs the command, including token refreshes.
     client_logger = logging.Logger("cstudio.colab", level=logging.WARNING)
-    cli.state._client = Client(Prod(), AuthorizedSession(credentials), logger=client_logger)
+    prod = Prod()
+    cli.state._client = Client(prod, AuthorizedSession(credentials), logger=client_logger)
     cli.setup_logging = lambda _: None
     cli.auto_update.run_background_check = lambda: None
     command = sys.argv[1]
@@ -106,6 +109,15 @@ def main():
                 cli.state._store = store
             code = cli.app(standalone_mode=False)
     except Exception as exc:
+        # A preflight GET can fail before any allocation POST was sent.
+        if (
+            command == "new"
+            and isinstance(exc, ColabRequestError)
+            and get_status_code(exc) == 503
+            and getattr(exc.request, "method", None) == "POST"
+            and (exc.request.url or "").partition("?")[0] == f"{prod.domain}{TUN_ENDPOINT}/assign"
+        ):
+            raise SystemExit(ALLOCATION_HTTP_503) from None
         raise SystemExit(f"Colab {command} failed ({type(exc).__name__})") from None
     finally:
         known_secrets.update((credentials.token, credentials.refresh_token))

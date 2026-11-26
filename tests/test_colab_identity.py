@@ -13,9 +13,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from colab_cli import common
-from colab_cli.client import Accelerator, AssignmentVariant, Shape
+from colab_cli.client import Accelerator, AssignmentVariant, Client, Shape
 from colab_cli.commands import session
 from colab_cli.state import SessionState, StateStore
+from requests import Request, Response
 
 from cstudio import _colab, colab_login
 
@@ -90,6 +91,37 @@ class ColabIdentityTests(unittest.TestCase):
         self.assertIsNone(self.execute("new", "-s", "shared", "--gpu", "L4"))
         self.assertIn("CSTUDIO_ASSIGNED assigned-endpoint", self.output.getvalue())
         self.assertEqual(self.store.get("shared").endpoint, "assigned-endpoint")
+
+    def test_new_reports_503_only_for_the_colab_assignment_post(self):
+        secret = "fixture-private-response"
+        for method, target, expected in (
+            ("POST", None, "CSTUDIO_ALLOCATION_HTTP 503"),
+            ("GET", None, "Colab new failed (ColabRequestError)"),
+            ("POST", "https://example.invalid/tun/m/assign", "Colab new failed (ColabRequestError)"),
+        ):
+            with self.subTest(method=method, target=target):
+                prepare = Response()
+                prepare.status_code = 200
+                prepare.request = Request("GET", "https://colab.research.google.com/tun/m/assign").prepare()
+                prepare._content = b'{"acc":"L4","nbh":"fixture","token":"fixture-xsrf","variant":"GPU"}'
+                unavailable = Response()
+                unavailable.status_code = 503
+                unavailable.request = Request(
+                    method, target or "https://colab.research.google.com/tun/m/assign?nbh=fixture",
+                ).prepare()
+                unavailable.reason = secret
+                unavailable._content = secret.encode()
+                transport = Mock()
+                transport.request.side_effect = [prepare, unavailable] if method == "POST" else [unavailable]
+                with (
+                    patch.object(_colab, "Client", Client),
+                    patch.object(_colab, "AuthorizedSession", return_value=transport),
+                    redirect_stderr(io.StringIO()) as errors,
+                ):
+                    self.assertEqual(self.execute("new", "-s", "shared", "--gpu", "L4"), expected)
+                self.assertNotIn(secret, errors.getvalue() + self.output.getvalue())
+                self.assertNotIn("CSTUDIO_ASSIGNED", self.output.getvalue())
+                self.assertIsNone(self.store.get("shared"))
 
     def test_colliding_alias_during_new_is_preserved_and_yields_no_receipt(self):
         def assign(*_args, **_kwargs):

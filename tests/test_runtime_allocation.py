@@ -15,7 +15,7 @@ from unittest.mock import Mock, call, patch
 
 from PIL import Image
 
-from cstudio import colab_client as C
+from cstudio import cli, colab_client as C
 from cstudio import results as store
 from cstudio import runner as R
 
@@ -1455,6 +1455,28 @@ with outputs.lock():
             with self.assertRaises(C.ColabTimeout):
                 C.new_runtime(self.session, "L4", retries=2)
         command.assert_called_once()
+
+    def test_cli_reports_allocation_post_503_and_keeps_result_pending(self):
+        def transport(operation, *args, **options):
+            if operation == "new":
+                return self.real_colab(operation, *args, **options)
+            return self.fake_colab(operation, *args, **options)
+
+        reply = subprocess.CompletedProcess(
+            ["fixture-colab"], 1, stdout="fixture-private-output",
+            stderr="CSTUDIO_ALLOCATION_HTTP 503\nfixture-private-error",
+        )
+        with (
+            patch.object(C.colab, "side_effect", transport),
+            patch.object(C.subprocess, "run", return_value=reply) as request,
+            patch.object(sys, "argv", ["cstudio", "run", str(self.manifest), "--session", self.session]),
+            self.assertRaises(SystemExit) as result,
+        ):
+            cli.main()
+        self.assertEqual(result.exception.code, "Colab GPU 配置收到 HTTP 503，配置結果待確認")
+        request.assert_called_once()
+        C.remote_exec.assert_not_called()
+        self.assertEqual(C.keep_info(self.session)["created_by"], "pending")
 
     def test_retry_does_not_overwrite_a_registered_assignment(self):
         self.on_allocate.side_effect = RuntimeError("503")
