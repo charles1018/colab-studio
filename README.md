@@ -37,3 +37,5 @@ BF16 搭配預設 INT8 文字編碼器及 VAE 時，權重合計約 22.6 GiB，�
 A100 已有單項 Q2_K Edit 實測。
 
 Linux 已實測 OAuth、CLI 和本機工作台。macOS、Windows 與 Windows ACL 未驗證。GPU 的實際可用性取決於 Colab 帳號、配額與配置。[操作與驗證範圍](CLAUDE.md#2-模型設定與驗證範圍)
+
+尚未實測的組合、平台與延後的改善項目見 [ROADMAP.md](ROADMAP.md)。
