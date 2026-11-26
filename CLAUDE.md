@@ -52,7 +52,7 @@ uv run cstudio sheet jobs/demo_qwen21/out/*.png
 
 `cstudio-patch --status` 回傳逐檔 JSON 狀態。退出碼 `0` 表示已補齊，`1` 表示待補（含 `legacy`），`2` 表示不相容。重建虛擬環境後可重新查詢。Studio 的帳號綁定子程序會在程序內停用上游 CLI 的更新檢查，共用使用者設定可獨立管理。
 
-本機 CLI 與工作台的離線驗證在 Linux 執行。釘選的 Colab CLI 上游列出 Linux 與 macOS，Studio 的 macOS 端到端流程及 Windows 相容性尚待實機驗證。 [google-colab-cli 0.7.4 平台說明](https://pypi.org/project/google-colab-cli/0.7.4/)
+Linux 已實測 Colab OAuth 與 CLI，也以本機瀏覽器驗證工作台。已知平台限制為 macOS 端到端流程、Windows 相容性及 Windows ACL 未驗證。釘選的 Colab CLI 上游列出 Linux 與 macOS。 [google-colab-cli 0.7.4 平台說明](https://pypi.org/project/google-colab-cli/0.7.4/)
 
 `cancel` 先送出指定批次的取消要求，確認遠端任務停止後才回報完成。CLI 回報等待確認時，可用 `cancel --session NAME --run-id RUN_ID` 再查同一批次。取消確認前，原有的 GPU 回收期限繼續適用。
 
@@ -90,7 +90,13 @@ uv run cstudio sheet jobs/demo_qwen21/out/*.png
 | 16:9 | 1376×768 | 2752×1536 |
 | 9:16 | 768×1376 | 1536×2752 |
 
-Linux 離線測試驗證 manifest、生成圖組裝、權重選取、成果同步及 Session 契約的替身情境。CLI 與工作台可請求 L4（Studio 預設）、G4、A100、H100、T4，實際可用規格由 Colab 決定。各 GPU 與量化的相容性、VRAM、速度、畫質、PE 暖啟、10 張參考圖與透明像素實測，仍需代表性 Colab 批次驗證。
+Linux 離線測試驗證 manifest、生成圖組裝、權重選取、成果同步及 Session 契約的替身情境。CLI 與工作台可請求 L4（Studio 預設）、G4、A100、H100、T4，實際可用規格由 Colab 決定。
+
+Colab L4 搭配 Q2_K 已實測 T2I、RGBA（含透明像素）、提示詞擴寫（PE），以及 1～10 張 Edit 參考圖的有序上傳、SHA-256 驗證、ComfyUI history 和成果同步。參考圖較多時，尤其是 9～10 張，構圖、編號和挖孔位置受模型及量化限制，Studio 不保證精確重現。九張 Edit 的 Q2_K、8 步 Turbo 對照在同 seed 與同提示下重現相同 RGBA 像素，也重現了錯號和多餘挖孔。
+
+L4（22.03 GiB）的混合權重批次以 GPU-only 執行並關閉 PE。Studio 預設的原生 INT8 UNet 與 Q4_K_M 均通過 1024×1024 的 T2I 及雙圖 Edit。INT8 另通過 `edit_resolution: 0` 的 Edit 首圖尺寸（768×512）及 2K T2I（2048×2048）。六張 PNG 都通過 Studio 同步、SHA-256、ComfyUI history 和基本目視檢查。BF16 的 T2I 與雙圖 Edit 在相同批次因 VRAM 不足而失敗。
+
+A100 已有單項 Q2_K Edit 實測。
 
 ---
 

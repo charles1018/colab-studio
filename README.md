@@ -26,4 +26,10 @@ uv run --locked --offline --no-sync cstudio plan jobs/demo_qwen21/manifest.json
 uv run cstudio run jobs/demo_qwen21/manifest.json --gpu L4
 ```
 
-Linux 的離線檢查由 CI 執行。GPU 選單列出可請求的規格，實際可用性取決於 Colab 帳號、配額與配置。各 GPU、權重規格、PE 和 RGBA 輸出尚未完成實機驗證。[操作與驗證範圍](CLAUDE.md#2-模型設定與驗證範圍)
+## 驗證範圍
+
+Colab L4 搭配 Q2_K 已實測 T2I、RGBA、提示詞擴寫（PE），以及 1～10 張 Edit 參考圖的有序傳輸、SHA-256 驗證、ComfyUI history 和成果同步。參考圖較多時，尤其是 9～10 張，構圖、編號和挖孔位置受模型及量化限制，Studio 不保證精確重現。
+
+L4 上的原生 INT8 與 Q4_K_M 已通過 T2I 和雙圖 Edit。INT8 也驗證了 768×512 的 Edit 首圖尺寸及 2048×2048 的 2K T2I。BF16 的 T2I 和雙圖 Edit 在本批混合權重、L4（22.03 GiB）、GPU-only、PE 關閉的條件下因 VRAM 不足而失敗。
+
+Linux 已實測 OAuth、CLI 和本機工作台。macOS、Windows 與 Windows ACL 未驗證。GPU 的實際可用性取決於 Colab 帳號、配額與配置。[操作與驗證範圍](CLAUDE.md#2-模型設定與驗證範圍)
